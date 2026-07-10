@@ -12,10 +12,13 @@ Key changes vs the original:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from src.config import strategy as _s
 from src.infra.logging import get_logger
+
+if TYPE_CHECKING:
+    from src.market.models import MarketInfo
 
 log = get_logger(__name__)
 
@@ -86,19 +89,34 @@ class TierSnapshot:
         return self.size_filled >= self.size_expected * 0.995
 
     @property
-    def is_expired(self, now: float | None = None) -> bool:
+    def is_expired(self) -> bool:
         """True if GTD has expired and the tier was never completed."""
         if self.expires_at <= 0:
             return False
-        if now is None:
-            import time as _t
-            now = _t.time()
-        return now >= self.expires_at and not self.is_complete
+        import time as _t
+        return _t.time() >= self.expires_at and not self.is_complete
 
 
 # ---------------------------------------------------------------------------
 # Position
 # ---------------------------------------------------------------------------
+
+# Helpers must be defined at module level so default_factory lambdas
+# can reference them without capturing _s() at class-definition time.
+def _tier1_factory() -> TierSnapshot:
+    return TierSnapshot(tier=1, notional=_s().TIER1_NOTIONAL)
+
+
+def _tier2_factory() -> TierSnapshot:
+    return TierSnapshot(tier=2, notional=_s().TIER2_NOTIONAL)
+
+
+def _tier3_factory() -> TierSnapshot:
+    return TierSnapshot(tier=3, notional=_s().TIER3_NOTIONAL)
+
+
+def _tier4_factory() -> TierSnapshot:
+    return TierSnapshot(tier=4, notional=_s().TIER4_NOTIONAL)
 
 
 @dataclass
@@ -108,18 +126,10 @@ class Position:
     entry_side: Literal["UP", "DOWN"] | None = None
     entry_token: str | None = None
 
-    tier1: TierSnapshot = field(
-        default_factory=lambda: TierSnapshot(tier=1, notional=_s().TIER1_NOTIONAL)
-    )
-    tier2: TierSnapshot = field(
-        default_factory=lambda: TierSnapshot(tier=2, notional=_s().TIER2_NOTIONAL)
-    )
-    tier3: TierSnapshot = field(
-        default_factory=lambda: TierSnapshot(tier=3, notional=_s().TIER3_NOTIONAL)
-    )
-    tier4: TierSnapshot = field(
-        default_factory=lambda: TierSnapshot(tier=4, notional=_s().TIER4_NOTIONAL)
-    )
+    tier1: TierSnapshot = field(default_factory=_tier1_factory)
+    tier2: TierSnapshot = field(default_factory=_tier2_factory)
+    tier3: TierSnapshot = field(default_factory=_tier3_factory)
+    tier4: TierSnapshot = field(default_factory=_tier4_factory)
 
     baseline_price: float | None = None   # anchor: avg fill price after T1 fills
     baseline_set: bool = False             # becomes True once baseline_price is anchored
@@ -272,15 +282,27 @@ class RoundState:
     """Complete per-round state machine."""
 
     round_start_ts: int
-    slug: str | None = None
-    condition_id: str | None = None
-    up_token: str | None = None
-    down_token: str | None = None
-    tick_size: float = 0.01
+    market: "MarketInfo | None" = None
+
+    # Derived from market — init=False so they don't appear in __init__ signature.
+    # Defaults are set in __post_init__.
+    slug: str | None = field(init=False, default=None)
+    condition_id: str | None = field(init=False, default=None)
+    up_token: str | None = field(init=False, default=None)
+    down_token: str | None = field(init=False, default=None)
+    tick_size: float = field(init=False, default=0.01)
 
     position: Position = field(default_factory=Position)
     finished: bool = False
     binance_baseline: float | None = None
-
-    # Snapshot of gate when it last changed (for logging)
     gate_last_state: str = ""
+
+    def __post_init__(self) -> None:
+        # Derived fields are set here because init=False excludes them from
+        # the __init__ signature. When market is None they retain their defaults.
+        if self.market is not None:
+            self.slug = self.market.slug
+            self.condition_id = self.market.condition_id
+            self.up_token = self.market.up_token
+            self.down_token = self.market.down_token
+            self.tick_size = self.market.tick_size

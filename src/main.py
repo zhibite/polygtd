@@ -1,7 +1,7 @@
 """Polymarket BTC 15m Up/Down — GTD Martingale Bot.
 
 Entry point. Coordinates:
-  1. RoundClock     — tracks 15-min window boundaries
+  1. WindowManager — tracks 15-min window boundaries
   2. BinanceFeed   — BTC spot WS + ring buffer
   3. MarketWS      — CLOB market data WS (best_bid / last_trade_price)
   4. MarketDiscovery — Gamma REST to find market metadata
@@ -32,11 +32,13 @@ from src.execution.clob_client import CLOBClient
 from src.execution.gtd_expiry_watcher import GtdExpiryWatcher
 from src.execution.heartbeat import HeartbeatLoop
 from src.execution.order_manager import OrderManager
-from src.feeds.binance_trades import BinanceCache, BinanceFeed, RingBuffer
+from src.feeds.binance_spot import BinanceCache, BinanceFeed, BinanceSpotService, RingBuffer
 from src.infra.logging import configure_logging, get_logger
-from src.market.discovery import MarketDiscovery
+from src.market.market_service import MarketService
+from src.market.models import MarketInfo
+from src.market.pm_client import PolymarketClient
+from src.market.window_manager import WindowManager
 from src.market.market_ws import MarketWS, PriceCache
-from src.market.round_clock import RoundClock
 from src.market.user_ws import UserWS
 from src.persistence.db import DB, init_db
 from src.strategy.engine import (
@@ -66,7 +68,6 @@ class AppState:
         self.db = DB(self.db_conn)
         self.current_market = None   # MarketInfo | None
         self.engine: StrategyEngine | None = None
-        self.round_clock: RoundClock | None = None
         self.binance_feed: BinanceFeed | None = None
         self.market_ws: MarketWS | None = None
         self.user_ws: UserWS | None = None
@@ -74,6 +75,10 @@ class AppState:
         self.heartbeat: HeartbeatLoop | None = None
         self.gtd_expiry: GtdExpiryWatcher | None = None
         self.clob: CLOBClient | None = None  # reference for fill_callback wiring
+        self.pm_client: PolymarketClient | None = None
+        self.market_svc: MarketService | None = None
+        self.wm: WindowManager | None = None  # window lifecycle manager
+        self.binance_spot: BinanceSpotService | None = None  # BTC spot via REST
         self._shutdown = asyncio.Event()
 
 
@@ -213,6 +218,10 @@ async def _on_binance_connect() -> None:
 
 
 async def _on_new_round(round_start_ts: int) -> None:
+    """
+    Called by WindowManager on every 15-min boundary.
+    Handles end-of-round cleanup; WindowManager.tick() is called separately by WM._run().
+    """
     state = STATE
 
     # End previous round
@@ -226,25 +235,29 @@ async def _on_new_round(round_start_ts: int) -> None:
 
     state.round_start_ts = round_start_ts
 
-    # Resolve market via Gamma
-    async with MarketDiscovery() as discovery:
-        market = await discovery.try_fetch_market(round_start_ts, timeout_s=60.0)
-        if market:
-            state.current_market = market
+    # ── Use WindowManager for market discovery ─────────────────────────────────
+    if state.wm:
+        ctx = state.wm.get("BTC")
+        if ctx and ctx.market:
+            mkt_info = ctx.market  # new MarketInfo (from models.py)
+            state.current_market = mkt_info
             if state.market_ws:
-                state.market_ws.subscribe_tokens([market.up_token, market.down_token])
+                state.market_ws.subscribe_tokens([mkt_info.token_up_id, mkt_info.token_down_id])
                 await state.market_ws.stop()
                 await state.market_ws.start()
             log.info(
                 "round.market_ready",
-                slug=market.slug,
-                condition_id=market.condition_id[:16],
-                up=market.up_token[:16],
-                down=market.down_token[:16],
+                slug=f"btc-updown-15m-{round_start_ts}",
+                condition_id=mkt_info.condition_id[:16],
+                up=mkt_info.token_up_id[:16],
+                down=mkt_info.token_down_id[:16],
             )
         else:
             state.current_market = None
             log.warning("round.market_not_found", round_start_ts=round_start_ts)
+    else:
+        state.current_market = None
+        log.warning("round.market_not_found.wm_unavailable", round_start_ts=round_start_ts)
 
     # Notify engine of new round
     if state.engine:
@@ -290,6 +303,7 @@ async def _on_new_round(round_start_ts: int) -> None:
             continue
 
 
+
 # ---------------------------------------------------------------------------
 # Status printer
 # ---------------------------------------------------------------------------
@@ -313,8 +327,8 @@ async def _status_loop() -> None:
         up_bid = s.price_cache.bid(mkt.up_token) if mkt and mkt.up_token else 0
         down_bid = s.price_cache.bid(mkt.down_token) if mkt and mkt.down_token else 0
 
-        rc = s.round_clock
-        next_in = rc.seconds_until_next() if rc else 0
+        wm = s.wm
+        next_in = wm.seconds_until_next() if wm else 0
 
         # Position state
         pos_str = ""
@@ -388,6 +402,30 @@ async def main() -> None:
         signature_type=cfg_strategy.SIGNATURE_TYPE,
     )
 
+    # ── Market / Window management ────────────────────────────────────────────
+    # PolymarketClient: Gamma + CLOB public API (market discovery, prices, resolution)
+    s.pm_client = PolymarketClient(
+        gamma_api="https://gamma-api.polymarket.com",
+        polymarket_host=cfg_strategy.POLYMARKET_HOST,
+    )
+    s.market_svc = MarketService(
+        pm=s.pm_client,
+        threshold=0.5,
+        slug_interval="15m",
+        window_sec=900,
+    )
+    # BinanceSpotService: REST-based BTC spot (K-line backtrack for window-open price)
+    s.binance_spot = BinanceSpotService()
+    # WindowManager: unified window lifecycle (discovery + price sync + BTC drift guard)
+    # WindowManager internally polls 15-min boundaries and fires _on_new_round callback.
+    s.wm = WindowManager(
+        market_svc=s.market_svc,
+        symbols=["BTC"],
+        on_new_round=_on_new_round,
+        binance_spot=s.binance_spot,
+        entry_cfg=None,
+    )
+
     # ── Execution layer ─────────────────────────────────────────────────
     s.order_manager = OrderManager(s.clob, price_cache=s.price_cache)
     s.heartbeat = HeartbeatLoop(s.clob)
@@ -431,13 +469,10 @@ async def main() -> None:
         )
         s.user_ws = None
 
-    # ── Round clock ─────────────────────────────────────────────────────
-    s.round_clock = RoundClock(_on_new_round)
-
     # ── Start services ──────────────────────────────────────────────────
     await s.binance_feed.start()
     await s.market_ws.start()
-    await s.round_clock.start()
+    await s.wm.start()
     s.gtd_expiry.start()
 
     if s.user_ws:
@@ -474,8 +509,8 @@ async def main() -> None:
     status_task.cancel()
 
     s.gtd_expiry.stop()
-    if s.round_clock:
-        await s.round_clock.stop()
+    if s.wm:
+        await s.wm.stop()
     if s.market_ws:
         await s.market_ws.stop()
     if s.user_ws:
@@ -484,6 +519,10 @@ async def main() -> None:
         await s.binance_feed.stop()
     if s.heartbeat:
         await s.heartbeat.stop()
+    if s.binance_spot:
+        await s.binance_spot.close()
+    if s.pm_client:
+        await s.pm_client.close()
     s.db_conn.close()
     log.info("bot.shutdown_complete")
 

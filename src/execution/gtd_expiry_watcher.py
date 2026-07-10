@@ -50,6 +50,8 @@ class GtdExpiryWatcher:
         self._task: asyncio.Task | None = None
         # server_order_id -> last time we notified (prevent spam)
         self._last_notified: dict[str, float] = {}
+        # Background cleanup tasks — tracked so stop() can await them
+        self._bg_tasks: set[asyncio.Task[None]] = set()
 
     def start(self) -> None:
         if self._running:
@@ -67,6 +69,10 @@ class GtdExpiryWatcher:
             except asyncio.CancelledError:
                 pass
         self._task = None
+        for t in self._bg_tasks:
+            t.cancel()
+        await asyncio.gather(*self._bg_tasks, return_exceptions=True)
+        self._bg_tasks.clear()
         log.info("gtd_expiry_watcher.stopped")
 
     async def _run(self) -> None:
@@ -122,7 +128,9 @@ class GtdExpiryWatcher:
 
             rs.position.mark_expired(tier, reason="gtd_expired")
 
-            asyncio.create_task(self._drop_notify_after(tier.server_order_id or "", 60))
+            t = asyncio.create_task(self._drop_notify_after(tier.server_order_id or "", 60))
+            self._bg_tasks.add(t)
+            t.add_done_callback(self._bg_tasks.discard)
 
     async def _drop_notify_after(self, server_order_id: str, delay: float) -> None:
         await asyncio.sleep(delay)

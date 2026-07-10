@@ -27,13 +27,17 @@ polygtd/
 │   ├── config.py            # 配置管理（TOML + .env）
 │   │
 │   ├── market/             # 市场数据层
-│   │   ├── discovery.py     # Gamma REST API 市场发现
-│   │   ├── round_clock.py   # 15分钟回合时钟
+│   │   ├── pm_client.py      # Polymarket Gamma + CLOB 公共 API
+│   │   ├── models.py         # 数据模型（MarketInfo / Side / OpenPosition）
+│   │   ├── market_service.py # 市场发现 + 价格获取
+│   │   ├── window_context.py # 窗口生命周期状态容器
+│   │   ├── window_manager.py # 窗口生命周期管理器（15-min 边界轮询）
 │   │   ├── market_ws.py     # Polymarket 市场行情 WebSocket
-│   │   └── user_ws.py       # 用户订单 WebSocket（未集成）
+│   │   └── user_ws.py       # 用户订单 WebSocket
 │   │
 │   ├── feeds/              # 数据源
-│   │   └── binance_trades.py  # Binance BTC/USDT 实时价格流
+│   │   ├── binance_trades.py  # Binance BTC/USDT 实时价格流（WS）
+│   │   └── binance_spot.py    # Binance BTC/USDT 现货（REST，K线回溯）
 │   │
 │   ├── strategy/           # 策略层
 │   │   ├── engine.py       # 策略引擎（决策核心）
@@ -63,7 +67,7 @@ polygtd/
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  回合开始 (RoundClock 每500ms检查边界触发)                       │
+│  回合开始 (WindowManager 每500ms检查边界触发)                       │
 ├─────────────────────────────────────────────────────────────────┤
 │  Step 1: 市场发现                                                │
 │  ├── Gamma API 查询 slug = "btc-updown-15m-{timestamp}"        │
@@ -162,14 +166,15 @@ drift = |BTC_now - BTC_baseline| / BTC_baseline
 
 ## 关键模块详解
 
-### 1. RoundClock (round_clock.py)
+### 1. WindowManager (window_manager.py)
 
-**职责：** 跟踪 15 分钟回合边界，触发回合切换。
+**职责：** 跟踪 15 分钟窗口边界，管理窗口生命周期。
 
 **核心逻辑：**
-- 每 500ms 检查一次当前时间是否跨越 15 分钟边界
+- 内部每 500ms 检查一次当前时间是否跨越 15 分钟边界
 - 计算公式：`round_start = floor(now / 900) * 900`
-- 触发回调 `on_new_round(round_start_ts)`
+- 检测到边界切换时调用 `tick()` 发现新窗口市场，并触发回调 `on_new_round(round_start_ts)`
+- 窗口切换时：记录跨窗口 BTC 偏移、检测新窗口、更新价格
 
 ### 2. BinanceFeed (binance_trades.py)
 

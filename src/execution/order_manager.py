@@ -136,10 +136,10 @@ class OrderManager:
             cid = f"{round_start_ts}-{tier_name}-{uuid.uuid4().hex[:8]}"
 
             # Snap to just above the current bid for better fill probability
-            price = self._adjust_buy_price(token_id, price)
+            adjusted_price = self._adjust_buy_price(token_id, price)
             result: FillResult = await self._clob.place_gtd_buy(
                 token_id=token_id,
-                price=price,
+                price=adjusted_price,
                 size=size,
                 lifetime_s=lifetime_s,
                 tick_size=tick_size,
@@ -148,7 +148,7 @@ class OrderManager:
             if not result.success:
                 log.warning(
                     "order_manager.buy.failed",
-                    token=token_id[:16], price=price, size=size,
+                    token=token_id[:16], price=adjusted_price, size=size,
                     tier=tier_name, error=result.error,
                 )
                 return None
@@ -161,7 +161,7 @@ class OrderManager:
                 side="BUY",
                 token_id=token_id,
                 tier_name=tier_name,
-                price=price,
+                price=adjusted_price,  # the price actually sent to CLOB
                 size=size,
                 lifetime_s=lifetime_s,
                 expires_at=float(expiration_ts),
@@ -214,11 +214,11 @@ class OrderManager:
             )
 
             if not result.success:
-                log.warning(
-                    "order_manager.sell.failed",
-                    token=token_id[:16], size=size, price=price,
-                    tier=tier_name, error=result.error,
-                )
+            log.warning(
+                "order_manager.sell.failed",
+                token=token_id[:16], size=size, price=sell_price,
+                tier=tier_name, error=result.error,
+            )
                 return None
 
             server_id = result.order_id
@@ -229,7 +229,7 @@ class OrderManager:
                 side="SELL",
                 token_id=token_id,
                 tier_name=tier_name,
-                price=price,
+                price=sell_price,  # the adjusted price actually sent to CLOB
                 size=size,
                 lifetime_s=0,
                 expires_at=0,

@@ -19,8 +19,8 @@ from dataclasses import dataclass
 from typing import Callable, Literal, Protocol
 
 from src.config import strategy as _s
-from src.feeds.binance_trades import BinanceCache
-from src.market.discovery import MarketInfo
+from src.feeds.binance_spot import BinanceCache
+from src.market.models import MarketInfo
 from src.market.market_ws import PriceCache
 from src.strategy.gatekeeper import GateKeeper
 from src.strategy.round_state import Position, RoundState, TierSnapshot
@@ -102,13 +102,7 @@ class StrategyEngine:
     async def on_new_round(self, round_start_ts: int, market: MarketInfo | None = None) -> None:
         """Called when the 15-min window rolls over."""
         log.info("engine.new_round", round_start_ts=round_start_ts)
-        self._round = RoundState(round_start_ts=round_start_ts)
-        if market:
-            self._round.slug = market.slug
-            self._round.condition_id = market.condition_id
-            self._round.up_token = market.up_token
-            self._round.down_token = market.down_token
-            self._round.tick_size = market.tick_size
+        self._round = RoundState(round_start_ts=round_start_ts, market=market)
         self._gate = None
 
     def set_binance_baseline(self, baseline: float) -> None:

@@ -3,8 +3,6 @@ from __future__ import annotations
 
 import tomllib
 from pathlib import Path
-from typing import Literal
-
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _ROOT = Path(__file__).parent.parent
@@ -29,12 +27,6 @@ class BinanceConfig(BaseSettings):
     RECONNECT_BASE_S: float = 1.0
     RECONNECT_MAX_S: float = 30.0
     BUFFER_RETENTION_S: int = 1200
-
-
-class RoundClockConfig(BaseSettings):
-    model_config = SettingsConfigDict(toml_file=str(_ROOT.parent / "config.toml"), extra="ignore")
-
-    TIMEZONE: Literal["local", "utc"] = "local"
 
 
 class BaselineConfig(BaseSettings):
@@ -138,7 +130,6 @@ class StrategySettings(BaseSettings):
 
 _general: GeneralConfig | None = None
 _binance: BinanceConfig | None = None
-_round_clock: RoundClockConfig | None = None
 _baseline: BaselineConfig | None = None
 _log: LogConfig | None = None
 _strategy: StrategySettings | None = None
@@ -156,13 +147,6 @@ def binance() -> BinanceConfig:
     if _binance is None:
         _binance = BinanceConfig()
     return _binance
-
-
-def round_clock() -> RoundClockConfig:
-    global _round_clock
-    if _round_clock is None:
-        _round_clock = RoundClockConfig()
-    return _round_clock
 
 
 def baseline_cfg() -> BaselineConfig:

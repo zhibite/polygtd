@@ -14,9 +14,9 @@ import asyncio
 import time
 from dataclasses import dataclass
 from decimal import ROUND_DOWN, Decimal
-from typing import Callable, Literal, Optional
+from typing import Optional
 
-from loguru import logger
+from src.infra.logging import get_logger
 
 from src.config import strategy as _s
 
@@ -29,12 +29,12 @@ from py_clob_client_v2 import (
 )
 from py_clob_client_v2.clob_types import ApiCreds, OrderArgsV2, PartialCreateOrderOptions
 
-log = logger
+log = get_logger(__name__)
 
 
 def _round_down(value: float, prec: Decimal) -> float:
     d = Decimal(str(value)).quantize(prec, rounding=ROUND_DOWN)
-    return float(Decimal(str(d)).quantize(prec, rounding=ROUND_DOWN))
+    return float(d)
 
 
 # ---------------------------------------------------------------------------

@@ -75,7 +75,7 @@ class MarketWS:
     # ------------------------------------------------------------------
 
     def subscribe_tokens(self, token_ids: list[str]) -> None:
-        """Call before start() to queue subscriptions. Safe to call multiple times."""
+        """Queue token subscriptions and send immediately if WS is connected."""
         for tid in token_ids:
             self._pending_tokens.add(tid)
 
@@ -116,7 +116,7 @@ class MarketWS:
                         await self._subscribe(ws, list(self._pending_tokens))
 
                     if self._on_connect:
-                        self._on_connect()
+                        asyncio.create_task(self._on_connect())
 
                     async for raw in ws:
                         if not self._running:

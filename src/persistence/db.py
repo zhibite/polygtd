@@ -10,7 +10,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from src.infra.logging import get_logger
@@ -116,13 +116,13 @@ class DB:
               tick_size=excluded.tick_size,
               binance_baseline=excluded.binance_baseline
         """, (round_start_ts, slug, condition_id, up_token, down_token,
-              tick_size, binance_baseline, datetime.utcnow().isoformat()))
+              tick_size, binance_baseline, datetime.now(timezone.utc).isoformat()))
         self._c.commit()
 
     def finish_round(self, round_start_ts: int) -> None:
         self._c.execute(
             "UPDATE rounds SET finished=1, finished_at=? WHERE round_start_ts=?",
-            (datetime.utcnow().isoformat(), round_start_ts)
+            (datetime.now(timezone.utc).isoformat(), round_start_ts)
         )
         self._c.commit()
 
@@ -183,7 +183,7 @@ class DB:
                price, size, ts_ms, confirmed, recorded_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (fill_id, order_id, round_start_ts, token_id, side,
-              price, size, ts_ms, confirmed, datetime.utcnow().isoformat()))
+              price, size, ts_ms, confirmed, datetime.now(timezone.utc).isoformat()))
         self._c.commit()
 
     def confirm_fill(self, fill_id: str) -> None:
