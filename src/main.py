@@ -344,7 +344,9 @@ async def _on_new_round(round_start_ts: int) -> None:
 
 async def _midpoint_poll_loop() -> None:
     """Poll /midpoint REST API every 2s to keep stable price cache updated."""
-    last_slug = ""
+    last_condition_id = ""
+    last_up_token = ""
+    last_down_token = ""
     while True:
         await asyncio.sleep(2.0)
         s = STATE
@@ -360,21 +362,23 @@ async def _midpoint_poll_loop() -> None:
         if not mkt or not mkt.token_up_id or not mkt.token_down_id:
             continue
 
-        slug = mkt.slug or ""
+        condition_id = mkt.condition_id or ""
         up_token = mkt.token_up_id
         down_token = mkt.token_down_id
 
-        # Log window transition
-        if slug != last_slug and last_slug:
+        # Log window transition when condition_id changes
+        if condition_id != last_condition_id and last_condition_id:
             log.info(
                 "midpoint.window_changed",
-                prev_slug=last_slug,
-                new_slug=slug,
+                prev_condition_id=last_condition_id[:16],
+                new_condition_id=condition_id[:16],
                 up_token=up_token[:16],
                 down_token=down_token[:16],
                 round_start_ts=mkt.round_start_ts,
             )
-        last_slug = slug
+        last_condition_id = condition_id
+        last_up_token = up_token
+        last_down_token = down_token
 
         try:
             up_mid = await s.pm_client.get_midpoint(up_token)
@@ -383,14 +387,14 @@ async def _midpoint_poll_loop() -> None:
             s.price_cache.midpoint[down_token] = down_mid
             log.info(
                 "midpoint.poll",
-                slug=slug,
+                condition_id=condition_id[:16],
                 up_token=up_token[:16],
                 down_token=down_token[:16],
                 up_mid=up_mid,
                 down_mid=down_mid,
             )
         except Exception as exc:
-            log.warning("midpoint.poll error", slug=slug, up_token=up_token[:16], down_token=down_token[:16], error=str(exc))
+            log.warning("midpoint.poll error", condition_id=condition_id[:16], up_token=up_token[:16], down_token=down_token[:16], error=str(exc))
 
 
 # ---------------------------------------------------------------------------

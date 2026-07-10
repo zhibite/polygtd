@@ -109,7 +109,8 @@ class WindowManager:
             now_start = self._round_start_of(time.time())
 
             # Window boundary transition?
-            if now_start != self._last_round_start:
+            round_changed = (now_start != self._last_round_start)
+            if round_changed:
                 prev = self._last_round_start
                 self._last_round_start = now_start
 
@@ -129,8 +130,11 @@ class WindowManager:
                          next_start=self.next_round_start(),
                          markets=", ".join(known) if known else "(no active market yet)")
 
+            # Force discovery at round boundary so ctx.market is updated immediately.
+            # After this call _last_round_start == now_start, so round_changed will be
+            # False inside tick() — we compensate by passing force_discovery here.
             try:
-                await self.tick(self._symbols)
+                await self.tick(self._symbols, force_discovery=round_changed)
             except Exception:
                 log.exception("window_mgr.tick raised")
                 if self._on_new:
