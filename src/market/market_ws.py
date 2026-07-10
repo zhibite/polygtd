@@ -154,16 +154,21 @@ class MarketWS:
         except json.JSONDecodeError:
             return
 
-        # Debug: log first few unique message types
+        # Skip non-dict messages (some WS messages may be arrays)
+        if not isinstance(msg, dict):
+            return
+
         msg_type = msg.get("type", "")
-        if not hasattr(self, "_logged_types"):
-            self._logged_types = set()
-        if msg_type not in self._logged_types:
-            self._logged_types.add(msg_type)
-            log.debug("market_ws.msg_type", type=msg_type, keys=list(msg.keys())[:10])
         token = msg.get("token") or msg.get("asset_id") or ""
 
-        # best_bid_ask - can be nested or flat
+        # Debug: log first few unique message types (info level)
+        if not hasattr(self, "_logged_types"):
+            self._logged_types = set()
+        if msg_type not in self._logged_types and len(self._logged_types) < 10:
+            self._logged_types.add(msg_type)
+            log.info("market_ws.msg", type=msg_type, keys=list(msg.keys()))
+
+        # best_bid_ask - can be nested dict, flat dict, or list of {price, size}
         bba = msg.get("best_bid_ask")
         if isinstance(bba, dict):
             bba_token = bba.get("asset_id") or bba.get("assetID") or token
@@ -174,28 +179,31 @@ class MarketWS:
             if asks and isinstance(asks, list) and len(asks) > 0:
                 self._cache.best_ask[bba_token] = float(asks[0])
         elif isinstance(bba, list) and len(bba) > 0:
-            # Direct flat format: [{"price": "0.55", "size": "100"}, ...]
-            best_bid = next((float(x["price"]) for x in bba if "price" in x), None)
-            if best_bid is not None:
-                self._cache.best_bid[token] = best_bid
+            # Flat list format: [{"price": "0.55", "size": "100"}, ...]
+            for x in bba:
+                if isinstance(x, dict) and "price" in x:
+                    self._cache.best_bid[token] = float(x["price"])
+                    break
 
         # last_trade_price
         ltp = msg.get("last_trade_price")
-        if ltp:
-            if isinstance(ltp, list) and len(ltp) >= 1:
-                self._cache.last_trade_price[token] = float(ltp[0])
-            elif isinstance(ltp, dict):
-                price = ltp.get("price") or ltp.get("last_trade_price") or (ltp[0] if isinstance(ltp, list) else None)
-                if price is not None:
-                    self._cache.last_trade_price[token] = float(price)
+        if isinstance(ltp, list) and len(ltp) >= 1:
+            # [price, size] format
+            self._cache.last_trade_price[token] = float(ltp[0])
+        elif isinstance(ltp, dict):
+            price = ltp.get("price") or ltp.get("last_trade_price")
+            if price is not None:
+                self._cache.last_trade_price[token] = float(price)
 
-        # price_change (incremental) - common format
+        # price_change (incremental)
         pc = msg.get("price_change")
         if isinstance(pc, dict):
             pc_token = pc.get("asset_id") or pc.get("assetID") or token
             bids = pc.get("bids", [])
             asks = pc.get("asks", [])
             if bids and isinstance(bids, list) and len(bids) > 0:
-                self._cache.best_bid[pc_token] = float(bids[0]) if isinstance(bids[0], (int, float)) else float(bids[0]["price"])
+                v = bids[0]
+                self._cache.best_bid[pc_token] = float(v) if isinstance(v, (int, float)) else float(v["price"]) if isinstance(v, dict) else 0.0
             if asks and isinstance(asks, list) and len(asks) > 0:
-                self._cache.best_ask[pc_token] = float(asks[0]) if isinstance(asks[0], (int, float)) else float(asks[0]["price"])
+                v = asks[0]
+                self._cache.best_ask[pc_token] = float(v) if isinstance(v, (int, float)) else float(v["price"]) if isinstance(v, dict) else 0.0
