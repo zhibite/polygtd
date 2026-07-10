@@ -159,14 +159,22 @@ class MarketWS:
             return
 
         msg_type = msg.get("type", "")
+
+        # Extract token - may be in 'market' field or in price_changes entries
         token = msg.get("token") or msg.get("asset_id") or ""
+        market_field = msg.get("market", {})
+        if not token and isinstance(market_field, dict):
+            token = market_field.get("asset_id") or market_field.get("assetID") or ""
 
         # Debug: log first few unique message types (info level)
         if not hasattr(self, "_logged_types"):
             self._logged_types = set()
-        if msg_type not in self._logged_types and len(self._logged_types) < 10:
+        if msg_type not in self._logged_types and len(self._logged_types) < 3:
             self._logged_types.add(msg_type)
-            log.info("market_ws.msg", type=msg_type, keys=list(msg.keys()))
+            pcs = msg.get("price_changes", [])
+            # Log first price_change entry structure
+            pc_sample = pcs[0] if pcs else "EMPTY"
+            log.info("market_ws.msg_type", type=msg_type, market=msg.get("market"), pc_sample=str(pc_sample)[:200])
 
         # best_bid_ask - can be nested dict, flat dict, or list of {price, size}
         bba = msg.get("best_bid_ask")
@@ -200,6 +208,7 @@ class MarketWS:
         if isinstance(pcs, list):
             for pc in pcs:
                 if isinstance(pc, dict):
+                    # Get token from price_changes entry or fall back to message level
                     pc_token = pc.get("asset_id") or pc.get("assetID") or token
                     bids = pc.get("bids", [])
                     asks = pc.get("asks", [])
