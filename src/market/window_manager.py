@@ -68,7 +68,6 @@ class WindowManager:
         }
         self._prev_condition_id: Dict[str, str] = {}
         self._first_seen: Dict[str, bool] = {s: False for s in symbols}
-        self._last_discovery_ts: Dict[str, float] = {s: 0.0 for s in symbols}
 
     # ── Lifecycle (15-min boundary polling) ─────────────────────────────────────
 
@@ -104,7 +103,7 @@ class WindowManager:
         return self.next_round_start() - time.time()
 
     async def _run(self) -> None:
-        """Poll every 10s: run tick() which rate-limits discover_market to once per 30s."""
+        """Poll every 10s: run tick() which only rediscovers at window boundaries."""
         while self._running:
             await asyncio.sleep(10)
             now_start = self._round_start_of(time.time())
@@ -131,25 +130,35 @@ class WindowManager:
         """Get current window context for an asset. Returns None only if asset is unknown."""
         return self._ctxs.get(asset)
 
-    async def tick(self, assets: list[str]) -> Dict[str, WindowContext]:
+    async def tick(self, assets: list[str], force_discovery: bool = False) -> Dict[str, WindowContext]:
         """
         Called every tick by main loop:
-        1. discover_market all assets (rate-limited to once per 30s per asset)
+        1. discover_market only when needed: first time, round transition, or force flag.
+           Once a market is discovered for the current window, the up/down token IDs
+           are cached on WindowContext and reused — no further discovery calls until
+           the next 15-min window boundary.
         2. Detect window switches, reset state
         3. Fetch latest prices
-        Returns {asset: ctx} dict (only assets with active windows)
+        Returns {asset: ctx} dict (only assets with active windows).
         """
         now_ts = time.time()
+        now_start = self._round_start_of(now_ts)
+        # _run() keeps _last_round_start fresh before calling tick(), so we just read it.
+        round_changed = (now_start != self._last_round_start)
+
+        # Discover only when: first run, round just ticked over, or explicit force.
         needs_discovery = [
             a for a in assets
-            if (now_ts - self._last_discovery_ts.get(a, 0)) >= 30.0
+            if force_discovery
+            or round_changed
+            or not self._first_seen.get(a, False)
         ]
         if needs_discovery:
             tasks = [self._svc.discover_market(a) for a in needs_discovery]
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for i, result in enumerate(results):
                 asset = needs_discovery[i]
-                self._last_discovery_ts[asset] = now_ts
+                self._first_seen[asset] = True
 
                 if isinstance(result, BaseException):
                     log.warning("discover_market failed", asset=asset, error=str(result))
