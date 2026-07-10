@@ -9,6 +9,7 @@ httpx>=0.27
 pydantic>=2.6
 pydantic-settings>=2.2
 python-dotenv>=1.0
+loguru>=0.7
 structlog>=24.1
 py-clob-client-v2>=1.0
 sqlalchemy[asyncio]>=2.0
