@@ -112,10 +112,22 @@ class WindowManager:
             if now_start != self._last_round_start:
                 prev = self._last_round_start
                 self._last_round_start = now_start
+
+                # Log known markets at round transition (token IDs already cached)
+                known = []
+                for asset in self._symbols:
+                    ctx = self._ctxs[asset]
+                    if ctx.market and ctx.condition_id:
+                        known.append(
+                            f"{asset}[up={ctx.market.token_up_id[:8]},"
+                            f"down={ctx.market.token_down_id[:8]},"
+                            f"end={ctx.market.window_end}]"
+                        )
                 log.info("window_mgr.round_transition",
                          prev_start=prev,
                          new_start=now_start,
-                         next_start=self.next_round_start())
+                         next_start=self.next_round_start(),
+                         markets=", ".join(known) if known else "(no active market yet)")
 
             try:
                 await self.tick(self._symbols)
@@ -153,6 +165,15 @@ class WindowManager:
             or round_changed
             or not self._first_seen.get(a, False)
         ]
+        if not needs_discovery:
+            log.debug(
+                "window_mgr.tick skipped discover",
+                assets=list(assets),
+                round_changed=round_changed,
+                now_start=now_start,
+                last_round_start=self._last_round_start,
+                first_seen=dict(self._first_seen),
+            )
         if needs_discovery:
             tasks = [self._svc.discover_market(a) for a in needs_discovery]
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -188,6 +209,15 @@ class WindowManager:
                 is_new = (prev_end is None) or (mkt.window_end > prev_end)
 
                 if is_new:
+                    log.info(
+                        "window_mgr.window_switch_detected",
+                        asset=asset,
+                        prev_end=(str(prev_end) if prev_end else "none"),
+                        new_end=mkt.window_end,
+                        new_cid=mkt.condition_id[:12],
+                        up_token=mkt.token_up_id[:16],
+                        down_token=mkt.token_down_id[:16],
+                    )
                     # New window: allocate new WindowContext (or reset existing)
                     await self._on_new_window(ctx, mkt)
 

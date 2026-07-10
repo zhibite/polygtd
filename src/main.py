@@ -381,8 +381,16 @@ async def _midpoint_poll_loop() -> None:
             down_mid = await s.pm_client.get_midpoint(down_token)
             s.price_cache.midpoint[up_token] = up_mid
             s.price_cache.midpoint[down_token] = down_mid
-        except Exception:
-            pass  # Silent failure — WS fallback will still work
+            log.info(
+                "midpoint.poll",
+                slug=slug,
+                up_token=up_token[:16],
+                down_token=down_token[:16],
+                up_mid=up_mid,
+                down_mid=down_mid,
+            )
+        except Exception as exc:
+            log.warning("midpoint.poll error", slug=slug, up_token=up_token[:16], down_token=down_token[:16], error=str(exc))
 
 
 # ---------------------------------------------------------------------------
