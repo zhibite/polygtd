@@ -35,11 +35,14 @@ class WindowManager:
     Each asset has exactly one active WindowContext at any moment.
     """
 
+    MarketDiscoveredCallback = Callable[[str, "MarketInfo"], None]  # asset, market
+
     def __init__(
         self,
         market_svc: MarketService,
         symbols: list[str],
         on_new_round: WindowCallback | None = None,
+        on_market_discovered: MarketDiscoveredCallback | None = None,
         binance_spot=None,
         entry_cfg=None,
         round_period_s: int = 900,
@@ -47,6 +50,7 @@ class WindowManager:
         self._svc = market_svc
         self._symbols = symbols
         self._on_new = on_new_round  # fires on every 15-min boundary
+        self._on_market = on_market_discovered  # fires when market info is ready
         self._binance_spot = binance_spot
         self._entry_cfg = entry_cfg
         self._round_period = round_period_s
@@ -170,6 +174,10 @@ class WindowManager:
 
                 # New window: allocate new WindowContext (or reset existing)
                 await self._on_new_window(ctx, mkt)
+
+                # Notify consumer: market info (token IDs) is now available
+                if self._on_market:
+                    self._on_market(asset, mkt)
 
                 # Record BTC spot at window open (use K-line for backtrack)
                 if self._binance_spot is not None:

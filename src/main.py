@@ -217,6 +217,22 @@ async def _on_binance_connect() -> None:
     log.debug("binance_feed.connected")
 
 
+def _on_market_discovered(asset: str, mkt) -> None:
+    """Called by WindowManager as soon as market info (token IDs) is resolved."""
+    state = STATE
+    if state.market_ws:
+        state.market_ws.subscribe_tokens([mkt.token_up_id, mkt.token_down_id])
+    state.current_market = mkt
+    log.info(
+        "market.discovered",
+        asset=asset,
+        slug=mkt.slug or "",
+        cid=mkt.condition_id[:16],
+        up=mkt.token_up_id[:16],
+        down=mkt.token_down_id[:16],
+    )
+
+
 async def _on_new_round(round_start_ts: int) -> None:
     """
     Called by WindowManager on every 15-min boundary.
@@ -236,24 +252,11 @@ async def _on_new_round(round_start_ts: int) -> None:
     state.round_start_ts = round_start_ts
 
     # ── Use WindowManager for market discovery ─────────────────────────────────
+    # Note: market subscription (token IDs) is handled in _on_market_discovered.
+    # Here we just check that market is available.
     if state.wm:
         ctx = state.wm.get("BTC")
-        if ctx and ctx.market:
-            mkt_info = ctx.market  # new MarketInfo (from models.py)
-            state.current_market = mkt_info
-            if state.market_ws:
-                state.market_ws.subscribe_tokens([mkt_info.token_up_id, mkt_info.token_down_id])
-                await state.market_ws.stop()
-                await state.market_ws.start()
-            log.info(
-                "round.market_ready",
-                slug=f"btc-updown-15m-{round_start_ts}",
-                condition_id=mkt_info.condition_id[:16],
-                up=mkt_info.token_up_id[:16],
-                down=mkt_info.token_down_id[:16],
-            )
-        else:
-            state.current_market = None
+        if not (ctx and ctx.market):
             log.warning("round.market_not_found", round_start_ts=round_start_ts)
     else:
         state.current_market = None
@@ -421,6 +424,7 @@ async def main() -> None:
         market_svc=s.market_svc,
         symbols=["BTC"],
         on_new_round=_on_new_round,
+        on_market_discovered=_on_market_discovered,
         binance_spot=s.binance_spot,
         entry_cfg=None,
     )
