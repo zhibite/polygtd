@@ -12,6 +12,10 @@ def configure_logging() -> None:
     cfg = log_config()
     level = getattr(logging, cfg.LEVEL.upper(), logging.INFO)
 
+    # Silence HTTP library logs (httpx, httpcore)
+    for lib in ("httpx", "httpcore", "http"):
+        logging.getLogger(lib).setLevel(logging.WARNING)
+
     logging.basicConfig(
         format="%(message)s",
         stream=sys.stdout,

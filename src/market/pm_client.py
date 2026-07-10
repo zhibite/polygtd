@@ -229,6 +229,24 @@ class PolymarketClient:
             out.setdefault(tid, 0.0)
         return out
 
+    async def get_order_book(self, token_id: str) -> Optional[dict]:
+        """
+        Get order book (bids/asks) for a token from CLOB.
+        Returns: {"bids": [{"price": "0.50", "size": "100"}, ...], "asks": [...]}
+        """
+        c = await self._client()
+        try:
+            resp = await c.get(
+                f"{self.settings.polymarket_host}/orderbook",
+                params={"token_id": token_id},
+                timeout=3.0,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            log.debug("get_order_book failed", token_id=token_id[:12], error=str(e))
+            return None
+
     async def get_tick_size(self, token_id: str) -> str:
         """Get minimum tick size for a token (v2 CLOB API)."""
         c = await self._client()

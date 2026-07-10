@@ -160,21 +160,11 @@ class MarketWS:
 
         msg_type = msg.get("type", "")
 
-        # Extract token - may be in 'market' field or in price_changes entries
+        # Extract token - may be in 'market' field
         token = msg.get("token") or msg.get("asset_id") or ""
         market_field = msg.get("market", {})
         if not token and isinstance(market_field, dict):
             token = market_field.get("asset_id") or market_field.get("assetID") or ""
-
-        # Debug: log first few unique message types (info level)
-        if not hasattr(self, "_logged_types"):
-            self._logged_types = set()
-        if msg_type not in self._logged_types and len(self._logged_types) < 3:
-            self._logged_types.add(msg_type)
-            pcs = msg.get("price_changes", [])
-            # Log first price_change entry structure
-            pc_sample = pcs[0] if pcs else "EMPTY"
-            log.info("market_ws.msg_type", type=msg_type, market=msg.get("market"), pc_sample=str(pc_sample)[:200])
 
         # best_bid_ask - can be nested dict, flat dict, or list of {price, size}
         bba = msg.get("best_bid_ask")
@@ -192,6 +182,9 @@ class MarketWS:
                 if isinstance(x, dict) and "price" in x:
                     self._cache.best_bid[token] = float(x["price"])
                     break
+        elif bba is not None:
+            # Log unknown best_bid_ask format for debugging
+            log.debug("market_ws.unknown_bba_format", bba=str(bba)[:100])
 
         # last_trade_price
         ltp = msg.get("last_trade_price")
@@ -205,18 +198,12 @@ class MarketWS:
 
         # price_changes (list of incremental updates) - Plural!
         # Structure: {'asset_id': '...', 'price': '0.26', 'size': '708.79', 'side': 'SELL', 'hash': '...'}
+        # These are trade executions - price is the actual trade/transaction price
         pcs = msg.get("price_changes", [])
         if isinstance(pcs, list):
             for pc in pcs:
                 if isinstance(pc, dict):
                     pc_token = pc.get("asset_id") or token
                     price_str = pc.get("price")
-                    side = pc.get("side", "").upper()
                     if price_str:
-                        price = float(price_str)
-                        if side == "SELL":
-                            # A sell at this price means it's the best ask
-                            self._cache.best_ask[pc_token] = price
-                        elif side == "BUY":
-                            # A buy at this price means it's the best bid
-                            self._cache.best_bid[pc_token] = price
+                        self._cache.last_trade_price[pc_token] = float(price_str)

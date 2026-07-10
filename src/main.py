@@ -24,6 +24,7 @@ import asyncio
 import signal
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from src.config import general, binance, baseline_cfg, log_config, strategy
@@ -313,9 +314,16 @@ async def _on_new_round(round_start_ts: int) -> None:
 
 async def _status_loop() -> None:
     cfg = log_config()
+    last_status_ts = 0.0
     while True:
         await asyncio.sleep(cfg.HEARTBEAT_S)
         s = STATE
+
+        # Throttle status log to every 5s
+        now = time.time()
+        if now - last_status_ts < 5.0:
+            continue
+        last_status_ts = now
 
         bc = s.binance_cache.last_price
         gate_str = ""
@@ -327,11 +335,11 @@ async def _status_loop() -> None:
         mkt = s.current_market
         up_last = s.price_cache.last(mkt.up_token) if mkt and mkt.up_token else 0
         down_last = s.price_cache.last(mkt.down_token) if mkt and mkt.down_token else 0
-        up_bid = s.price_cache.bid(mkt.up_token) if mkt and mkt.up_token else 0
-        down_bid = s.price_cache.bid(mkt.down_token) if mkt and mkt.down_token else 0
 
         wm = s.wm
         next_in = wm.seconds_until_next() if wm else 0
+        window_end = wm.next_round_start() if wm else 0
+        window_end_str = datetime.fromtimestamp(window_end, tz=timezone.utc).strftime("%H:%M:%S")
 
         # Position state
         pos_str = ""
@@ -345,9 +353,8 @@ async def _status_loop() -> None:
 
         log.info(
             f"STATUS  binance={bc:,.1f}  {gate_str}"
-            f"  next_in={next_in:.0f}s  "
-            f"UP(last={up_last:.4f} bid={up_bid:.4f})  "
-            f"DOWN(last={down_last:.4f} bid={down_bid:.4f}){pos_str}"
+            f"  window_end={window_end_str}({next_in:.0f}s)  "
+            f"UP={up_last:.4f}  DOWN={down_last:.4f}{pos_str}"
         )
 
 
@@ -430,7 +437,7 @@ async def main() -> None:
     )
 
     # ── Execution layer ─────────────────────────────────────────────────
-    s.order_manager = OrderManager(s.clob, price_cache=s.price_cache)
+    s.order_manager = OrderManager(s.clob, price_cache=s.price_cache, pm_client=s.pm_client)
     s.heartbeat = HeartbeatLoop(s.clob)
 
     # ── GTD expiry watcher ──────────────────────────────────────────────

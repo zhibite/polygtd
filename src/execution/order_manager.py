@@ -23,6 +23,7 @@ from src.config import strategy as _s
 from src.execution.clob_client import CLOBClient, FillResult
 from src.infra.logging import get_logger
 from src.market.market_ws import PriceCache
+from src.market.pm_client import PolymarketClient
 
 log = get_logger(__name__)
 
@@ -57,10 +58,12 @@ class OrderManager:
         self,
         clob: CLOBClient,
         price_cache: PriceCache | None = None,
+        pm_client: PolymarketClient | None = None,
     ) -> None:
         self._clob = clob
         self._s = _s()
         self._cache = price_cache
+        self._pm = pm_client
         self._lock = asyncio.Lock()
         self._orders: dict[str, TrackedOrder] = {}          # client_order_id -> order
         self._by_server: dict[str, str] = {}               # server_id -> client_id
@@ -69,28 +72,45 @@ class OrderManager:
     # Price helpers
     # ------------------------------------------------------------------
 
-    def _adjust_buy_price(self, token_id: str, desired_price: float) -> float:
+    async def _get_best_bid_ask(self, token_id: str) -> tuple[float, float]:
+        """
+        Fetch live best bid/ask from REST API (orderbook endpoint).
+        Returns (best_bid, best_ask), defaults to (0, 0) on error.
+        """
+        if not self._pm:
+            return 0.0, 0.0
+        try:
+            ob = await self._pm.get_order_book(token_id)
+            if not ob:
+                return 0.0, 0.0
+            bids = ob.get("bids", [])
+            asks = ob.get("asks", [])
+            bid = float(bids[0].get("price", 0)) if bids else 0.0
+            ask = float(asks[0].get("price", 0)) if asks else 0.0
+            return bid, ask
+        except Exception:
+            return 0.0, 0.0
+
+    async def _adjust_buy_price(self, token_id: str, desired_price: float) -> float:
         """
         Snap GTD buy price just above the current best bid so a taker is
         more likely to cross the spread and fill us immediately.
         Falls back to desired_price if the book is unavailable.
         """
-        if self._cache:
-            bid = self._cache.bid(token_id)
-            if bid > 0:
-                return round(bid + self.BUY_STEP, 4)
+        bid, _ = await self._get_best_bid_ask(token_id)
+        if bid > 0:
+            return round(bid + self.BUY_STEP, 4)
         return desired_price
 
-    def _adjust_sell_price(self, token_id: str, desired_price: float) -> float:
+    async def _adjust_sell_price(self, token_id: str, desired_price: float) -> float:
         """
         Snap GTD sell price just below the current best ask so a taker is
         more likely to cross the spread and fill us immediately.
         Falls back to desired_price if the book is unavailable.
         """
-        if self._cache:
-            ask = self._cache.ask(token_id)
-            if ask > 0:
-                return round(ask - self.SELL_STEP, 4)
+        _, ask = await self._get_best_bid_ask(token_id)
+        if ask > 0:
+            return round(ask - self.SELL_STEP, 4)
         return desired_price
 
     # ------------------------------------------------------------------
@@ -136,7 +156,7 @@ class OrderManager:
             cid = f"{round_start_ts}-{tier_name}-{uuid.uuid4().hex[:8]}"
 
             # Snap to just above the current bid for better fill probability
-            adjusted_price = self._adjust_buy_price(token_id, price)
+            adjusted_price = await self._adjust_buy_price(token_id, price)
             result: FillResult = await self._clob.place_gtd_buy(
                 token_id=token_id,
                 price=adjusted_price,
@@ -204,7 +224,7 @@ class OrderManager:
             cid = f"{round_start_ts}-{tier_name}-{uuid.uuid4().hex[:8]}"
 
             # Snap to just below the current ask for better fill probability
-            sell_price = self._adjust_sell_price(token_id, price)
+            sell_price = await self._adjust_sell_price(token_id, price)
             result: FillResult = await self._clob.place_fak_sell(
                 token_id=token_id,
                 size=size,
