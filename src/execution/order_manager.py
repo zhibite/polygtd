@@ -343,7 +343,7 @@ class OrderManager:
                         )
 
             except Exception as exc:
-                log.warning("order_manager.reconcile.error: {}", exc)
+                log.warning("order_manager.reconcile.error", error=str(exc))
 
     # ------------------------------------------------------------------
     # State mutations from callbacks

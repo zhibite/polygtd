@@ -258,7 +258,7 @@ class UserWS:
             return
 
         if not order_id:
-            log.debug("user_ws.order_missing_id content={}", str(content)[:200])
+            log.debug("user_ws.order_missing_id", content=str(content)[:200])
             return
 
         ev = OrderEvent(
@@ -347,11 +347,11 @@ class UserWS:
                     mo_price = float(mo.get("price", 0))
                     mo_size = float(mo.get("size", 0))
                 except Exception:
-                    log.debug("user_ws.maker_parse_error mo={}", str(mo)[:200])
+                    log.debug("user_ws.maker_parse_error", mo=str(mo)[:200])
                     continue
 
                 if not mo_id or not asset_id:
-                    log.debug("user_ws.maker_missing_fields mo={}", str(mo)[:200])
+                    log.debug("user_ws.maker_missing_fields", mo=str(mo)[:200])
                     continue
 
                 fill = MakerFill(
@@ -389,7 +389,7 @@ class UserWS:
             size = float(content.get("size", 0))
 
             if not order_id:
-                log.debug("user_ws.trade_no_makers_no_id content={}", str(content)[:200])
+                log.debug("user_ws.trade_no_makers_no_id", content=str(content)[:200])
                 return
 
             fill = MakerFill(
@@ -418,4 +418,4 @@ class UserWS:
                 log.exception("user_ws.on_maker_fill callback raised")
 
         if fills_emitted == 0:
-            log.debug("user_ws.trade_no_fills content={}", str(content)[:200])
+            log.debug("user_ws.trade_no_fills", content=str(content)[:200])

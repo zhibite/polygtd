@@ -158,15 +158,15 @@ class StrategyEngine:
         """
         if not self._round:
             log.debug(
-                "engine.fill_ignored no_round token={} order_id={}",
-                token_id[:16], server_order_id,
+                "engine.fill_ignored no_round",
+                token=token_id[:16], order_id=server_order_id,
             )
             return
 
         if self._round.position.is_empty:
             log.debug(
-                "engine.fill_ignored no_position token={} order_id={}",
-                token_id[:16], server_order_id,
+                "engine.fill_ignored no_position",
+                token=token_id[:16], order_id=server_order_id,
             )
             return
 
@@ -176,8 +176,8 @@ class StrategyEngine:
                 # Verify asset_id matches — reject mismatches (cross-token contamination)
                 if token_id and token_id != tier.token_id and tier.token_id:
                     log.warning(
-                        "engine.fill_asset_mismatch token_id={} expected={} order_id={}",
-                        token_id[:16], tier.token_id[:16], server_order_id,
+                        "engine.fill_asset_mismatch",
+                        token=token_id[:16], expected=tier.token_id[:16], order_id=server_order_id,
                     )
                     return
 
@@ -196,7 +196,7 @@ class StrategyEngine:
                 )
                 return
 
-        log.debug("engine.fill_unknown order_id={}", server_order_id)
+        log.debug("engine.fill_unknown", order_id=server_order_id)
 
     def on_order_cancelled(self, server_order_id: str, reason: str = "manual") -> None:
         """
@@ -316,7 +316,7 @@ class StrategyEngine:
 
             # Price cap check
             if last_price > s.ENTRY_PRICE_CAP:
-                log.debug("engine.t1_skip_too_expensive side={} last={}", side, last_price)
+                log.debug("engine.t1_skip_too_expensive", side=side, last_price=last_price)
                 continue
 
             # ── T1 entry time gate ───────────────────────────────────────
@@ -342,8 +342,8 @@ class StrategyEngine:
             # Stake cap check — don't overcommit
             if pos.stake_cap_remaining < s.TIER1_NOTIONAL:
                 log.debug(
-                    "engine.t1_skip_cap_reached stake_remaining={} needed={}",
-                    pos.stake_cap_remaining, s.TIER1_NOTIONAL,
+                    "engine.t1_skip_cap_reached",
+                    stake_remaining=pos.stake_cap_remaining, needed=s.TIER1_NOTIONAL,
                 )
                 continue
 
@@ -419,8 +419,8 @@ class StrategyEngine:
             # Stake cap check — don't overcommit
             if pos.stake_cap_remaining < tier.notional:
                 log.debug(
-                    "engine.tN_skip_cap tier={} remaining={} needed={}",
-                    tier.tier, pos.stake_cap_remaining, tier.notional,
+                    "engine.tN_skip_cap",
+                    tier=tier.tier, remaining=pos.stake_cap_remaining, needed=tier.notional,
                 )
                 continue
 

@@ -377,14 +377,13 @@ async def main() -> None:
                 api_secret = creds.api_secret
                 api_passphrase = creds.api_passphrase
                 log.info(
-                    "clob_l1_auth.derived key={}...",
-                    api_key[:8],
+                    "clob_l1_auth.derived",
+                    api_key=api_key[:8],
                 )
             except ClobL1Error as exc:
                 log.error(
-                    "clob_l1_auth.failed: {} — trading disabled. "
-                    "Ensure wallet has pUSD balance and is logged into Polymarket.com",
-                    exc,
+                    "clob_l1_auth.failed — trading disabled",
+                    error=str(exc),
                 )
         else:
             log.warning(
@@ -553,8 +552,8 @@ def _make_maker_fill_callback(state: AppState):
 
         if not order_id or fill_size <= 0:
             log.debug(
-                "router.maker_fill.skip order_id={} size={}",
-                order_id, fill_size,
+                "router.maker_fill.skip",
+                order_id=order_id, fill_size=fill_size,
             )
             return
 
@@ -599,8 +598,8 @@ def _make_user_ws_order_callback(state: AppState):
             # Engine tracks fills via on_order_filled separately,
             # but UPDATE gives us the authoritative size_matched for the order.
             log.debug(
-                "router.order_update order_id={} size_matched={}",
-                order_id, ev.size_matched,
+                "router.order_update",
+                order_id=order_id, size_matched=ev.size_matched,
             )
 
     return on_order

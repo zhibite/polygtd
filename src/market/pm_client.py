@@ -146,8 +146,8 @@ class PolymarketClient:
                         outcomes = [t.get("outcome", "").lower() for t in m["tokens"]]
                         if outcomes[0] != "up" or outcomes[1] != "down":
                             log.warning(
-                                "get_asset_updown_markets({}): unexpected outcome order {!r}, skipping",
-                                asset, outcomes,
+                                "get_asset_updown_markets unexpected outcome order",
+                                asset=asset, outcomes=outcomes,
                             )
                             continue
 
@@ -158,11 +158,11 @@ class PolymarketClient:
                         markets.append(m)
                 if not markets and asset:
                     log.debug(
-                        "get_asset_updown_markets({} {} {}s) returned 0 markets for slug prefix {}",
-                        asset, slug_interval, window_sec, prefix,
+                        "get_asset_updown_markets returned 0 markets",
+                        asset=asset, slug_interval=slug_interval, window_sec=window_sec, prefix=prefix,
                     )
             except Exception as e:
-                log.debug("Slug {} query failed: {}", slug, e)
+                log.debug("Slug query failed", slug=slug, error=str(e))
 
         return markets[:limit]
 
@@ -177,7 +177,7 @@ class PolymarketClient:
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
-            log.debug("get_markets_by_condition_id({}) failed: {}", condition_id[:12], e)
+            log.debug("get_markets_by_condition_id failed", condition_id=condition_id[:12], error=str(e))
             return None
 
     # ── CLOB price data ─────────────────────────────────────────────────────────
@@ -264,7 +264,7 @@ class PolymarketClient:
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
-            log.debug("get_clob_market_info({}) failed: {}", condition_id[:12], e)
+            log.debug("get_clob_market_info failed", condition_id=condition_id[:12], error=str(e))
             return None
 
     # ── Fee rate ────────────────────────────────────────────────────────────────
@@ -308,8 +308,8 @@ class PolymarketClient:
                 data = data[0]
             elif not isinstance(data, dict):
                 log.warning(
-                    "get_market_resolution({}) unexpected response type: {}",
-                    condition_id[:12], type(data).__name__,
+                    "get_market_resolution unexpected response type",
+                    condition_id=condition_id[:12], got=type(data).__name__,
                 )
                 return None
 
@@ -334,7 +334,7 @@ class PolymarketClient:
         except Exception as e:
             is_422 = getattr(e, "status_code", None) == 422
             level = "debug" if is_422 else "warning"
-            getattr(log, level)("get_market_resolution({}) failed: {}", condition_id[:12], e)
+            getattr(log, level)("get_market_resolution failed", condition_id=condition_id[:12], error=str(e))
             return None
 
 

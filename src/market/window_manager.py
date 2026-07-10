@@ -142,11 +142,11 @@ class WindowManager:
             ctx = self._ctxs[asset]
 
             if isinstance(result, BaseException):
-                log.warning("discover_market {} failed: {}", asset, result)
+                log.warning("discover_market failed", asset=asset, error=str(result))
                 continue
 
             if result is None:
-                log.debug("discover_market {} returned None (no active window)", asset)
+                log.debug("discover_market returned None (no active window)", asset=asset)
                 continue
 
             mkt = result  # MarketInfo
@@ -182,15 +182,14 @@ class WindowManager:
                             datetime.now(timezone.utc) - mkt.window_start
                         ).total_seconds()
                         log.info(
-                            "window_mgr {} BTC spot at window_open = {} "
-                            "(window_start={}, age={:.1f}s)",
-                            asset, btc_price, mkt.window_start.isoformat(), age_sec,
+                            "window_mgr BTC spot at window_open",
+                            asset=asset, btc_price=btc_price,
+                            window_start=mkt.window_start.isoformat(), age_sec=age_sec,
                         )
                     else:
                         log.warning(
-                            "window_mgr {} failed to get BTC spot at window_open "
-                            "(window_start={}) — entry_open_offset check will be stale",
-                            asset, mkt.window_start.isoformat(),
+                            "window_mgr failed to get BTC spot at window_open",
+                            asset=asset, window_start=mkt.window_start.isoformat(),
                         )
 
                 # Cross-window BTC drift guard
@@ -210,17 +209,19 @@ class WindowManager:
                     if drift_pct > drift_pct_cfg + 1e-9:
                         ctx.skip_until_next_window = True
                         log.warning(
-                            "window_mgr {} cross-window BTC drift {:.3f}% > "
-                            "{:.3f}% → SKIP new window (prev_close={} new_open={})",
-                            asset, drift_pct, drift_pct_cfg,
-                            prev_close, mkt.btc_spot_at_window_open,
+                            "window_mgr cross-window BTC drift > threshold → SKIP new window",
+                            asset=asset, drift_pct=drift_pct,
+                            drift_pct_cfg=drift_pct_cfg,
+                            prev_close=prev_close,
+                            new_open=mkt.btc_spot_at_window_open,
                         )
                     else:
                         log.info(
-                            "window_mgr {} cross-window BTC drift {:.3f}% ≤ "
-                            "{:.3f}% → normal trading enabled (prev_close={} new_open={})",
-                            asset, drift_pct, drift_pct_cfg,
-                            prev_close, mkt.btc_spot_at_window_open,
+                            "window_mgr cross-window BTC drift ≤ threshold → normal trading",
+                            asset=asset, drift_pct=drift_pct,
+                            drift_pct_cfg=drift_pct_cfg,
+                            prev_close=prev_close,
+                            new_open=mkt.btc_spot_at_window_open,
                         )
                 else:
                     reasons = []
@@ -234,13 +235,12 @@ class WindowManager:
                     if drift_pct_cfg <= 0:
                         reasons.append("cfg disabled")
                     log.warning(
-                        "window_mgr {} cross-window BTC drift check skipped: "
-                        "{} (continuing without skip)",
-                        asset, "; ".join(reasons),
+                        "window_mgr cross-window BTC drift check skipped",
+                        asset=asset, reasons="; ".join(reasons),
                     )
                 log.info(
-                    "window_mgr {} discovered: cid={} end={}",
-                    asset, mkt.condition_id[:12], mkt.window_end,
+                    "window_mgr discovered",
+                    asset=asset, cid=mkt.condition_id[:12], end=mkt.window_end,
                 )
 
         # Fetch prices for all active windows in parallel
@@ -250,7 +250,7 @@ class WindowManager:
             price_results = await asyncio.gather(*price_tasks.values(), return_exceptions=True)
             for asset, price_result in zip(price_tasks.keys(), price_results):
                 if isinstance(price_result, BaseException):
-                    log.warning("fetch_prices {} failed: {}", asset, price_result)
+                    log.warning("fetch_prices failed", asset=asset, error=str(price_result))
                     ctx = self._ctxs[asset]
                     if ctx.market:
                         ctx.market._up_mid = 0.5
@@ -328,8 +328,8 @@ class WindowManager:
 
         if prev_id and prev_id != mkt.condition_id:
             log.info(
-                "window_mgr {} window changed: {} -> {}",
-                ctx.asset, prev_id[:12], mkt.condition_id[:12],
+                "window_mgr window changed",
+                asset=ctx.asset, prev_cid=prev_id[:12], new_cid=mkt.condition_id[:12],
             )
 
         # Boot-time window age guard: skip if window already open > grace_sec
@@ -344,13 +344,11 @@ class WindowManager:
                 if age_sec > grace_sec:
                     ctx.skip_until_next_window = True
                     log.warning(
-                        "window_mgr {} boot-time window is late (elapsed={:.1f}s > grace={:.1f}s) "
-                        "→ SKIP this window, wait for next one",
-                        ctx.asset, age_sec, grace_sec,
+                        "window_mgr boot-time window is late → SKIP this window",
+                        asset=ctx.asset, age_sec=age_sec, grace_sec=grace_sec,
                     )
                 else:
                     log.info(
-                        "window_mgr {} boot-time window age={:.1f}s ≤ grace={:.1f}s → "
-                        "normal trading enabled",
-                        ctx.asset, age_sec, grace_sec,
+                        "window_mgr boot-time window within grace",
+                        asset=ctx.asset, age_sec=age_sec, grace_sec=grace_sec,
                     )

@@ -122,11 +122,11 @@ class CLOBClient:
                 signature_type=self._signature_type,
             )
             log.info(
-                "CLOBClient ready: host={} sig_type={}",
-                self._host, self._signature_type,
+                "CLOBClient ready",
+                host=self._host, sig_type=self._signature_type,
             )
         except Exception as exc:
-            log.error("CLOBClient init failed: {}", exc)
+            log.error("CLOBClient init failed", error=str(exc))
             self._client = None
 
     def is_configured(self) -> bool:
@@ -144,7 +144,7 @@ class CLOBClient:
             bal = await self._run(self._client.get_pusd_balance)
             return float(bal) / 1_000_000 if bal else 0.0
         except Exception as exc:
-            log.warning("clob.get_balance.error: {}", exc)
+            log.warning("clob.get_balance.error", error=str(exc))
             return 0.0
 
     async def get_token_balance(self, token_id: str) -> float:
@@ -155,7 +155,7 @@ class CLOBClient:
             bal = await self._run(self._client.get_balance, token_id)
             return float(bal) if bal else 0.0
         except Exception as exc:
-            log.debug("clob.get_token_balance.error: {}", exc)
+            log.debug("clob.get_token_balance.error", error=str(exc))
             return 0.0
 
     # ------------------------------------------------------------------
@@ -190,8 +190,9 @@ class CLOBClient:
             return FillResult("", 0, 0, price_q, False, "tokens below CLOB 5-shares minimum")
 
         log.debug(
-            "clob.gtd_buy token={} size={:.4f} price={:.4f} tick={} expires={}",
-            token_id[:12], size_q, price_q, tick_size, expiration_ts,
+            "clob.gtd_buy",
+            token=token_id[:12], size=size_q, price=price_q,
+            tick=tick_size, expires=expiration_ts,
         )
 
         try:
@@ -211,7 +212,7 @@ class CLOBClient:
                 post_only=False,
             )
         except Exception as exc:
-            log.warning("clob.gtd_buy.post_error: {}", exc)
+            log.warning("clob.gtd_buy.post_error", error=str(exc))
             return FillResult("", 0, 0, price_q, False, str(exc))
 
         if not resp:
@@ -234,7 +235,7 @@ class CLOBClient:
             try:
                 status_resp = await self._run(self._client.get_order, order_id)
             except Exception as exc:
-                log.debug("clob.gtd_buy.get_order error: {}", exc)
+                log.debug("clob.gtd_buy.get_order error", error=str(exc))
                 continue
 
             if not status_resp:
@@ -265,7 +266,7 @@ class CLOBClient:
 
             order_status = (status_resp.get("status") or "").lower()
             if order_status in ("cancelled", "expired", "failed"):
-                log.info("clob.gtd_buy expired status={}", order_status)
+                log.info("clob.gtd_buy expired", status=order_status)
                 return FillResult(
                     order_id=order_id, tokens=0, usdc=0,
                     fill_price=price_q, success=False,
@@ -306,8 +307,8 @@ class CLOBClient:
         size_q = _round_down(size, max(Decimal("0.0001"), tick_d))
 
         log.debug(
-            "clob.fak_sell token={} size={:.4f} price={:.4f} slippage={}%",
-            token_id[:12], size_q, sell_price, slippage_pct,
+            "clob.fak_sell",
+            token=token_id[:12], size=size_q, price=sell_price, slippage_pct=slippage_pct,
         )
 
         try:
@@ -321,7 +322,7 @@ class CLOBClient:
                 self._client.create_and_post_market_order, mkt_args
             )
         except Exception as exc:
-            log.warning("clob.fak_sell.post_error: {}", exc)
+            log.warning("clob.fak_sell.post_error", error=str(exc))
             return FillResult("", 0, 0, sell_price, False, str(exc))
 
         if not resp:
@@ -366,10 +367,10 @@ class CLOBClient:
             return False
         try:
             await self._run(self._client.cancel_order, order_id)
-            log.info("clob.order_cancelled id={}", order_id[:16])
+            log.info("clob.order_cancelled", order_id=order_id[:16])
             return True
         except Exception as exc:
-            log.warning("clob.cancel_order error: {}", exc)
+            log.warning("clob.cancel_order error", error=str(exc))
             return False
 
     async def cancel_orders(self, order_ids: list[str]) -> dict:
@@ -380,7 +381,7 @@ class CLOBClient:
             resp = await self._run(self._client.cancel_orders, [{"orderID": oid} for oid in order_ids])
             return resp if isinstance(resp, dict) else {"canceled": order_ids, "not_canceled": []}
         except Exception as exc:
-            log.warning("clob.cancel_orders error: {}", exc)
+            log.warning("clob.cancel_orders error", error=str(exc))
             return {"canceled": [], "not_canceled": list(order_ids)}
 
     # ------------------------------------------------------------------
@@ -395,7 +396,7 @@ class CLOBClient:
             resp = await self._run(self._client.post_heartbeat, heartbeat_id)
             return resp if resp else {"success": True}
         except Exception as exc:
-            log.warning("clob.heartbeat.error: {}", exc)
+            log.warning("clob.heartbeat.error", error=str(exc))
             return {"success": False, "error": str(exc)}
 
     # ------------------------------------------------------------------
@@ -412,7 +413,7 @@ class CLOBClient:
                 orders = [o for o in orders if o.get("conditionID") == condition_id]
             return orders
         except Exception as exc:
-            log.warning("clob.get_orders error: {}", exc)
+            log.warning("clob.get_orders error", error=str(exc))
             return []
 
     async def get_midpoint(self, token_id: str) -> float:
@@ -422,7 +423,7 @@ class CLOBClient:
         try:
             return float(await self._run(self._client.get_midpoint, token_id))
         except Exception as exc:
-            log.warning("clob.get_midpoint error: {}", exc)
+            log.warning("clob.get_midpoint error", error=str(exc))
             return 0.0
 
     # ------------------------------------------------------------------
@@ -436,7 +437,7 @@ class CLOBClient:
             try:
                 self.fill_callback(token_id, order_id, fill_price, fill_size)
             except Exception as exc:
-                log.debug("fill_callback error: {}", exc)
+                log.debug("fill_callback error", error=str(exc))
 
     @staticmethod
     async def _run(fn, *args, **kwargs):

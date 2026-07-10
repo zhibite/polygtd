@@ -147,11 +147,11 @@ class BinanceSpotService:
             self._cached_at = now
             elapsed = (now - self._last_log_at).total_seconds() if self._last_log_at else 999.0
             if elapsed >= 10.0:
-                log.debug("binance_spot BTC/USDT = {}", price)
+                log.debug("binance_spot BTC/USDT", price=price)
                 self._last_log_at = now
             return price
         except Exception as exc:
-            log.warning("binance_spot fetch failed: {}", exc)
+            log.warning("binance_spot fetch failed", error=str(exc))
             return self._cached_price
 
     async def fetch_price_at(self, ts_utc: datetime) -> Optional[float]:
@@ -180,7 +180,7 @@ class BinanceSpotService:
             resp.raise_for_status()
             arr = resp.json()
             if not arr:
-                log.warning("binance_spot klines empty for ts={}", ts_utc.isoformat())
+                log.warning("binance_spot klines empty", ts=ts_utc.isoformat())
                 return None
             target_ts_ms = int(ts_utc.timestamp() * 1000)
             best_kline, best_delta = None, None
@@ -201,13 +201,13 @@ class BinanceSpotService:
                 return None
             self._kline_cache[cache_key] = close_price
             log.debug(
-                "binance_spot kline @{} = {} (requested ts={})",
-                datetime.fromtimestamp(int(best_kline[0]) / 1000, tz=timezone.utc).isoformat(),
-                close_price, ts_utc.isoformat(),
+                "binance_spot kline",
+                ts=datetime.fromtimestamp(int(best_kline[0]) / 1000, tz=timezone.utc).isoformat(),
+                price=close_price, requested=ts_utc.isoformat(),
             )
             return close_price
         except Exception as exc:
-            log.warning("binance_spot klines fetch failed (ts={}): {}", ts_utc.isoformat(), exc)
+            log.warning("binance_spot klines fetch failed", ts=ts_utc.isoformat(), error=str(exc))
             return None
 
     async def fetch_at_window_open(
@@ -229,9 +229,8 @@ class BinanceSpotService:
             if kline_px is not None and kline_px > 0:
                 return kline_px
             log.warning(
-                "binance_spot: kline fetch failed for window_start={} — falling back to spot price "
-                "(may be inaccurate; entry_open_offset check will be stale until next tick)",
-                window_start.isoformat(),
+                "binance_spot kline fetch failed for window_start — falling back to spot price",
+                window_start=window_start.isoformat(),
             )
             return await self.fetch_price()
         log.debug("fetch_at_window_open called without window_start — using current price only")

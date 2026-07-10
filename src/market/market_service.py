@@ -135,7 +135,7 @@ class MarketService:
                 [market.token_up_id, market.token_down_id]
             )
         except Exception as e:
-            log.debug("fetch_last_trade_prices failed: {}", e)
+            log.debug("fetch_last_trade_prices failed", error=str(e))
             return 0.5, 0.5
         up = prices.get(market.token_up_id, 0.0)
         dn = prices.get(market.token_down_id, 0.0)

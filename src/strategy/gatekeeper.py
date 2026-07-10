@@ -111,8 +111,8 @@ class GateKeeper:
             next_trigger = baseline * (1 - next_tier_drop_pct)
             if token_price <= next_trigger:
                 log.debug(
-                    "gatekeeper.drift_bypass tier={} token={:.4f} next_trigger={:.4f}",
-                    current_tier, token_price, next_trigger,
+                    "gatekeeper.drift_bypass",
+                    tier=current_tier, token=token_price, next_trigger=next_trigger,
                 )
                 return True
 
