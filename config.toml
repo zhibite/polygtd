@@ -1,0 +1,24 @@
+###############################################################################
+# Polymarket BTC 15m Up/Down bot configuration
+###############################################################################
+
+[GENERAL]
+ROUND_PERIOD_S=900
+WINDOW_PRE_OPEN_S=300
+
+[BINANCE]
+WS_URL=wss://stream.binance.com:9443/ws/btcusdt@trade
+RECONNECT_BASE_S=1.0
+RECONNECT_MAX_S=30.0
+BUFFER_RETENTION_S=1200
+
+[ROUND_CLOCK]
+TIMEZONE=local
+
+[BASELINE]
+WINDOW_S=300
+MIN_SAMPLES=30
+
+[LOG]
+LEVEL=INFO
+HEARTBEAT_S=5

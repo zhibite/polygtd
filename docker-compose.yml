@@ -1,0 +1,18 @@
+services:
+  polymarket-gtd:
+    build: .
+    container_name: polymarket-gtd
+    restart: unless-stopped
+    ports:
+      - "8004:8004"
+    volumes:
+      - polymarket_data:/app/data
+    env_file:
+      - .env.docker
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+
+volumes:
+  polymarket_data:
+    driver: local
