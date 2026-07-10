@@ -222,6 +222,11 @@ def _on_market_discovered(asset: str, mkt) -> None:
     """Called by WindowManager as soon as market info (token IDs) is resolved."""
     state = STATE
 
+    # Detect if this is a window transition (condition_id changed)
+    prev_up = getattr(state.current_market, "token_up_id", None) if state.current_market else None
+    prev_cid = getattr(state.current_market, "condition_id", "") if state.current_market else ""
+    is_transition = prev_cid and prev_cid != mkt.condition_id
+
     # Clear old token prices from cache to avoid stale data
     if state.current_market and state.price_cache:
         old_up = getattr(state.current_market, "token_up_id", None)
@@ -233,14 +238,30 @@ def _on_market_discovered(asset: str, mkt) -> None:
     if state.market_ws:
         state.market_ws.subscribe_tokens([mkt.token_up_id, mkt.token_down_id])
     state.current_market = mkt
-    log.info(
-        "market.discovered",
-        asset=asset,
-        slug=mkt.slug or "",
-        cid=mkt.condition_id[:16],
-        up=mkt.token_up_id[:16],
-        down=mkt.token_down_id[:16],
-    )
+
+    if is_transition:
+        log.info(
+            "market.transition",
+            asset=asset,
+            slug=mkt.slug or "",
+            cid=mkt.condition_id[:16],
+            up=mkt.token_up_id[:16],
+            down=mkt.token_down_id[:16],
+            round_start_ts=mkt.round_start_ts,
+            window_start=mkt.window_start.isoformat(),
+            window_end=mkt.window_end.isoformat(),
+            prev_cid=prev_cid[:16],
+            prev_up=(prev_up[:16] if prev_up else "none"),
+        )
+    else:
+        log.info(
+            "market.discovered",
+            asset=asset,
+            slug=mkt.slug or "",
+            cid=mkt.condition_id[:16],
+            up=mkt.token_up_id[:16],
+            down=mkt.token_down_id[:16],
+        )
 
 
 async def _on_new_round(round_start_ts: int) -> None:
@@ -323,16 +344,37 @@ async def _on_new_round(round_start_ts: int) -> None:
 
 async def _midpoint_poll_loop() -> None:
     """Poll /midpoint REST API every 2s to keep stable price cache updated."""
+    last_slug = ""
     while True:
         await asyncio.sleep(2.0)
         s = STATE
-        if not s.pm_client or not s.current_market:
+        if not s.pm_client:
             continue
 
-        up_token = s.current_market.up_token
-        down_token = s.current_market.down_token
-        if not up_token or not down_token:
+        wm = s.wm
+        if not wm:
             continue
+
+        ctx = wm.get("BTC")
+        mkt = ctx.market if ctx else None
+        if not mkt or not mkt.token_up_id or not mkt.token_down_id:
+            continue
+
+        slug = mkt.slug or ""
+        up_token = mkt.token_up_id
+        down_token = mkt.token_down_id
+
+        # Log window transition
+        if slug != last_slug and last_slug:
+            log.info(
+                "midpoint.window_changed",
+                prev_slug=last_slug,
+                new_slug=slug,
+                up_token=up_token[:16],
+                down_token=down_token[:16],
+                round_start_ts=mkt.round_start_ts,
+            )
+        last_slug = slug
 
         try:
             up_mid = await s.pm_client.get_midpoint(up_token)
@@ -367,13 +409,13 @@ async def _status_loop() -> None:
             flag = "PASS" if gs.within_limit else "FAIL"
             gate_str = f"drift={gs.drift:.4f} [{flag}] |"
 
-        mkt = s.current_market
+        wm = s.wm
+        mkt = wm.get("BTC").market if wm and wm.get("BTC") else None
         up_token = mkt.up_token if mkt else ""
         down_token = mkt.down_token if mkt else ""
         up_last = s.price_cache.get_midpoint(up_token) if up_token else 0
         down_last = s.price_cache.get_midpoint(down_token) if down_token else 0
 
-        wm = s.wm
         next_in = wm.seconds_until_next() if wm else 0
         window_end = wm.next_round_start() if wm else 0
         window_end_str = datetime.fromtimestamp(window_end, tz=timezone.utc).strftime("%H:%M:%S")

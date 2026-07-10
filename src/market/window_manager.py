@@ -351,11 +351,20 @@ class WindowManager:
         ctx.market = mkt
         ctx.reset_for_new_window()
 
-        if prev_id and prev_id != mkt.condition_id:
-            log.info(
-                "window_mgr window changed",
-                asset=ctx.asset, prev_cid=prev_id[:12], new_cid=mkt.condition_id[:12],
-            )
+        log.info(
+            "window_mgr.new_window",
+            asset=ctx.asset,
+            slug=mkt.slug or "",
+            prev_cid=(prev_id[:12] if prev_id else "none"),
+            new_cid=mkt.condition_id[:12],
+            round_start_ts=mkt.round_start_ts,
+            window_start=mkt.window_start.isoformat(),
+            window_end=mkt.window_end.isoformat(),
+            up_token=mkt.token_up_id[:16],
+            down_token=mkt.token_down_id[:16],
+            window_open_up=mkt.window_open_up,
+            window_open_down=mkt.window_open_down,
+        )
 
         # Boot-time window age guard: skip if window already open > grace_sec
         first_seen = self._first_seen.get(ctx.asset, False)
