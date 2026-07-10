@@ -28,9 +28,17 @@ from src.market.pm_client import PolymarketClient
 log = get_logger(__name__)
 
 # Two-stage TP: maker-first, fallback to taker.
-# `TP_GTD_LIFETIME_S` is short on purpose — window market is 15 minutes and we
-# want to clear position before settlement if market is shallow.
-TP_GTD_LIFETIME_S: int = 90         # how long we wait at the bid (maker)
+#
+# IMPORTANT: TP_GTD_LIFETIME_S is the DESIRED lifetime — Polymarket CLOB
+# enforces a 180-second hard floor (`CLOBClient.GTD_MIN_SEC = 180`), so the
+# actual server-side lifetime is `effective_lifetime = max(TP_GTD_LIFETIME_S,
+# GTD_MIN_SEC + 1) = 181s`. Setting TP_GTD_LIFETIME_S below 180 does NOT
+# shorten the TP wait — it is clamped. If you need shorter TP windows, you
+# must accept the CLOB's floor; the bot already does the right thing.
+#
+# The corresponding fallback-buffer wait in `place_tp_with_fallback` is
+# `effective_lifetime - TP_FALLBACK_BUFFER_S = 166s` for current settings.
+TP_GTD_LIFETIME_S: int = 90         # desired; clamped to 181s by CLOB
 TP_FALLBACK_BUFFER_S: int = 15     # how much buffer before GTD deadline to start fallback
 
 
@@ -59,10 +67,35 @@ class OrderManager:
     """Serialized order executor with in-memory state."""
 
     # How close to the book to post GTD orders (in ticks).
-    # BUY: bid + BUY_STEP ticks → slightly above bid so taker hits us first.
-    # SELL: ask - SELL_STEP ticks → slightly below ask so taker hits us first.
+    # M-NEW-4 fix: Polymarket BTC 15m markets use tick_size=0.01; the previous
+    # hard-coded BUY_STEP=0.001 was below tick granularity and round-down in
+    # the CLOB would collapse it back to bid, defeating the taker-cross intent.
+    # Use tick_size-aware stepping so we always land strictly inside the bid→ask
+    # band: BUY = bid + tick_size/2, SELL = ask - tick_size/2.
+    #
+    # The legacy 0.001 values are kept as fallbacks for any market with
+    # tick_size <= 0.001 (no such market exists today but keeps the math safe).
     BUY_STEP: float = 0.001
     SELL_STEP: float = 0.001
+
+    @staticmethod
+    def _buy_step_for(tick_size: float) -> float:
+        """Step size for BUY snap, scaled to the market's tick granularity.
+
+        tick_size=0.01 → step=0.005 (half a tick above bid, round-up).
+        tick_size=0.001 → step=0.0005.
+        tick_size=0.0001 → step=0.0001 (smaller than half a tick — clamp).
+        """
+        if tick_size <= 0:
+            return OrderManager.BUY_STEP
+        return max(tick_size / 2.0, min(tick_size, 0.0001))
+
+    @staticmethod
+    def _sell_step_for(tick_size: float) -> float:
+        """Step size for SELL snap, mirror of _buy_step_for."""
+        if tick_size <= 0:
+            return OrderManager.SELL_STEP
+        return max(tick_size / 2.0, min(tick_size, 0.0001))
 
     def __init__(
         self,
@@ -77,6 +110,11 @@ class OrderManager:
         self._lock = asyncio.Lock()
         self._orders: dict[str, TrackedOrder] = {}          # client_order_id -> order
         self._by_server: dict[str, str] = {}               # server_id -> client_id
+        # H-NEW-1 fix: queue of (fill_price, size_matched) tuples for server_ids
+        # that arrived BEFORE the real TrackedOrder was inserted (CLOBClient
+        # fired the fill callback synchronously from inside place_gtd_buy).
+        # Drained by resolve_pending_server_id() when the real entry lands.
+        self._pending_fills: dict[str, list[tuple[float, float]]] = {}
 
     # ------------------------------------------------------------------
     # Price helpers
@@ -101,26 +139,36 @@ class OrderManager:
         except Exception:
             return 0.0, 0.0
 
-    async def _adjust_buy_price(self, token_id: str, desired_price: float) -> float:
+    async def _adjust_buy_price(self, token_id: str, desired_price: float, tick_size: float = 0.01) -> float:
         """
         Snap GTD buy price just above the current best bid so a taker is
         more likely to cross the spread and fill us immediately.
+
+        M-NEW-4 fix: uses `_buy_step_for(tick_size)` instead of the legacy
+        hard-coded BUY_STEP=0.001, which round-down to nothing on
+        tick_size=0.01 markets. Now the snap moves us strictly above bid
+        by at least half a tick.
+
         Falls back to desired_price if the book is unavailable.
         """
         bid, _ = await self._get_best_bid_ask(token_id)
         if bid > 0:
-            return round(bid + self.BUY_STEP, 4)
+            step = self._buy_step_for(tick_size)
+            return round(bid + step, 4)
         return desired_price
 
-    async def _adjust_sell_price(self, token_id: str, desired_price: float) -> float:
+    async def _adjust_sell_price(self, token_id: str, desired_price: float, tick_size: float = 0.01) -> float:
         """
         Snap GTD sell price just below the current best ask so a taker is
         more likely to cross the spread and fill us immediately.
-        Falls back to desired_price if the book is unavailable.
+
+        M-NEW-4 fix: uses `_sell_step_for(tick_size)`. Symmetric with the
+        BUY adjustment.
         """
         _, ask = await self._get_best_bid_ask(token_id)
         if ask > 0:
-            return round(ask - self.SELL_STEP, 4)
+            step = self._sell_step_for(tick_size)
+            return round(ask - step, 4)
         return desired_price
 
     # ------------------------------------------------------------------
@@ -146,9 +194,169 @@ class OrderManager:
             if o.token_id == token_id and o.status in ("placed", "live")
         ]
 
+    # ── H-NEW-1 fix: pending-server-id + pending-fill queue
+    # ────────────────────────────────────────────────────
+    #
+    # CLOBClient.place_gtd_buy polls every 0.5s. If the CLOB fills the order
+    # within the first poll cycle, the fill callback fires BEFORE the await
+    # returns to OrderManager.place_buy — meaning the server_id -> client_id
+    # mapping in `self._by_server` is NOT yet populated when the callback
+    # lands. om.by_server_id(server_id) returns None, the fill is logged as
+    # "untracked" and silently dropped, and tier.size_filled / _total_cost
+    # never advance even though the user has paid.
+    #
+    # Two-part fix:
+    #   (a) `register_pending_server_id(server_id)` lets the CLOBClient
+    #       pre-register the server_id the moment the post-response arrives.
+    #       We use a sentinel client_order_id; by_server_id() below detects
+    #       the sentinel and either returns the eventual TrackedOrder (if
+    #       already inserted) or queues the fill arguments for replay.
+    #   (b) `_pending_fills[server_id]` stores fill kwargs that arrived
+    #       before the real TrackedOrder was inserted; on insertion we
+    #       replay them through `apply_fill_event` so size_matched and the
+    #       downstream engine state stay coherent.
+
+    def register_pending_server_id(self, server_id: str) -> None:
+        """Pre-register a server_order_id before the full TrackedOrder exists.
+
+        Called by CLOBClient as soon as the post-response arrives (i.e. the
+        moment we know the server_id). Idempotent: if the server_id is
+        already mapped to a real client_order_id, this is a no-op.
+        """
+        if not server_id or server_id in self._by_server:
+            return
+        sentinel_cid = f"_pending_{server_id}"
+        self._by_server[server_id] = sentinel_cid
+
+    def resolve_pending_server_id(self, real_cid: str, server_id: str) -> None:
+        """After place_buy / place_gtd_sell finishes, re-point the server_id
+        to the real client_order_id and replay any pending fills.
+
+        Pending fills (queue (b)) are drained in arrival order so that
+        cumulative size_matched / _avg_cost reflects every observed fill,
+        not just the ones that landed after the TrackedOrder existed.
+        """
+        if not server_id:
+            return
+        self._by_server[server_id] = real_cid
+        # If a fill raced us, the deduper-driven callback fired while we
+        # still pointed at the sentinel. Replay queued fills now so the
+        # real TrackedOrder's size_matched / state catch up.
+        bucket = getattr(self, "_pending_fills", None)
+        pending = bucket.pop(server_id, []) if bucket is not None else []
+        if pending:
+            order = self._orders.get(real_cid)
+            if order:
+                for fill_price, size_matched in pending:
+                    self.apply_fill_event(server_id, size_matched=size_matched, fill_price=fill_price)
+                # If the cumulative matched reached the order's expected size,
+                # promote the status to "filled" (mirrors what mark_filled
+                # would have done had the lookup succeeded in time).
+                if order.size_matched + 1e-9 >= order.size * 0.995:
+                    self.mark_filled(server_id)
+                log.info(
+                    "order_manager.replay_pending_fills",
+                    server_id=server_id[:16],
+                    count=len(pending),
+                    real_cid=real_cid,
+                )
+
+    def queue_pending_fill(self, server_id: str, fill_price: float, size_matched: float) -> None:
+        """Store a fill observation that arrived before the real TrackedOrder.
+
+        Called from `apply_fill_event` when the sentinel is detected. The
+        fill is replayed via `resolve_pending_server_id` once the real
+        client_order_id is inserted.
+        """
+        if not server_id:
+            return
+        # Tolerate tests that build OrderManager via __new__ without
+        # running __init__ (which would have created _pending_fills).
+        bucket = getattr(self, "_pending_fills", None)
+        if bucket is None:
+            self._pending_fills = {}
+            bucket = self._pending_fills
+        bucket.setdefault(server_id, []).append((fill_price, size_matched))
+
+    def drain_pending_fills(self, server_id: str) -> None:
+        """Explicitly drop pending fills for a server_id (e.g. on cancel)."""
+        bucket = getattr(self, "_pending_fills", None)
+        if bucket is not None:
+            bucket.pop(server_id, None)
+
+    def _cleanup_failed_post(self, server_id: str | None) -> None:
+        """Drop the sentinel mapping and any queued fills for a failed post.
+
+        B-V4-1 fix (audit v4): `register_pending_server_id` writes a sentinel
+        `_pending_<server_id>` to `_by_server` the moment CLOBClient's
+        `place_gtd_buy` / `place_gtd_sell` / `place_fak_sell` returns the
+        server_order_id. If the post then yields `success=False` (network
+        error, size < 5 tokens, poll timeout), the TrackedOrder is never
+        inserted and `resolve_pending_server_id` is never called. The
+        sentinel + any queued `_pending_fills` would persist forever,
+        causing subsequent fill callbacks for the same server_id to be
+        re-queued into a dead-letter bucket.
+
+        Callers must invoke this on every failure path that exits with
+        `return None` so that partial state is not leaked.
+        """
+        if not server_id:
+            return
+        # Only drop sentinel entries; never touch a real cid mapping
+        # that a successful post elsewhere may have installed.
+        client_id = self._by_server.get(server_id)
+        if client_id and client_id.startswith("_pending_"):
+            self._by_server.pop(server_id, None)
+        self.drain_pending_fills(server_id)
+
     # ------------------------------------------------------------------
     # Place BUY (GTD)
     # ------------------------------------------------------------------
+
+    async def place_buy_by_notional(
+        self,
+        token_id: str,
+        notional: float,
+        ref_price: float,
+        round_start_ts: int,
+        tier_name: str,
+        tick_size: float,
+    ) -> TrackedOrder | None:
+        """Place a GTD BUY sized by USD notional rather than share count.
+
+        H-V4-1 fix (audit v4): router used to compute
+            size = notional / bid_price
+        with `bid_price` = engine decision-time WS-cached bid. But the
+        CLOB accepts the BUY at `adjusted_price = bid + BUY_STEP`, so
+        the actual cost CLOB charges is `size * adjusted_price`, which
+        can be 1-3% higher than `notional` per tier (cumulative 5% over
+        4 tiers). This wrapper computes `size` AFTER `_adjust_buy_price`
+        so the per-tier hard cap (`TIER_NOTIONAL_MAX_MULT`) and the
+        eventual `_avg_cost` reflect what the CLOB actually accepted.
+
+        `ref_price` is only used as a fallback when the orderbook is
+        unavailable (same semantics as `place_buy(desired_price=...)`).
+        """
+        # Step 1: ask the orderbook for the snap price (REST, OUTSIDE lock).
+        adjusted_price = await self._adjust_buy_price(token_id, ref_price, tick_size)
+        if adjusted_price <= 0:
+            adjusted_price = ref_price
+        if adjusted_price <= 0:
+            log.warning(
+                "order_manager.buy_by_notional.no_price",
+                token=token_id[:16], notional=notional,
+            )
+            return None
+        # Step 2: compute size so cost == notional at the actual CLOB price.
+        size = notional / adjusted_price
+        return await self.place_buy(
+            token_id=token_id,
+            price=adjusted_price,
+            size=size,
+            round_start_ts=round_start_ts,
+            tier_name=tier_name,
+            tick_size=tick_size,
+        )
 
     async def place_buy(
         self,
@@ -159,27 +367,44 @@ class OrderManager:
         tier_name: str,
         tick_size: float,
     ) -> TrackedOrder | None:
-        """Place a GTD BUY order. Returns TrackedOrder or None."""
-        async with self._lock:
-            # H-3 fix: the CLOB client enforces a minimum GTD lifetime of
-            # GTD_MIN_SEC+1 = 181 s (CLOB-side hard floor). The TrackedOrder
-            # must expire at the *same* wall-clock time as the server-side
-            # GTD, otherwise the expiry watcher cancels an order that has
-            # already expired on the server (or vice versa) — both paths
-            # cause cancel-after-fill races. See also CLOBClient.GTD_MIN_SEC.
-            from src.execution.clob_client import CLOBClient as _CC
-            lifetime_s = self._s.GTD_LIFETIME_S
-            effective_lifetime = max(lifetime_s, _CC.GTD_MIN_SEC + 1)
-            cid = f"{round_start_ts}-{tier_name}-{uuid.uuid4().hex[:8]}"
+        """Place a GTD BUY order. Returns TrackedOrder or None.
 
-            # Snap to just above the current bid for better fill probability.
-            # B-1 v2 fix: prior to this fix the same `_adjust_buy_price +
-            # place_gtd_buy + success-check` block appeared TWICE in this
-            # function, which meant every BUY order was posted to the CLOB
-            # twice and charged the user 2x the intended notional. The second
-            # block was a leftover copy-paste; the dedup is enforced by
-            # `tests/test_audit_fixes_2026_07_11.py::test_b1_v2_buy_single_call`.
-            adjusted_price = await self._adjust_buy_price(token_id, price)
+        B-NEW-2 fix (audit v3): `_adjust_buy_price` performs a REST orderbook
+        fetch (1-3s in the worst case). Previously the entire place_buy body
+        — adjust + post + bookkeeping — ran inside `async with self._lock`,
+        so a slow orderbook fetch serialized all BUY traffic across rounds.
+        Now the orderbook fetch happens BEFORE acquiring the lock; the lock
+        only serializes the CLOB post + state insert (the section that
+        actually needs exclusive access to `self._orders` / `self._by_server`).
+
+        H-V4-1 fix (audit v4): prefer `place_buy_by_notional` over this
+        method so that `size` is computed AFTER the orderbook price snap
+        instead of before — see `place_buy_by_notional` docstring for
+        the rationale. Callers that pass a precomputed `size` (e.g. tests,
+        the FAK sell path) keep using this method directly.
+        """
+        # H-3 fix: the CLOB client enforces a minimum GTD lifetime of
+        # GTD_MIN_SEC+1 = 181 s (CLOB-side hard floor). The TrackedOrder
+        # must expire at the *same* wall-clock time as the server-side
+        # GTD, otherwise the expiry watcher cancels an order that has
+        # already expired on the server (or vice versa) — both paths
+        # cause cancel-after-fill races. See also CLOBClient.GTD_MIN_SEC.
+        from src.execution.clob_client import CLOBClient as _CC
+        lifetime_s = self._s.GTD_LIFETIME_S
+        effective_lifetime = max(lifetime_s, _CC.GTD_MIN_SEC + 1)
+        cid = f"{round_start_ts}-{tier_name}-{uuid.uuid4().hex[:8]}"
+
+        # Snap to just above the current bid for better fill probability.
+        # OUTSIDE the lock — REST orderbook can take 1-3s, no need to block
+        # other OM operations. B-1 v2 fix: prior to this fix the same
+        # `_adjust_buy_price + place_gtd_buy + success-check` block appeared
+        # TWICE in this function, which meant every BUY order was posted to
+        # the CLOB twice and charged the user 2x the intended notional.
+        # The second block was a leftover copy-paste; the dedup is enforced
+        # by `tests/test_audit_fixes_2026_07_11.py::test_b1_v2_buy_single_call`.
+        adjusted_price = await self._adjust_buy_price(token_id, price, tick_size)
+
+        async with self._lock:
             result: FillResult = await self._clob.place_gtd_buy(
                 token_id=token_id,
                 price=adjusted_price,
@@ -189,6 +414,11 @@ class OrderManager:
             )
 
             if not result.success:
+                # B-V4-1 fix: drop the sentinel + pending fills before exiting
+                # so a server_id that has already fired a fill callback (and
+                # thus installed a `_pending_<server_id>` mapping) does not
+                # leak as a dead-letter entry in `_by_server` / `_pending_fills`.
+                self._cleanup_failed_post(result.order_id)
                 log.warning(
                     "order_manager.buy.failed",
                     token=token_id[:16], price=adjusted_price, size=size,
@@ -225,8 +455,14 @@ class OrderManager:
                 status="live",
             )
             self._orders[cid] = order
+            # H-NEW-1 fix: re-point the sentinel mapping (if any) to the real
+            # client_order_id. If the CLOBClient already pre-registered the
+            # server_id via register_pending_server_id(), _by_server already
+            # holds `_pending_<server_id>`; resolve_pending_server_id will
+            # overwrite it with the real cid. If no race occurred this is
+            # equivalent to a plain insert.
             if server_id:
-                self._by_server[server_id] = cid
+                self.resolve_pending_server_id(cid, server_id)
 
             log.info(
                 "order_manager.placed",
@@ -285,7 +521,7 @@ class OrderManager:
             # BUY tiers still snap to ask-SELL_STEP for fill probability.
             adjusted_price = (
                 price if price_lock
-                else await self._adjust_sell_price(token_id, price)
+                else await self._adjust_sell_price(token_id, price, tick_size)
             )
             result: FillResult = await self._clob.place_gtd_sell(
                 token_id=token_id,
@@ -296,6 +532,9 @@ class OrderManager:
             )
 
             if not result.success or not result.order_id:
+                # B-V4-1 fix: drop sentinel + pending fills so a callback that
+                # already fired against the sentinel does not orphan.
+                self._cleanup_failed_post(result.order_id)
                 log.warning(
                     "order_manager.gtd_sell.failed",
                     token=token_id[:16], size=size, price=adjusted_price,
@@ -333,8 +572,12 @@ class OrderManager:
                 size_matched=result.tokens,
             )
             self._orders[cid] = order
+            # H-NEW-1 fix: same as place_buy — resolve the sentinel mapping
+            # pre-registered by CLOBClient when the post-response first
+            # arrived. If no fill callback raced us, this is just a plain
+            # insert. See register_pending_server_id docstring.
             if server_id:
-                self._by_server[server_id] = cid
+                self.resolve_pending_server_id(cid, server_id)
 
             log.info(
                 "order_manager.gtd_sell.posted",
@@ -344,7 +587,8 @@ class OrderManager:
                 size=size,
                 price=adjusted_price,
                 tier=tier_name,
-                lifetime_s=gtd_lifetime,
+                desired_lifetime_s=gtd_lifetime,
+                effective_lifetime_s=effective_lifetime,
                 initial_match=result.tokens,
             )
             return order
@@ -520,7 +764,7 @@ class OrderManager:
             cid = f"{round_start_ts}-{tier_name}-{uuid.uuid4().hex[:8]}"
 
             # Snap to just below the current ask for better fill probability
-            sell_price = await self._adjust_sell_price(token_id, price)
+            sell_price = await self._adjust_sell_price(token_id, price, tick_size)
             result: FillResult = await self._clob.place_fak_sell(
                 token_id=token_id,
                 size=size,
@@ -530,6 +774,10 @@ class OrderManager:
             )
 
             if not result.success:
+                # B-V4-1 fix: drop sentinel + pending fills so FAK partial
+                # fills that fired via the post-response callback are not
+                # orphaned as dead-letter entries.
+                self._cleanup_failed_post(result.order_id)
                 log.warning(
                     "order_manager.sell.failed",
                     token=token_id[:16], size=size, price=sell_price,
@@ -553,8 +801,13 @@ class OrderManager:
                 status="filled",
             )
             self._orders[cid] = order
+            # H-NEW-1 fix: same resolve — FAK sells also race against the
+            # synchronous _fire_fill_callback inside place_fak_sell (which
+            # fires immediately on the post-response). resolve_pending here
+            # turns the sentinel mapping into the real cid so the deduper
+            # bookkeeping lands on the right TrackedOrder.
             if server_id:
-                self._by_server[server_id] = cid
+                self.resolve_pending_server_id(cid, server_id)
 
             log.info(
                 "order_manager.sell_filled",
@@ -592,6 +845,11 @@ class OrderManager:
                 ok = await self._clob.cancel_order(server_id)
                 if ok:
                     order.status = "cancelled"
+                    # M-V4-3 fix: drop any queued pending fills for this
+                    # server_id (partial fills that arrived before the
+                    # cancel request would otherwise sit in `_pending_fills`
+                    # forever and accumulate over a long session).
+                    self.drain_pending_fills(server_id)
                     log.info(
                         "order_manager.cancelled",
                         client_id=client_order_id,
@@ -624,6 +882,13 @@ class OrderManager:
             for o in to_cancel:
                 if o.status != "cancelled":
                     o.status = "cancelled"
+
+            # M-V4-3 fix: drain pending fills for any server_id we just
+            # cancelled so the dead-letter queue does not accumulate stale
+            # entries from previous partial-fill events.
+            for o in to_cancel:
+                if o.server_order_id:
+                    self.drain_pending_fills(o.server_order_id)
 
             log.info(
                 "order_manager.cancel_market",
@@ -660,6 +925,41 @@ class OrderManager:
 
             except Exception as exc:
                 log.warning("order_manager.reconcile.error", error=str(exc))
+
+    async def purge_round(self, round_start_ts: int) -> int:
+        """Drop in-memory state for orders belonging to a finished round.
+
+        M-V4-1 fix (audit v4): without this, `_orders` / `_by_server` /
+        `_pending_fills` grow monotonically across rounds — at 96
+        rounds/day × ~16 TrackedOrders each, the maps accumulate ~50k
+        entries in a month, and `reconcile()` ends up scanning every
+        historical TrackedOrder on every poll.
+
+        Called from `_on_new_round` once the previous round has been
+        cancelled. Returns the number of TrackedOrders purged for
+        observability.
+        """
+        async with self._lock:
+            stale = [
+                cid for cid, o in self._orders.items()
+                if o.round_start_ts == round_start_ts
+            ]
+            for cid in stale:
+                o = self._orders.pop(cid, None)
+                if o is None:
+                    continue
+                sid = o.server_order_id
+                if sid:
+                    self._by_server.pop(sid, None)
+                    self.drain_pending_fills(sid)
+            if stale:
+                log.info(
+                    "order_manager.purge_round",
+                    round_start_ts=round_start_ts,
+                    purged=len(stale),
+                    remaining=len(self._orders),
+                )
+            return len(stale)
 
     # ------------------------------------------------------------------
     # State mutations from callbacks
@@ -707,6 +1007,20 @@ class OrderManager:
         """Update matched size for a GTD order and report any newly-completed status."""
         order = self.by_server_id(server_order_id)
         if not order:
+            # H-NEW-1 fix: if CLOBClient pre-registered a sentinel
+            # `_pending_<server_id>` mapping but the real TrackedOrder is
+            # not yet inserted, queue this fill so resolve_pending_server_id
+            # can replay it once the real entry lands.
+            client_id = self._by_server.get(server_order_id)
+            if client_id and client_id.startswith("_pending_"):
+                self.queue_pending_fill(
+                    server_order_id, fill_price or 0.0, size_matched
+                )
+                log.debug(
+                    "order_manager.apply_fill.queued_for_replay",
+                    server_id=server_order_id[:16],
+                    size_matched=size_matched,
+                )
             return
         # size_matched is monotonic — keep the max
         if size_matched > order.size_matched:

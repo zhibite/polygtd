@@ -117,11 +117,14 @@ class ActionRouter:
         round_ts = self._state.round_start_ts
 
         if isinstance(action, ActionOpenT1):
-            size = action.notional / action.price
-            order = await om.place_buy(
+            # H-V4-1 fix: route via `place_buy_by_notional` so the share
+            # count is computed AFTER the orderbook price snap instead of
+            # before. This prevents each tier from over-spending by 1-3%
+            # versus the planned `notional`.
+            order = await om.place_buy_by_notional(
                 token_id=action.token,
-                price=action.price,
-                size=size,
+                notional=action.notional,
+                ref_price=action.price,
                 round_start_ts=round_ts,
                 tier_name="T1",
                 tick_size=tick_size,
@@ -150,16 +153,38 @@ class ActionRouter:
                     side=action.side,
                     token=action.token[:16],
                     price=order.price,
-                    size=size,
+                    size=order.size,
                     server_id=order.server_order_id or "none",
                 )
+            else:
+                # B-V4-2 fix: H-1 v2 wrote `entry_token` / `entry_side`
+                # BEFORE awaiting the handler. If `place_buy` returns None
+                # (CLOB post error / size below 5 tokens / poll timeout),
+                # the engine is now stuck in a state where the round thinks
+                # T1 was attempted but no TrackedOrder / server_id was bound.
+                # Subsequent `_evaluate` would skip both `_check_t1_entry`
+                # (entry_token is set) and `_check_average_down`
+                # (baseline_set is False) — the round silently idles until
+                # the next window transition. Roll back the engine state so
+                # a future evaluate can re-attempt or the next round starts
+                # cleanly.
+                log.error(
+                    "router.t1_failed",
+                    side=action.side,
+                    token=action.token[:16],
+                    price=action.price,
+                    notional=action.notional,
+                    reason="om.place_buy returned None",
+                )
+                eng._round.position.entry_side = None
+                eng._round.position.entry_token = None
 
         elif isinstance(action, ActionOpenTN):
-            size = action.notional / action.price
-            order = await om.place_buy(
+            # H-V4-1 fix: same as T1 — size after the price snap.
+            order = await om.place_buy_by_notional(
                 token_id=action.token,
-                price=action.price,
-                size=size,
+                notional=action.notional,
+                ref_price=action.price,
                 round_start_ts=round_ts,
                 tier_name=f"T{action.tier}",
                 tick_size=tick_size,
@@ -181,9 +206,29 @@ class ActionRouter:
                     tier=action.tier,
                     token=action.token[:16],
                     price=order.price,
-                    size=size,
+                    size=order.size,
                     server_id=order.server_order_id or "none",
                 )
+            else:
+                # B-V4-2 fix: tier.placed / tier.server_order_id were not
+                # mutated (those happen inside `bind_server_order_id`), but
+                # `_check_average_down` already passed the `if tier.placed:
+                # continue` check — meaning a subsequent evaluate in the
+                # same 250ms tick could re-trigger T_N. Reset the tier
+                # state and log the failure.
+                log.error(
+                    "router.tN_failed",
+                    tier=action.tier,
+                    token=action.token[:16],
+                    price=action.price,
+                    notional=action.notional,
+                    reason="om.place_buy returned None",
+                )
+                tier_snap = getattr(eng._round.position, f"tier{action.tier}", None)
+                if tier_snap is not None:
+                    tier_snap.placed = False
+                    tier_snap.server_order_id = None
+                    tier_snap.expires_at = 0.0
 
         elif isinstance(action, ActionTakeProfit):
             # Two-stage TP: GTD limit sell at bid (maker), then FAK fallback
@@ -421,6 +466,15 @@ async def _on_new_round(round_start_ts: int) -> None:
             await state.engine.on_round_end()
         if state.order_manager:
             await state.order_manager.cancel_market(prev)
+            # M-V4-1 fix: drop the previous round's TrackedOrders /
+            # server_id mappings / pending fills so the maps do not grow
+            # unbounded across rounds.
+            purged = await state.order_manager.purge_round(prev)
+            if purged:
+                log.info(
+                    "round.purged_prev_state",
+                    prev_round_start=prev, purged=purged,
+                )
         log.info("round.transition", prev_round_start=prev, new_round_start=round_start_ts)
 
     state.round_start_ts = round_start_ts
@@ -687,6 +741,13 @@ async def main() -> None:
 
     # ── Execution layer ─────────────────────────────────────────────────
     s.order_manager = OrderManager(s.clob, price_cache=s.price_cache, pm_client=s.pm_client)
+    # H-NEW-1 fix: tell CLOBClient how to pre-register a server_order_id
+    # the moment the post-response arrives. This closes the race where a
+    # fill callback fires from inside place_gtd_buy / place_gtd_sell /
+    # place_fak_sell BEFORE the awaited call returns to place_buy / etc.,
+    # by which time the real TrackedOrder is not yet in OrderManager._orders.
+    # See OrderManager.register_pending_server_id docstring.
+    s.clob.register_pending = s.order_manager.register_pending_server_id
     s.heartbeat = HeartbeatLoop(s.clob)
 
     # ── GTD expiry watcher ──────────────────────────────────────────────

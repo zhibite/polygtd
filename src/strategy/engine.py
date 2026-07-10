@@ -295,6 +295,18 @@ class StrategyEngine:
         else:
             t.size_expected = 0.0
 
+        # H-NEW-3 fix: anchor the martingale trigger baseline to the price
+        # the CLOB actually accepted (`expected_price` here is the adjusted
+        # price from TrackedOrder, after bid+BUY_STEP snap). Previously
+        # _check_t1_entry pre-set baseline_target_price from the WS-cached
+        # `bid_price`, which can be stale by the time the order lands on
+        # the CLOB and produces a different adjusted_price. Re-anchoring
+        # here (idempotent overwrite with the same value during T1, and
+        # meaningful for T2..T4) keeps the martingale math aligned with
+        # what we are actually paying per share.
+        if tier == 1 and expected_price > 0:
+            self._round.position.baseline_target_price = expected_price
+
     # ------------------------------------------------------------------
     # Core evaluation
     # ------------------------------------------------------------------
@@ -422,15 +434,15 @@ class StrategyEngine:
             # is still held, closes the race. The router will skip its own
             # `entry_token = action.token` write because the field is no
             # longer None (idempotent overwrite with the same value).
+            #
+            # H-NEW-3 fix: `baseline_target_price` is now anchored inside
+            # `bind_server_order_id` to the actual adjusted_price (the price
+            # the CLOB accepted). Previously it was set here to the
+            # WS-cached bid which can be stale by 200-500ms vs the REST
+            # orderbook the CLOB saw. The bind-server-id path runs after
+            # the order has been posted, so we get a more accurate anchor.
             pos.entry_side = side
             pos.entry_token = token
-            # H-3 v2 fix: anchor the averaging-tier trigger baseline to
-            # the intended entry price (the bid at decision time), not to
-            # whatever we end up actually filling at. The actual fill
-            # average still drives `_avg_cost` and TP via `baseline_price`;
-            # this `baseline_target_price` only seeds T2/T3/T4 triggers so
-            # martingale spacing is independent of T1 slippage direction.
-            pos.baseline_target_price = bid_price
             await self._handler(ActionOpenT1(
                 side=side,
                 token=token,
@@ -457,6 +469,17 @@ class StrategyEngine:
         if not pos.baseline_set or pos.entry_token is None:
             return
 
+        # H-NEW-2 fix: while a TP runner is in flight (pos._tp_inflight=True),
+        # suppress averaging-down. Reason: the TP runner is working a GTD
+        # sell at the bid; opening a new BUY would (a) widen the position we
+        # intend to close and (b) interact with B-NEW-1's old bug where BUY
+        # fills incorrectly cleared _tp_inflight. Suppressing averaging here
+        # keeps the close path deterministic — once TP resolves (fill or
+        # GTD expiry → _tp_inflight cleared), the next evaluate() resumes
+        # normal averaging-down decisions.
+        if pos._tp_inflight:
+            return
+
         mid_price = self._pc.get_midpoint(pos.entry_token)
         if mid_price <= 0:
             return
@@ -476,7 +499,23 @@ class StrategyEngine:
             if tier.is_complete:
                 continue
             if tier.placed:
-                continue
+                # M-V4-2 fix: `tier.placed=True` but `server_order_id is None`
+                # is a stale state — it can only arise if a previous
+                # `bind_server_order_id` call did not run (router-level
+                # failure, see B-V4-2) or was unwound. Treat this as a
+                # half-placed tier and reset so we can re-fire cleanly,
+                # rather than skipping forever or duplicating the order.
+                if not tier.server_order_id:
+                    log.warning(
+                        "engine.tier_stale_placed_reset",
+                        tier=tier.tier,
+                        size_filled=tier.size_filled,
+                        cost_filled=tier.cost_filled,
+                    )
+                    tier.placed = False
+                    tier.expires_at = 0.0
+                else:
+                    continue
 
             # Per-tier hard cap: refuse to (re)place this tier if it has
             # already absorbed > tier.notional * TIER_NOTIONAL_MAX_MULT.

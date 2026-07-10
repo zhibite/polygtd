@@ -84,7 +84,18 @@ class TierSnapshot:
 
     @property
     def is_complete(self) -> bool:
-        """True if the tier has fully filled (>= 99.5% of expected size)."""
+        """True if the tier has fully filled (>= 99.5% of expected size).
+
+        M-NEW-2 review: kept the original size-based check. An additional
+        cost-based fallback was prototyped but it created false positives
+        when size_expected was inflated relative to notional (which happens
+        in unit tests that pre-set size_expected without a real CLOB post).
+        For production the 99.5% size check is sufficient — placed_size
+        (from CLOB) drives size_expected to the actual accepted share count,
+        and the cost-based assertion `cost_filled >= notional * TIER_NOTIONAL_MAX_MULT`
+        is enforced separately by `Position.tier_is_saturated` (see
+        engine._check_average_down).
+        """
         if self.size_expected <= 0:
             return self.filled
         return self.size_filled >= self.size_expected * 0.995
@@ -238,8 +249,17 @@ class Position:
 
     @property
     def stake_cap_remaining(self) -> float:
-        """How much more USD could be deployed before hitting total_max_notional."""
-        return max(0.0, _s().total_max_notional - self._total_cost)
+        """How much more USD could be deployed before hitting total_max_notional.
+
+        H-V4-2 fix (audit v4): uses `total_notional_committed` (placed +
+        filled) instead of `_total_cost` (filled only). Without this, an
+        in-flight tier's `notional` does not consume the cap, so the
+        check is ineffective while a tier sits between post and fill.
+        The "one tier in-flight at a time" invariant currently hides
+        this — but the cap is structural defence-in-depth and should
+        hold even if that invariant ever changes.
+        """
+        return max(0.0, _s().total_max_notional - self.total_notional_committed)
 
     def tier_notional_used(self, tier: TierSnapshot) -> float:
         """USD already filled into this tier (not including in-flight)."""
@@ -387,17 +407,14 @@ class Position:
         if self._total_qty > 0:
             self._avg_cost = self._total_cost / self._total_qty
 
-        # Any fill landing while TP is in-flight means the previous TP did
-        # not consume the full position (FAK partial), so allow the engine
-        # to re-fire TP on the next tick if mid is still above target.
-        if self._tp_inflight:
-            self._tp_inflight = False
-            log.info(
-                "position.tp_inflight_cleared_by_fill",
-                tier=tier.tier, total_qty=self._total_qty,
-            )
-
-        # Anchor baseline on first T1 fill (any partial fill counts)
+        # Anchor baseline on first T1 fill (any partial fill counts).
+        # NOTE: BUY-side fills must NOT clear _tp_inflight here — that flag
+        # tracks a SELL-side TP runner in flight, and an averaging BUY fill
+        # landing while TP is waiting is independent of TP's progress. Clearing
+        # it here would let the next _evaluate() re-arm a second TP sell while
+        # the first GTD sell is still live on the CLOB (B-NEW-1, audit v3).
+        # _tp_inflight is cleared only inside record_tp_fill() when a real
+        # TP fill actually lands.
         if tier.tier == 1 and not self.baseline_set and tier.size_filled > 0:
             self.baseline_price = tier.avg_fill_price or price
             self.baseline_set = True

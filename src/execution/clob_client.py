@@ -195,6 +195,14 @@ class CLOBClient:
         # without having to compute the cumulative itself.
         self.fill_callback: Optional[Callable] = None
 
+        # H-NEW-1 fix: optional callback to pre-register a server_order_id
+        # the moment it is known (right after the CLOB post-response).
+        # OrderManager registers itself here so that the very first fill
+        # callback — fired from inside place_gtd_buy / place_gtd_sell /
+        # place_fak_sell before the awaited call returns — can be routed
+        # to the correct TrackedOrder via by_server_id().
+        self.register_pending: Optional[Callable[[str], None]] = None
+
         # Deduper protects against double-counting when WS, polling and FAK
         # all observe the same fill. See FillDeduper docstring.
         self._deduper = FillDeduper()
@@ -330,6 +338,16 @@ class CLOBClient:
             err = resp.get("errorMsg") or resp.get("error") or "no orderID"
             return FillResult("", 0, 0, price_q, False, err, expiration_ts)
 
+        # H-NEW-1 fix: pre-register the server_id with the OrderManager
+        # (best-effort) so the very first fill — potentially fired from the
+        # poll loop below before the caller returns — can be routed via
+        # by_server_id() even before the real TrackedOrder is inserted.
+        if self.register_pending:
+            try:
+                self.register_pending(order_id)
+            except Exception as exc:
+                log.debug("clob.register_pending.error", error=str(exc))
+
         # Poll until filled or timed out
         deadline = time.monotonic() + self.GTD_CLIENT_TIMEOUT_SEC
         poll_interval = 0.5
@@ -458,6 +476,13 @@ class CLOBClient:
         if not order_id:
             err = resp.get("errorMsg") or resp.get("error") or "no orderID"
             return FillResult("", 0, 0, price_q, False, err, expiration_ts)
+
+        # H-NEW-1 fix: pre-register server_id immediately — see place_gtd_buy.
+        if self.register_pending:
+            try:
+                self.register_pending(order_id)
+            except Exception as exc:
+                log.debug("clob.register_pending.error", error=str(exc))
 
         # Poll until filled or GTD timeout.
         # B-3 fix: deduper is the single source of truth for delta
@@ -641,9 +666,20 @@ class CLOBClient:
         if total_sz <= 0:
             return FillResult("", 0, 0, sell_price, False, "FAK_no_fills")
 
+        # H-NEW-1 fix: FAK sells also race — _fire_fill_callback below runs
+        # synchronously on this same coroutine, before the await returns to
+        # OrderManager.place_sell. Pre-register so the sentinel mapping is
+        # in place when the callback looks up by_server_id.
+        fak_server_id = str(resp.get("orderID", ""))
+        if fak_server_id and self.register_pending:
+            try:
+                self.register_pending(fak_server_id)
+            except Exception as exc:
+                log.debug("clob.register_pending.error", error=str(exc))
+
         avg_px = total_usdc / total_sz
         result = FillResult(
-            order_id=str(resp.get("orderID", "")),
+            order_id=fak_server_id,
             tokens=_round_down(total_sz, Decimal("0.0001")),
             usdc=_round_down(total_usdc, Decimal("0.01")),
             fill_price=_round_down(avg_px, tick_d),

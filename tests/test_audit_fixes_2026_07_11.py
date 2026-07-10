@@ -81,7 +81,7 @@ async def test_b1_v2_buy_single_call() -> None:
     mgr._pm = None
     mgr._s = type("S", (), {"GTD_LIFETIME_S": 120, "SELL_SLIPPAGE_PCT": 1.0})()
 
-    async def fake_adjust(token, price):
+    async def fake_adjust(token, price, tick_size=0.01):
         return price
     mgr._adjust_buy_price = fake_adjust  # type: ignore[assignment]
 
