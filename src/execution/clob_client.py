@@ -14,7 +14,7 @@ import asyncio
 import time
 from dataclasses import dataclass
 from decimal import ROUND_DOWN, Decimal
-from typing import Optional
+from typing import Callable, Optional
 
 from src.infra.logging import get_logger
 

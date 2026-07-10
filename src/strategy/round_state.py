@@ -149,15 +149,7 @@ class Position:
 
     @property
     def next_open_tier(self) -> TierSnapshot | None:
-        """The first tier that is placed but not yet filled, or next to place."""
-        for t in self.tiers:
-            if not t.is_complete:
-                return t
-        return None
-
-    @property
-    def next_unfilled_tier(self) -> TierSnapshot | None:
-        """The first tier that has not been placed or has only partially filled."""
+        """The first tier that is not yet fully filled (placed or pending)."""
         for t in self.tiers:
             if not t.is_complete:
                 return t
@@ -282,7 +274,7 @@ class RoundState:
     """Complete per-round state machine."""
 
     round_start_ts: int
-    market: "MarketInfo | None" = None
+    market: "MarketInfo | None" = field(default=None, repr=False)
 
     # Derived from market — init=False so they don't appear in __init__ signature.
     # Defaults are set in __post_init__.

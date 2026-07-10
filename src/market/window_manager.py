@@ -310,11 +310,6 @@ class WindowManager:
                     pos._pending_close = False
                 except Exception:
                     pass
-                try:
-                    pos._pending_ws_reconcile_oid = ""
-                    pos._pending_ws_reconcile_since = 0.0
-                except Exception:
-                    pass
 
     # ── Internal methods ───────────────────────────────────────────────────────
 

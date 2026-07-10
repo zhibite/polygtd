@@ -214,11 +214,11 @@ class OrderManager:
             )
 
             if not result.success:
-            log.warning(
-                "order_manager.sell.failed",
-                token=token_id[:16], size=size, price=sell_price,
-                tier=tier_name, error=result.error,
-            )
+                log.warning(
+                    "order_manager.sell.failed",
+                    token=token_id[:16], size=size, price=sell_price,
+                    tier=tier_name, error=result.error,
+                )
                 return None
 
             server_id = result.order_id
