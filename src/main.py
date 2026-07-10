@@ -221,6 +221,15 @@ async def _on_binance_connect() -> None:
 def _on_market_discovered(asset: str, mkt) -> None:
     """Called by WindowManager as soon as market info (token IDs) is resolved."""
     state = STATE
+
+    # Clear old token prices from cache to avoid stale data
+    if state.current_market and state.price_cache:
+        old_up = getattr(state.current_market, "token_up_id", None)
+        old_down = getattr(state.current_market, "token_down_id", None)
+        for old_t in [old_up, old_down]:
+            if old_t and old_t != mkt.token_up_id and old_t != mkt.token_down_id:
+                state.price_cache.clear_token(old_t)
+
     if state.market_ws:
         state.market_ws.subscribe_tokens([mkt.token_up_id, mkt.token_down_id])
     state.current_market = mkt
@@ -309,6 +318,32 @@ async def _on_new_round(round_start_ts: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# REST midpoint poller (stable prices for strategy decisions)
+# ---------------------------------------------------------------------------
+
+async def _midpoint_poll_loop() -> None:
+    """Poll /midpoint REST API every 2s to keep stable price cache updated."""
+    while True:
+        await asyncio.sleep(2.0)
+        s = STATE
+        if not s.pm or not s.current_market:
+            continue
+
+        up_token = s.current_market.up_token
+        down_token = s.current_market.down_token
+        if not up_token or not down_token:
+            continue
+
+        try:
+            up_mid = await s.pm.get_midpoint(up_token)
+            down_mid = await s.pm.get_midpoint(down_token)
+            s.price_cache.midpoint[up_token] = up_mid
+            s.price_cache.midpoint[down_token] = down_mid
+        except Exception:
+            pass  # Silent failure — WS fallback will still work
+
+
+# ---------------------------------------------------------------------------
 # Status printer
 # ---------------------------------------------------------------------------
 
@@ -333,8 +368,10 @@ async def _status_loop() -> None:
             gate_str = f"drift={gs.drift:.4f} [{flag}] |"
 
         mkt = s.current_market
-        up_last = s.price_cache.last(mkt.up_token) if mkt and mkt.up_token else 0
-        down_last = s.price_cache.last(mkt.down_token) if mkt and mkt.down_token else 0
+        up_token = mkt.up_token if mkt else ""
+        down_token = mkt.down_token if mkt else ""
+        up_last = s.price_cache.get_midpoint(up_token) if up_token else 0
+        down_last = s.price_cache.get_midpoint(down_token) if down_token else 0
 
         wm = s.wm
         next_in = wm.seconds_until_next() if wm else 0

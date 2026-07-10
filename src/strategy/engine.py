@@ -309,14 +309,13 @@ class StrategyEngine:
         down_tok = self._round.down_token
 
         for side, token in [("UP", up_tok), ("DOWN", down_tok)]:
-            last_price = self._pc.last(token)
-            bid_price = self._pc.bid(token)
-            if last_price <= 0 or bid_price <= 0:
+            mid_price = self._pc.get_midpoint(token)
+            if mid_price <= 0:
                 continue
 
             # Price cap check
-            if last_price > s.ENTRY_PRICE_CAP:
-                log.debug("engine.t1_skip_too_expensive", side=side, last_price=last_price)
+            if mid_price > s.ENTRY_PRICE_CAP:
+                log.debug("engine.t1_skip_too_expensive", side=side, mid_price=mid_price)
                 continue
 
             # ── T1 entry time gate ───────────────────────────────────────
@@ -336,7 +335,11 @@ class StrategyEngine:
                 continue
 
             # BTC drift gate
-            if not self._gate.can_enter(bc_now, last_price):
+            if not self._gate.can_enter(bc_now, mid_price):
+                continue
+
+            bid_price = self._pc.bid(token)
+            if bid_price <= 0:
                 continue
 
             # Stake cap check — don't overcommit
@@ -351,7 +354,7 @@ class StrategyEngine:
                 "engine.trigger_t1",
                 side=side,
                 token=token[:16],
-                last_trade=last_price,
+                mid=mid_price,
                 best_bid=bid_price,
                 drift=self._gate.state(bc_now).drift,
             )
@@ -382,8 +385,8 @@ class StrategyEngine:
         if not pos.baseline_set or pos.entry_token is None:
             return
 
-        last_price = self._pc.last(pos.entry_token)
-        if last_price <= 0:
+        mid_price = self._pc.get_midpoint(pos.entry_token)
+        if mid_price <= 0:
             return
 
         baseline = pos.baseline_price
@@ -401,7 +404,7 @@ class StrategyEngine:
                 continue
 
             # Price must have dropped to or below the trigger
-            if last_price > trigger:
+            if mid_price > trigger:
                 continue
 
             bid_price = self._pc.bid(pos.entry_token)
@@ -413,7 +416,7 @@ class StrategyEngine:
             # tier's trigger line (e.g. checking T2 but price already hit T3's -40%).
             # In that case price momentum justifies the averaging entry.
             next_drop = TierSnapshot._next_tier_drop(tier.tier)
-            if not self._gate.can_double_down(bc_now, last_price, tier.tier, next_drop, baseline):
+            if not self._gate.can_double_down(bc_now, mid_price, tier.tier, next_drop, baseline):
                 continue
 
             # Stake cap check — don't overcommit
@@ -427,7 +430,7 @@ class StrategyEngine:
             log.info(
                 "engine.trigger_tN",
                 tier=tier.tier,
-                last_trade=last_price,
+                mid=mid_price,
                 trigger=trigger,
                 baseline=baseline,
                 bid=bid_price,
@@ -452,16 +455,16 @@ class StrategyEngine:
         if not pos.entry_token or pos.total_qty <= 0:
             return
 
-        last_price = self._pc.last(pos.entry_token)
-        if last_price <= 0:
+        mid_price = self._pc.get_midpoint(pos.entry_token)
+        if mid_price <= 0:
             return
 
         tp_target = pos.tp_target()
         if tp_target is None:
             return
 
-        # Use last_price for trigger, bid for order placement
-        if last_price < tp_target:
+        # Use mid_price for trigger, bid for order placement
+        if mid_price < tp_target:
             return
 
         bid_price = self._pc.bid(pos.entry_token)
@@ -473,7 +476,7 @@ class StrategyEngine:
 
         log.info(
             "engine.trigger_tp",
-            last_trade=last_price,
+            mid=mid_price,
             tp_target=tp_target,
             avg_cost=pos.avg_cost,
             qty=pos.total_qty,

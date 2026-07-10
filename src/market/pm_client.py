@@ -247,6 +247,51 @@ class PolymarketClient:
             log.debug("get_order_book failed", token_id=token_id[:12], error=str(e))
             return None
 
+    async def get_midpoint(self, token_id: str) -> float:
+        """Get current midpoint price (bid+ask)/2 for a token from CLOB."""
+        c = await self._client()
+        try:
+            resp = await c.get(
+                f"{self.settings.polymarket_host}/midpoint",
+                params={"token_id": token_id},
+                timeout=3.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return float(data.get("mid", 0.0))
+        except Exception:
+            return 0.0
+
+    async def get_last_trade_prices_batch(
+        self, token_ids: list[str]
+    ) -> dict[str, float]:
+        """
+        Batch fetch last trade prices for multiple tokens.
+        CLOB: GET /last-trades-prices?token_ids=id1,id2,...
+        Returns: {"token_id": price}
+        """
+        if not token_ids:
+            return {}
+        c = await self._client()
+        try:
+            resp = await c.get(
+                f"{self.settings.polymarket_host}/last-trades-prices",
+                params={"token_ids": ",".join(token_ids)},
+                timeout=5.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            result = {}
+            if isinstance(data, dict):
+                for tid, price_val in data.items():
+                    try:
+                        result[tid] = float(price_val)
+                    except (TypeError, ValueError):
+                        result[tid] = 0.0
+            return result
+        except Exception:
+            return {tid: 0.0 for tid in token_ids}
+
     async def get_tick_size(self, token_id: str) -> str:
         """Get minimum tick size for a token (v2 CLOB API)."""
         c = await self._client()

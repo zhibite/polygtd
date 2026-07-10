@@ -25,12 +25,13 @@ MARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 @dataclass
 class PriceCache:
-    """Per-token price snapshot, updated by MarketWS."""
+    """Per-token price snapshot, updated by MarketWS and REST polling."""
 
     last_trade_price: dict[str, float] = field(default_factory=dict)
     best_bid: dict[str, float] = field(default_factory=dict)
     best_ask: dict[str, float] = field(default_factory=dict)
     tick_size: dict[str, float] = field(default_factory=dict)
+    midpoint: dict[str, float] = field(default_factory=dict)  # Updated via REST /midpoint
 
     def last(self, token: str) -> float:
         return self.last_trade_price.get(token, 0.0)
@@ -47,6 +48,18 @@ class PriceCache:
         if b and a:
             return (b + a) / 2.0
         return 0.0
+
+    def get_midpoint(self, token: str) -> float:
+        """REST midpoint price — more stable than last_trade_price for strategy decisions."""
+        return self.midpoint.get(token, 0.0)
+
+    def clear_token(self, token: str) -> None:
+        """Clear cached data for a specific token (e.g., on window change)."""
+        self.last_trade_price.pop(token, None)
+        self.best_bid.pop(token, None)
+        self.best_ask.pop(token, None)
+        self.tick_size.pop(token, None)
+        self.midpoint.pop(token, None)
 
 
 MarketWSConnected = Callable[[], None]
