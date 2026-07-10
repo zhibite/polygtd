@@ -68,6 +68,7 @@ class WindowManager:
         }
         self._prev_condition_id: Dict[str, str] = {}
         self._first_seen: Dict[str, bool] = {s: False for s in symbols}
+        self._last_discovery_ts: Dict[str, float] = {s: 0.0 for s in symbols}
 
     # ── Lifecycle (15-min boundary polling) ─────────────────────────────────────
 
@@ -103,10 +104,12 @@ class WindowManager:
         return self.next_round_start() - time.time()
 
     async def _run(self) -> None:
-        """Poll 15-min boundaries every 0.5s; on each transition, run tick()."""
+        """Poll every 10s: run tick() which rate-limits discover_market to once per 30s."""
         while self._running:
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(10)
             now_start = self._round_start_of(time.time())
+
+            # Window boundary transition?
             if now_start != self._last_round_start:
                 prev = self._last_round_start
                 self._last_round_start = now_start
@@ -114,68 +117,73 @@ class WindowManager:
                          prev_start=prev,
                          new_start=now_start,
                          next_start=self.next_round_start())
-                try:
-                    await self.tick(self._symbols)
-                except Exception:
-                    log.exception("window_mgr.tick raised")
+
+            try:
+                await self.tick(self._symbols)
+            except Exception:
+                log.exception("window_mgr.tick raised")
                 if self._on_new:
                     await self._on_new(now_start)
 
     # ── Public API ──────────────────────────────────────────────────────────────
 
     def get(self, asset: str) -> Optional[WindowContext]:
-        """Get current window context for an asset (None if no active window)."""
-        ctx = self._ctxs.get(asset)
-        if ctx is None or ctx.condition_id == "":
-            return None
-        return ctx
+        """Get current window context for an asset. Returns None only if asset is unknown."""
+        return self._ctxs.get(asset)
 
     async def tick(self, assets: list[str]) -> Dict[str, WindowContext]:
         """
         Called every tick by main loop:
-        1. discover_market all assets
+        1. discover_market all assets (rate-limited to once per 30s per asset)
         2. Detect window switches, reset state
         3. Fetch latest prices
         Returns {asset: ctx} dict (only assets with active windows)
         """
-        tasks = [self._svc.discover_market(a) for a in assets]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        now_ts = time.time()
+        needs_discovery = [
+            a for a in assets
+            if (now_ts - self._last_discovery_ts.get(a, 0)) >= 30.0
+        ]
+        if needs_discovery:
+            tasks = [self._svc.discover_market(a) for a in needs_discovery]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for i, result in enumerate(results):
+                asset = needs_discovery[i]
+                self._last_discovery_ts[asset] = now_ts
 
-        for i, result in enumerate(results):
-            asset = assets[i]
-            ctx = self._ctxs[asset]
+                if isinstance(result, BaseException):
+                    log.warning("discover_market failed", asset=asset, error=str(result))
+                    continue
 
-            if isinstance(result, BaseException):
-                log.warning("discover_market failed", asset=asset, error=str(result))
-                continue
+                if result is None:
+                    log.debug("discover_market returned None (no active window)", asset=asset)
+                    continue
 
-            if result is None:
-                log.debug("discover_market returned None (no active window)", asset=asset)
-                continue
+                mkt = result  # MarketInfo
 
-            mkt = result  # MarketInfo
+                # Detect new window: window_end increases = new window online
+                ctx = self._ctxs[asset]
+                prev_end = ctx.window_end if ctx.condition_id else None
+                is_new = (prev_end is None) or (mkt.window_end > prev_end)
 
-            # Detect new window: window_end increases = new window online
-            prev_end = ctx.window_end if ctx.condition_id else None
-            is_new = (prev_end is None) or (mkt.window_end > prev_end)
+                if is_new:
+                    # Save prev window BTC close price before reset
+                    prev_close: Optional[float] = None
+                    if prev_end is not None and ctx.market is not None:
+                        try:
+                            prev_close = float(
+                                getattr(ctx.market, "btc_spot_now", 0.0) or 0.0
+                            )
+                            if prev_close > 0:
+                                ctx.prev_window_btc_close = prev_close
+                        except Exception:
+                            pass
 
-            if is_new:
-                # Save prev window BTC close price before reset
-                prev_close: Optional[float] = None
-                if prev_end is not None and ctx.market is not None:
-                    try:
-                        prev_close = float(
-                            getattr(ctx.market, "btc_spot_now", 0.0) or 0.0
-                        )
-                        if prev_close > 0:
-                            ctx.prev_window_btc_close = prev_close
-                    except Exception:
-                        pass
+                    # New window: allocate new WindowContext (or reset existing)
+                    await self._on_new_window(ctx, mkt)
 
-                # New window: allocate new WindowContext (or reset existing)
-                await self._on_new_window(ctx, mkt)
-
-                # Notify consumer: market info (token IDs) is now available
+                # Notify consumer whenever we have a valid market
+                # (first discovery, new window, or even re-confirm of current window)
                 if self._on_market:
                     self._on_market(asset, mkt)
 
@@ -251,8 +259,8 @@ class WindowManager:
                     asset=asset, cid=mkt.condition_id[:12], end=mkt.window_end,
                 )
 
-        # Fetch prices for all active windows in parallel
-        active_assets = [a for a in assets if self.get(a) is not None]
+        # Fetch prices for all assets with a valid market
+        active_assets = [a for a in assets if self._ctxs[a].market is not None]
         if active_assets:
             price_tasks = {a: self._svc.fetch_prices(self._ctxs[a].market) for a in active_assets}
             price_results = await asyncio.gather(*price_tasks.values(), return_exceptions=True)
@@ -279,7 +287,7 @@ class WindowManager:
                     if ctx.market:
                         ctx.market.btc_spot_now = btc_now
 
-        return {a: self._ctxs[a] for a in active_assets if self.get(a) is not None}
+        return {a: self._ctxs[a] for a in assets if self._ctxs[a].market is not None}
 
     def on_position_opened(self, asset: str, side: Side) -> None:
         """Called after successful entry: mark side as traded."""
