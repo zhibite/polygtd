@@ -103,42 +103,60 @@ class WindowManager:
         return self.next_round_start() - time.time()
 
     async def _run(self) -> None:
-        """Poll every 10s: run tick() which only rediscovers at window boundaries."""
+        """
+        Drive window discovery with precise boundary detection.
+
+        Strategy: sleep until 3 s before each 15-min boundary, then poll every
+        second (up to 3 times) to catch the exact moment the window switches.
+        Once detected, run discovery once and return to idle.
+        """
         while self._running:
-            await asyncio.sleep(10)
-            now_start = self._round_start_of(time.time())
+            now = time.time()
+            now_start = self._round_start_of(now)
+            next_boundary = now_start + self._round_period
+            secs_to_boundary = next_boundary - now
 
-            # Window boundary transition?
-            round_changed = (now_start != self._last_round_start)
-            if round_changed:
-                prev = self._last_round_start
-                self._last_round_start = now_start
+            # Idle: sleep until 3 s before the next boundary
+            if secs_to_boundary > 3:
+                await asyncio.sleep(secs_to_boundary - 3)
+                continue
 
-                # Log known markets at round transition (token IDs already cached)
-                known = []
-                for asset in self._symbols:
-                    ctx = self._ctxs[asset]
-                    if ctx.market and ctx.condition_id:
-                        known.append(
-                            f"{asset}[up={ctx.market.token_up_id[:8]},"
-                            f"down={ctx.market.token_down_id[:8]},"
-                            f"end={ctx.market.window_end}]"
-                        )
-                log.info("window_mgr.round_transition",
-                         prev_start=prev,
-                         new_start=now_start,
-                         next_start=self.next_round_start(),
-                         markets=", ".join(known) if known else "(no active market yet)")
+            # Boundary window: poll every second until new window is found
+            detected = False
+            while self._running and not detected:
+                now_in = time.time()
+                now_start_in = self._round_start_of(now_in)
 
-            # Force discovery at round boundary so ctx.market is updated immediately.
-            # After this call _last_round_start == now_start, so round_changed will be
-            # False inside tick() — we compensate by passing force_discovery here.
-            try:
-                await self.tick(self._symbols, force_discovery=round_changed)
-            except Exception:
-                log.exception("window_mgr.tick raised")
-                if self._on_new:
-                    await self._on_new(now_start)
+                round_changed = (now_start_in != self._last_round_start)
+
+                if round_changed:
+                    detected = True
+                    prev = self._last_round_start
+                    self._last_round_start = now_start_in
+
+                    known = []
+                    for asset in self._symbols:
+                        ctx = self._ctxs[asset]
+                        if ctx.market and ctx.condition_id:
+                            known.append(
+                                f"{asset}[up={ctx.market.token_up_id[:8]},"
+                                f"down={ctx.market.token_down_id[:8]},"
+                                f"end={ctx.market.window_end}]"
+                            )
+                    log.info("window_mgr.round_transition",
+                             prev_start=prev,
+                             new_start=now_start_in,
+                             next_start=next_boundary,
+                             markets=", ".join(known) if known else "(no active market yet)")
+
+                    try:
+                        await self.tick(self._symbols, force_discovery=True)
+                    except Exception:
+                        log.exception("window_mgr.tick raised")
+                        if self._on_new:
+                            await self._on_new(now_start_in)
+
+                await asyncio.sleep(1.0)
 
     # ── Public API ──────────────────────────────────────────────────────────────
 
@@ -196,33 +214,21 @@ class WindowManager:
                 mkt = result  # MarketInfo
                 ctx = self._ctxs[asset]
 
-                # Save prev window BTC close price before any state changes
-                prev_close: Optional[float] = None
-                if ctx.market is not None and ctx.condition_id:
-                    try:
-                        prev_close = float(
-                            getattr(ctx.market, "btc_spot_now", 0.0) or 0.0
-                        )
-                        if prev_close > 0:
-                            ctx.prev_window_btc_close = prev_close
-                    except Exception:
-                        pass
+                # Always update ctx.market on discovery (refreshes token IDs, prices, etc.)
+                ctx.market = mkt
 
-                # Detect new window: window_end increases = new window online
-                prev_end = ctx.window_end if ctx.condition_id else None
-                is_new = (prev_end is None) or (mkt.window_end > prev_end)
+                # Detect window switch by condition_id change (more reliable than window_end)
+                cid_changed = ctx.condition_id and ctx.condition_id != mkt.condition_id
 
-                if is_new:
+                if cid_changed:
                     log.info(
                         "window_mgr.window_switch_detected",
                         asset=asset,
-                        prev_end=(str(prev_end) if prev_end else "none"),
-                        new_end=mkt.window_end,
+                        prev_cid=ctx.condition_id[:12],
                         new_cid=mkt.condition_id[:12],
                         up_token=mkt.token_up_id[:16],
                         down_token=mkt.token_down_id[:16],
                     )
-                    # New window: allocate new WindowContext (or reset existing)
                     await self._on_new_window(ctx, mkt)
 
                 # Notify consumer whenever we have a valid market
