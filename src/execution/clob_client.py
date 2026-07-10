@@ -389,15 +389,24 @@ class CLOBClient:
     # ------------------------------------------------------------------
 
     async def post_heartbeat(self, heartbeat_id: str = "") -> dict:
-        """Send a heartbeat to keep GTD orders alive. Must be called every ~5 seconds."""
+        """Send a heartbeat to keep GTD orders alive. Must be called every ~5 seconds.
+
+        Errors are returned in the dict (not logged here) so the caller can
+        decide the right log level — this runs every 5s, so unconditional
+        warnings would flood the log.
+
+        Note: Polymarket server treats "" (empty string) as an invalid id.
+        Pass heartbeat_id=None (or omit) for the bootstrap / re-bootstrap call
+        so the server issues a fresh session id instead of 400-ing.
+        """
         if not self._client:
             return {"success": False, "error": "ClobClient not initialised"}
+        sdk_arg: str | None = heartbeat_id if heartbeat_id else None
         try:
-            resp = await self._run(self._client.post_heartbeat, heartbeat_id)
+            resp = await self._run(self._client.post_heartbeat, sdk_arg)
             return resp if resp else {"success": True}
         except Exception as exc:
-            log.warning("clob.heartbeat.error", error=str(exc))
-            return {"success": False, "error": str(exc)}
+            return {"success": False, "error": str(exc), "exception": True}
 
     # ------------------------------------------------------------------
     # Queries
