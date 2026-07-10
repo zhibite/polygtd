@@ -49,6 +49,7 @@ from src.strategy.engine import (
     ActionTakeProfit,
     StrategyEngine,
 )
+from src.strategy.loop import DecisionLoop
 
 log = get_logger(__name__)
 
@@ -75,12 +76,21 @@ class AppState:
         self.order_manager: OrderManager | None = None
         self.heartbeat: HeartbeatLoop | None = None
         self.gtd_expiry: GtdExpiryWatcher | None = None
+        self.decision_loop: DecisionLoop | None = None
         self.clob: CLOBClient | None = None  # reference for fill_callback wiring
         self.pm_client: PolymarketClient | None = None
         self.market_svc: MarketService | None = None
         self.wm: WindowManager | None = None  # window lifecycle manager
         self.binance_spot: BinanceSpotService | None = None  # BTC spot via REST
         self._shutdown = asyncio.Event()
+        # B-3 v2 fix: hold strong references to fire-and-forget background
+        # tasks (currently the TP runner spawned by ActionRouter) so they
+        # cannot be garbage-collected before they finish. Without this, a
+        # CPython GC pass happening between `asyncio.create_task(...)` and
+        # the task's first `await` can drop the task entirely — silently
+        # aborting the TP sell path even though the GTD BUY is live on the
+        # CLOB. Mirrors the same pattern used in `GtdExpiryWatcher._bg_tasks`.
+        self._bg_tasks: set[asyncio.Task[None]] = set()
 
 
 STATE = AppState()
@@ -121,12 +131,17 @@ class ActionRouter:
                 eng._round.position.entry_side = action.side
                 eng._round.position.entry_token = action.token
                 expires = order.expires_at
+                # Use adjusted_price (the price actually sent to CLOB, after bid+BUY_STEP)
+                # so size_expected matches the notional CLOB will charge us with.
                 eng.bind_server_order_id(
                     tier=1,
                     server_order_id=order.server_order_id or "",
                     token_id=action.token,
                     expires_at=expires,
-                    expected_price=action.price,
+                    expected_price=order.price,
+                    # M-1: pass the CLOB-accepted placed_size so size_expected
+                    # is exact (avoid notional/price round-trip mismatch).
+                    placed_size=order.placed_size if order.placed_size > 0 else None,
                 )
                 # Wire fill callback so engine knows when order fills
                 self._state.clob.fill_callback = self._make_fill_callback()
@@ -134,7 +149,7 @@ class ActionRouter:
                     "router.t1_placed",
                     side=action.side,
                     token=action.token[:16],
-                    price=action.price,
+                    price=order.price,
                     size=size,
                     server_id=order.server_order_id or "none",
                 )
@@ -156,38 +171,145 @@ class ActionRouter:
                     server_order_id=order.server_order_id or "",
                     token_id=action.token,
                     expires_at=expires,
-                    expected_price=action.price,
+                    expected_price=order.price,
+                    # M-1: use CLOB-accepted placed_size for size_expected.
+                    placed_size=order.placed_size if order.placed_size > 0 else None,
                 )
                 self._state.clob.fill_callback = self._make_fill_callback()
                 log.info(
                     "router.tN_placed",
                     tier=action.tier,
                     token=action.token[:16],
-                    price=action.price,
+                    price=order.price,
                     size=size,
                     server_id=order.server_order_id or "none",
                 )
 
         elif isinstance(action, ActionTakeProfit):
-            order = await om.place_sell(
-                token_id=action.token,
-                size=action.qty,
-                price=action.price,
-                round_start_ts=round_ts,
-                tier_name="TP",
-                tick_size=tick_size,
-            )
-            if order:
-                log.info(
-                    "router.tp_placed",
-                    token=action.token[:16],
-                    price=action.price,
-                    qty=action.qty,
-                    server_id=order.server_order_id or "none",
-                )
+            # Two-stage TP: GTD limit sell at bid (maker), then FAK fallback
+            # after ~75 seconds for any residual qty. Avoids the "FAK reload
+            # loop" where a shallow book lets TP fill part-by-part and each
+            # round walks down one more bid level.
+            #
+            # H-1 fix: place_tp_with_fallback may take 75–90s end-to-end.
+            # Awaiting it directly stalls the action router and the entire
+            # _evaluate loop. Fire the placement as a background task and
+            # bind the resulting server_order_ids back into the engine so
+            # subsequent fill events route into Position.record_tp_fill
+            # (B-2 fix). The in-flight mutex (`pos._tp_inflight`) remains
+            # the single source of truth for "TP is in flight, do not
+            # re-arm yet" — it is cleared either by the deduper-driven
+            # fill callback or by the failure-recovery branch at the end
+            # of the spawned task.
+            async def _tp_runner() -> None:
+                try:
+                    gtd, fak, gtd_err, fak_err = await om.place_tp_with_fallback(
+                        token_id=action.token,
+                        size=action.qty,
+                        price=action.price,
+                        round_start_ts=round_ts,
+                        tier_name="TP",
+                        tick_size=tick_size,
+                    )
+                except Exception as exc:
+                    # H-1 fix: any uncaught exception in the TP runner
+                    # would leave pos._tp_inflight stuck True forever.
+                    # Release the mutex and surface the crash so the next
+                    # tick can decide whether to re-arm.
+                    log.exception("router.tp_runner_crashed", error=str(exc))
+                    if eng._round:
+                        eng._round.position._tp_inflight = False
+                    return
+
+                if not eng._round:
+                    return
+                pos = eng._round.position
+                if gtd and gtd.server_order_id:
+                    pos.register_tp(
+                        server_order_id=gtd.server_order_id,
+                        token_id=action.token,
+                        target_qty=action.qty,
+                    )
+                if fak and fak.server_order_id:
+                    # FAK target_qty is the residual; if it returned a
+                    # tracked order the actual sold qty may differ.
+                    pos.register_tp(
+                        server_order_id=fak.server_order_id,
+                        token_id=action.token,
+                        target_qty=fak.size,
+                    )
+
+                # H-4 fix: classify outcome for observability. The mutex
+                # policy is decided by whether we observed any tracked
+                # order; engine-side fill callbacks will clear the mutex
+                # for partial/full fills. Only a "no order posted at all"
+                # outcome releases the mutex here.
+                no_order_posted = (gtd is None and fak is None)
+                if no_order_posted:
+                    pos._tp_inflight = False
+                    log.warning(
+                        "router.tp_failed",
+                        token=action.token[:16],
+                        price=action.price,
+                        qty=action.qty,
+                        gtd_err=gtd_err,
+                        fak_err=fak_err,
+                    )
+                    return
+
+                if gtd and not fak:
+                    log.info(
+                        "router.tp_gtd_only",
+                        token=action.token[:16],
+                        price=action.price,
+                        qty=action.qty,
+                        gtd_id=(gtd.server_order_id or "")[:16],
+                    )
+                elif fak and not gtd:
+                    log.info(
+                        "router.tp_fak_only",
+                        token=action.token[:16],
+                        price=action.price,
+                        qty=action.qty,
+                        fak_id=(fak.server_order_id or "")[:16],
+                        gtd_err=gtd_err,
+                        fak_err=fak_err,
+                    )
+                else:
+                    log.info(
+                        "router.tp_full",
+                        token=action.token[:16],
+                        price=action.price,
+                        qty=action.qty,
+                        gtd_id=(gtd.server_order_id or "")[:16] if gtd else "",
+                        fak_id=(fak.server_order_id or "")[:16] if fak else "",
+                    )
+
+            # B-3 v2 fix: retain a strong reference to the spawned task so it
+            # cannot be GC'd before its first `await` yields control. Mirrors
+            # the cleanup pattern in `GtdExpiryWatcher._bg_tasks` — when the
+            # task finishes, it removes itself from the set.
+            task = asyncio.create_task(_tp_runner())
+            self._state._bg_tasks.add(task)
+            task.add_done_callback(self._state._bg_tasks.discard)
 
     def _make_fill_callback(self):
-        """Create a fill callback that routes to engine (used by CLOBClient polling)."""
+        """Create a fill callback that routes to engine (used by CLOBClient polling).
+
+        CLOBClient now uses a FillDeduper to translate cumulative observations
+        into per-event deltas. The callback receives `(token_id, order_id,
+        fill_price, fill_delta_size, fill_total_size)`:
+
+          * `fill_delta_size`  — strict increment since the last fire (B-3 fix;
+            the engine must treat this as a delta, not a cumulative).
+          * `fill_total_size`  — cumulative matched size; used by OrderManager
+            to keep its tracked-order state in monotonic lock-step with the
+            server. Always > 0 once deduper has accepted the observation.
+
+        The engine end (on_order_filled -> record_fill) already does
+        `size_filled += size`, which under delta semantics gives an exact sum,
+        regardless of how many times WS / polling / FAK re-observe the order.
+        """
         eng = self._state.engine
         om = self._state.order_manager
 
@@ -195,17 +317,38 @@ class ActionRouter:
             token_id: str,
             order_id: str,
             fill_price: float,
-            fill_size: float,
+            fill_delta_size: float,
+            fill_total_size: float,
         ):
-            if eng and om:
-                om.mark_filled(order_id)
-                eng.on_order_filled(token_id, order_id, fill_price, fill_size)
+            if not eng or not om:
+                return
+            if fill_delta_size <= 0 or fill_total_size <= 0:
+                # Defensive: deduper should already have filtered these out.
+                return
+
+            # 1) Promote tracked-order status to "filled" (no-op if partial).
+            om.mark_filled(order_id)
+
+            # 2) Feed the engine position state with the DELTA. record_fill
+            #    does `size_filled += size` which under delta semantics is
+            #    exactly correct — no double counting (B-3). We also pass
+            #    cumulative to the OrderManager for its own bookkeeping.
+            om.apply_fill_event(
+                order_id,
+                size_matched=fill_total_size,
+                fill_price=fill_price,
+            )
+            eng.on_order_filled(
+                token_id, order_id, fill_price, fill_delta_size
+            )
+
             log.info(
                 "router.fill",
                 token=token_id[:16],
-                order_id=order_id,
+                order_id=order_id[:16],
                 fill_price=fill_price,
-                fill_size=fill_size,
+                fill_delta_size=fill_delta_size,
+                fill_total_size=fill_total_size,
             )
         return on_fill
 
@@ -297,6 +440,21 @@ async def _on_new_round(round_start_ts: int) -> None:
     if state.engine:
         await state.engine.on_new_round(round_start_ts, state.current_market)
 
+    # Seed initial baseline immediately so the gate opens within seconds of
+    # window start. The 5-min sampled baseline below will overwrite this if
+    # the window-start spot proves noisy, but in practice using the live spot
+    # at round transition is good enough — we just want the gate ready before
+    # T1_ENTRY_WINDOW_S (5 min) expires.
+    bc_now = state.binance_cache.last_price if state.binance_cache else 0.0
+    if state.engine and bc_now > 0:
+        state.engine.set_binance_baseline(bc_now)
+        log.info(
+            "round.baseline_seeded",
+            round_start_ts=round_start_ts,
+            baseline=bc_now,
+            source="binance_now",
+        )
+
     # Persist round start
     mkt = state.current_market
     state.db.upsert_round(
@@ -385,14 +543,14 @@ async def _midpoint_poll_loop() -> None:
             down_mid = await s.pm_client.get_midpoint(down_token)
             s.price_cache.midpoint[up_token] = up_mid
             s.price_cache.midpoint[down_token] = down_mid
-            log.info(
-                "midpoint.poll",
-                condition_id=condition_id[:16],
-                up_token=up_token[:16],
-                down_token=down_token[:16],
-                up_mid=up_mid,
-                down_mid=down_mid,
-            )
+
+            # B-1 fix (single-driver): the strategy decision loop is now
+            # driven solely by DecisionLoop on a 250ms tick. The midpoint
+            # poll here only refreshes the price cache; it no longer
+            # re-enters _evaluate. Previously both this loop and
+            # DecisionLoop would invoke _evaluate, which combined with the
+            # engine's _eval_inflight drop-on-re-entry guard produced
+            # redundant work and confusing log timing.
         except Exception as exc:
             log.warning("midpoint.poll error", condition_id=condition_id[:16], up_token=up_token[:16], down_token=down_token[:16], error=str(exc))
 
@@ -542,6 +700,11 @@ async def main() -> None:
     router = ActionRouter(s)
     s.engine = StrategyEngine(s.binance_cache, s.price_cache, router)
 
+    # ── Decision loop — drives StrategyEngine._evaluate() on a fixed tick ──
+    # Fixes audit B-1: before this loop existed, nothing invoked _evaluate,
+    # so the entire decision core was dead code.
+    s.decision_loop = DecisionLoop(s.engine, tick_interval_s=0.25)
+
     # ── Feeds ───────────────────────────────────────────────────────────
     s.binance_feed = BinanceFeed(
         cache=s.binance_cache,
@@ -575,6 +738,8 @@ async def main() -> None:
     await s.market_ws.start()
     await s.wm.start()
     s.gtd_expiry.start()
+    if s.decision_loop:
+        s.decision_loop.start()
 
     if s.user_ws:
         await s.user_ws.start()
@@ -611,8 +776,17 @@ async def main() -> None:
     status_task.cancel()
     midpoint_task.cancel()
 
+    # B-3 v2 fix: await any in-flight TP runners so they finish cleanly
+    # before tearing down dependencies (clob / order_manager). Otherwise a
+    # TP sell could fire after `_shutdown` is set and race against cleanup.
+    if STATE._bg_tasks:
+        await asyncio.gather(*list(STATE._bg_tasks), return_exceptions=True)
+        STATE._bg_tasks.clear()
+
     if s.gtd_expiry:
         await s.gtd_expiry.stop()
+    if s.decision_loop:
+        await s.decision_loop.stop()
     if s.wm:
         await s.wm.stop()
     if s.market_ws:
@@ -653,27 +827,64 @@ def _make_maker_fill_callback(state: AppState):
         order_id = fill.maker_order_id
         asset_id = fill.asset_id
         fill_price = fill.price
-        fill_size = fill.size
+        # polymarket WS reports per-trade size (incremental). We must
+        # accumulate into the order's matched size before promoting to filled.
+        fill_size_inc = fill.size
 
-        if not order_id or fill_size <= 0:
+        if not order_id or fill_size_inc <= 0:
             log.debug(
                 "router.maker_fill.skip",
-                order_id=order_id, fill_size=fill_size,
+                order_id=order_id, fill_size=fill_size_inc,
             )
             return
 
-        # Mark in order manager
+        tracked = om.by_server_id(order_id)
+        if not tracked:
+            log.debug(
+                "router.maker_fill.untracked",
+                order_id=order_id,
+            )
+            return
+
+        # Decide what *increment* to forward to the engine. The UserWS
+        # delivers one maker-fill row per trade — most of the time the
+        # increment is exactly fill.size. But the exchange can also send a
+        # MOMENTUM / UPDATE event that reports the order's NEW cumulative
+        # matched size (not a delta). We unify on delta semantics here:
+        # `prev_cumulative + delta == new_cumulative`, so `delta = max(0,
+        # new_cumulative - prev_cumulative)`. Anything beyond that is
+        # treated as already accounted for and dropped. (B-3 fix — earlier
+        # versions ignored this and double-counted on UPDATE-style events.)
+        prev_cumulative = tracked.size_matched or 0.0
+        new_cumulative = prev_cumulative + fill_size_inc
+        delta = max(0.0, fill_size_inc)
+        # Only emit when there is net new matched size to report.
+        if new_cumulative - prev_cumulative <= 1e-9:
+            log.debug(
+                "router.maker_fill.no_new",
+                order_id=order_id, prev=prev_cumulative, inc=fill_size_inc,
+            )
+            return
+
+        om.apply_fill_event(
+            order_id,
+            size_matched=new_cumulative,
+            fill_price=fill_price,
+        )
         om.mark_filled(order_id)
 
-        # Route to engine with authoritative asset_id
-        eng.on_order_filled(asset_id, order_id, fill_price, fill_size)
+        # Route to engine with authoritative asset_id. Engine treats
+        # `fill_size` as the per-event delta after the B-3 deduper / Lock
+        # refactor (see engine.on_order_filled docstring).
+        eng.on_order_filled(asset_id, order_id, fill_price, delta)
 
         log.info(
             "router.maker_fill",
             maker_order_id=order_id,    # full id — never truncate
             asset_id=asset_id[:16],
             fill_price=fill_price,
-            fill_size=fill_size,
+            fill_size=delta,
+            fill_total_size=new_cumulative,
             status=fill.status,
         )
 
@@ -702,6 +913,10 @@ def _make_user_ws_order_callback(state: AppState):
             # Partial fill update — size_matched changed
             # Engine tracks fills via on_order_filled separately,
             # but UPDATE gives us the authoritative size_matched for the order.
+            om = state.order_manager
+            if om:
+                om.apply_fill_event(order_id, size_matched=ev.size_matched)
+                om.mark_filled(order_id)
             log.debug(
                 "router.order_update",
                 order_id=order_id, size_matched=ev.size_matched,

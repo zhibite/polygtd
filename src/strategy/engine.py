@@ -94,6 +94,10 @@ class StrategyEngine:
         self._round: RoundState | None = None
         self._gate: GateKeeper | None = None
         self._s = _s()
+        # B-1 fix: prevents concurrent tick sources (midpoint poll loop +
+        # binance + WS book ticker) from re-entering _evaluate while the
+        # previous run is awaiting an action handler. Drop-on-re-entry.
+        self._eval_inflight: bool = False
 
     # ------------------------------------------------------------------
     # Round lifecycle
@@ -148,13 +152,19 @@ class StrategyEngine:
         fill_size: float,
     ) -> None:
         """
-        Called when a fill event is received.
+        Called when a confirmed fill delta is received.
 
         Args:
             token_id:        authoritative asset_id of the filled maker order (UP or DOWN)
             server_order_id: complete server order_id hash (NOT a prefix)
             fill_price:      price of this fill
-            fill_size:       tokens filled in this event
+            fill_size:       tokens filled IN THIS EVENT (a delta, NOT a
+                              cumulative). Multiple sources (WS, polling,
+                              FAK response) may observe the same order — a
+                              FillDeduper inside CLOBClient ensures this is
+                              only called with the un-processed delta so that
+                              `record_fill`'s `size_filled += size` does not
+                              double-count (B-3 fix).
         """
         if not self._round:
             log.debug(
@@ -195,6 +205,20 @@ class StrategyEngine:
                     tp_target=pos.tp_target(),
                 )
                 return
+
+        # Not a BUY tier fill — check if it is a registered TP (SELL) fill.
+        if pos.record_tp_fill(server_order_id, fill_price, fill_size):
+            log.info(
+                "engine.tp_filled",
+                server_order_id=server_order_id[:16],
+                token_id=token_id[:16],
+                fill_price=fill_price,
+                fill_size=fill_size,
+                total_qty=pos.total_qty,
+                avg_cost=pos.avg_cost,
+                tp_target=pos.tp_target(),
+            )
+            return
 
         log.debug("engine.fill_unknown", order_id=server_order_id)
 
@@ -245,13 +269,17 @@ class StrategyEngine:
         token_id: str,
         expires_at: float,
         expected_price: float,
+        placed_size: float | None = None,
     ) -> None:
         """
         Called by the action router after an order is placed.
 
         Records the authoritative token_id so fill events can be validated.
-        size_expected is computed from expected_price (bid at placement), not from
-        avg_fill_price (still None at this point — it's only set on first fill).
+        size_expected is the CLOB-accepted placed_size when supplied (M-1
+        fix — the CLOB may round down size to the nearest tick, so
+        notional / expected_price can be off by one tick and cause
+        is_complete to never flip on a clean fill). Falls back to the
+        notional/expected_price quotient if placed_size is missing.
         """
         if not self._round:
             return
@@ -260,40 +288,66 @@ class StrategyEngine:
         t.server_order_id = server_order_id
         t.token_id = token_id
         t.expires_at = expires_at
-        t.size_expected = t.notional / expected_price if expected_price > 0 else 0.0
+        if placed_size is not None and placed_size > 0:
+            t.size_expected = placed_size
+        elif expected_price > 0:
+            t.size_expected = t.notional / expected_price
+        else:
+            t.size_expected = 0.0
 
     # ------------------------------------------------------------------
     # Core evaluation
     # ------------------------------------------------------------------
 
     async def _evaluate(self) -> None:
+        """Re-evaluate the round state and emit at most one action.
+
+        Wrapped in an in-flight guard so concurrent tick sources (B-1 fix:
+        midpoint poll, WS book ticker, binance trades) cannot re-enter the
+        decision loop while a previous evaluate is awaiting the action
+        handler. Without this, two ticks arriving in the same window could
+        each emit ActionOpenT1 / ActionOpenTN and the router would queue
+        two placements.
+        """
         if not self._round or not self._gate:
             return
 
-        bc_now = self._bc.last_price
-        if bc_now <= 0:
+        # Single-flight: drop re-entry rather than queue it. The next tick
+        # will pick up the new state and call _evaluate again.
+        if self._eval_inflight:
+            log.debug(
+                "engine.evaluate.skip re_entry",
+                round_start_ts=self._round.round_start_ts,
+            )
             return
+        self._eval_inflight = True
+        try:
+            bc_now = self._bc.last_price
+            if bc_now <= 0:
+                return
 
-        gate_state = self._gate.state(bc_now)
+            gate_state = self._gate.state(bc_now)
 
-        new_state = "PASS" if gate_state.within_limit else "FAIL"
-        if self._round.gate_last_state != new_state:
-            self._round.gate_last_state = new_state
-            log.info("engine.gate", drift=gate_state.drift, state=new_state)
+            new_state = "PASS" if gate_state.within_limit else "FAIL"
+            if self._round.gate_last_state != new_state:
+                self._round.gate_last_state = new_state
+                log.info("engine.gate", drift=gate_state.drift, state=new_state)
 
-        if not gate_state.within_limit:
-            return  # drift out of bounds — no new orders
+            if not gate_state.within_limit:
+                return  # drift out of bounds — no new orders
 
-        pos = self._round.position
+            pos = self._round.position
 
-        # ── Not yet entered → check T1 entry ────────────────────────────
-        if pos.entry_token is None:
-            await self._check_t1_entry(bc_now)
+            # ── Not yet entered → check T1 entry ────────────────────────────
+            if pos.entry_token is None:
+                await self._check_t1_entry(bc_now)
 
-        # ── In position → check averaging-down and take-profit ───────────
-        if pos.entry_token is not None:
-            await self._check_average_down(bc_now)
-            await self._check_take_profit(bc_now)
+            # ── In position → check averaging-down and take-profit ───────────
+            if pos.entry_token is not None:
+                await self._check_average_down(bc_now)
+                await self._check_take_profit(bc_now)
+        finally:
+            self._eval_inflight = False
 
     async def _check_t1_entry(self, bc_now: float) -> None:
         """Check both sides for T1 entry trigger."""
@@ -359,6 +413,24 @@ class StrategyEngine:
                 drift=self._gate.state(bc_now).drift,
             )
 
+            # H-1 v2 fix: claim the entry slot BEFORE awaiting the handler.
+            # Previously `_round.position.entry_token` was written by the
+            # router only AFTER `await place_buy` resolved — during that
+            # yield window a concurrent `_evaluate` tick could observe
+            # `entry_token is None` and emit a duplicate ActionOpenT1.
+            # Writing it here, under the same `_eval_inflight` guard that
+            # is still held, closes the race. The router will skip its own
+            # `entry_token = action.token` write because the field is no
+            # longer None (idempotent overwrite with the same value).
+            pos.entry_side = side
+            pos.entry_token = token
+            # H-3 v2 fix: anchor the averaging-tier trigger baseline to
+            # the intended entry price (the bid at decision time), not to
+            # whatever we end up actually filling at. The actual fill
+            # average still drives `_avg_cost` and TP via `baseline_price`;
+            # this `baseline_target_price` only seeds T2/T3/T4 triggers so
+            # martingale spacing is independent of T1 slippage direction.
+            pos.baseline_target_price = bid_price
             await self._handler(ActionOpenT1(
                 side=side,
                 token=token,
@@ -389,7 +461,14 @@ class StrategyEngine:
         if mid_price <= 0:
             return
 
-        baseline = pos.baseline_price
+        # H-3 v2 fix: anchor the averaging trigger lines to the INTENDED
+        # entry price (the bid at T1 decision time), not to the actual
+        # fill average. This keeps martingale spacing stable across T1
+        # slippage — if T1 fills 5% above the bid, T2 still triggers at
+        # the design -20% from the original bid, not -20% from a
+        # slippage-shifted avg. Falls back to the actual baseline for
+        # older round-state objects constructed before this field existed.
+        baseline = pos.baseline_target_price or pos.baseline_price
         s = self._s
 
         for tier in pos.tiers[1:]:  # T2, T3, T4
@@ -397,6 +476,20 @@ class StrategyEngine:
             if tier.is_complete:
                 continue
             if tier.placed:
+                continue
+
+            # Per-tier hard cap: refuse to (re)place this tier if it has
+            # already absorbed > tier.notional * TIER_NOTIONAL_MAX_MULT.
+            # This stops GTD loops / repeated partial fills from silently
+            # spending into the next tier's budget.
+            if pos.tier_is_saturated(tier):
+                log.warning(
+                    "engine.tier_saturated_skip",
+                    tier=tier.tier,
+                    cost_filled=tier.cost_filled,
+                    cap=tier.notional * s.TIER_NOTIONAL_MAX_MULT,
+                    planned=tier.notional,
+                )
                 continue
 
             trigger = tier.trigger_price(baseline)
@@ -417,6 +510,15 @@ class StrategyEngine:
             # In that case price momentum justifies the averaging entry.
             next_drop = TierSnapshot._next_tier_drop(tier.tier)
             if not self._gate.can_double_down(bc_now, mid_price, tier.tier, next_drop, baseline):
+                continue
+
+            # Per-tier remaining cap (defense-in-depth)
+            tier_remaining = pos.tier_notional_remaining(tier)
+            if tier_remaining < tier.notional * 0.5:
+                log.warning(
+                    "engine.tier_remaining_low_skip",
+                    tier=tier.tier, tier_remaining=tier_remaining,
+                )
                 continue
 
             # Stake cap check — don't overcommit
@@ -447,12 +549,21 @@ class StrategyEngine:
             return  # place one tier at a time
 
     async def _check_take_profit(self, bc_now: float) -> None:
-        """Check if take-profit should trigger."""
+        """Check if take-profit should trigger.
+
+        Mutex: while a TP sell is in-flight (awaiting CLOB ack / partial fill
+        callback), do not enqueue a new TP action. The flag is cleared by the
+        next fill event so residual position can re-arm if mid is still
+        above the target.
+        """
         if not self._round or not self._gate:
             return
 
         pos = self._round.position
         if not pos.entry_token or pos.total_qty <= 0:
+            return
+
+        if pos._tp_inflight:
             return
 
         mid_price = self._pc.get_midpoint(pos.entry_token)
@@ -463,21 +574,31 @@ class StrategyEngine:
         if tp_target is None:
             return
 
-        # Use mid_price for trigger, bid for order placement
-        if mid_price < tp_target:
-            return
-
+        # B-4 fix: trigger on bid, not mid. With mid/bid gap of ~1-3% in
+        # the 0.95-zone tokens, mid-based triggers over-state the profit
+        # window and lead to actual sale prices that miss the target.
+        # Using bid here keeps trigger-condition and sale-price identical.
         bid_price = self._pc.bid(pos.entry_token)
         if bid_price <= 0:
+            return
+
+        if bid_price < tp_target:
             return
 
         if not self._gate.can_act(bc_now):
             return
 
+        # Set mutex BEFORE emitting the action so re-entrant _evaluate()
+        # calls (called again from any subsequent token/bnb tick before the
+        # TP sell's fill callback lands) do not stack duplicate actions.
+        pos._tp_inflight = True
+
         log.info(
             "engine.trigger_tp",
             mid=mid_price,
+            bid=bid_price,
             tp_target=tp_target,
+            tp_pct=pos.tp_pct_for_current_state(),
             avg_cost=pos.avg_cost,
             qty=pos.total_qty,
         )

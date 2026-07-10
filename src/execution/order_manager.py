@@ -27,6 +27,12 @@ from src.market.pm_client import PolymarketClient
 
 log = get_logger(__name__)
 
+# Two-stage TP: maker-first, fallback to taker.
+# `TP_GTD_LIFETIME_S` is short on purpose — window market is 15 minutes and we
+# want to clear position before settlement if market is shallow.
+TP_GTD_LIFETIME_S: int = 90         # how long we wait at the bid (maker)
+TP_FALLBACK_BUFFER_S: int = 15     # how much buffer before GTD deadline to start fallback
+
 
 @dataclass
 class TrackedOrder:
@@ -41,6 +47,10 @@ class TrackedOrder:
     lifetime_s: int
     expires_at: float   # Unix timestamp
     placed_at: float
+    # Authoritative placed size, post-CLOB round-down. Used by the engine
+    # to set tier.size_expected so is_complete / cost-cap arithmetic stays
+    # consistent with what the CLOB actually accepted (audit M-1).
+    placed_size: float = 0.0
     size_matched: float = 0.0
     status: Literal["placed", "live", "filled", "cancelled", "expired"] = "placed"
 
@@ -151,11 +161,24 @@ class OrderManager:
     ) -> TrackedOrder | None:
         """Place a GTD BUY order. Returns TrackedOrder or None."""
         async with self._lock:
+            # H-3 fix: the CLOB client enforces a minimum GTD lifetime of
+            # GTD_MIN_SEC+1 = 181 s (CLOB-side hard floor). The TrackedOrder
+            # must expire at the *same* wall-clock time as the server-side
+            # GTD, otherwise the expiry watcher cancels an order that has
+            # already expired on the server (or vice versa) — both paths
+            # cause cancel-after-fill races. See also CLOBClient.GTD_MIN_SEC.
+            from src.execution.clob_client import CLOBClient as _CC
             lifetime_s = self._s.GTD_LIFETIME_S
-            expiration_ts = int(time.time()) + 60 + lifetime_s
+            effective_lifetime = max(lifetime_s, _CC.GTD_MIN_SEC + 1)
             cid = f"{round_start_ts}-{tier_name}-{uuid.uuid4().hex[:8]}"
 
-            # Snap to just above the current bid for better fill probability
+            # Snap to just above the current bid for better fill probability.
+            # B-1 v2 fix: prior to this fix the same `_adjust_buy_price +
+            # place_gtd_buy + success-check` block appeared TWICE in this
+            # function, which meant every BUY order was posted to the CLOB
+            # twice and charged the user 2x the intended notional. The second
+            # block was a leftover copy-paste; the dedup is enforced by
+            # `tests/test_audit_fixes_2026_07_11.py::test_b1_v2_buy_single_call`.
             adjusted_price = await self._adjust_buy_price(token_id, price)
             result: FillResult = await self._clob.place_gtd_buy(
                 token_id=token_id,
@@ -174,6 +197,14 @@ class OrderManager:
                 return None
 
             server_id = result.order_id
+            # H-3 fix: trust the server-side expiration_ts from FillResult
+            # so the watcher's `expires_at` matches the CLOB's wall clock
+            # exactly (was previously `int(time.time()) + effective_lifetime`
+            # computed at this call site, which could drift by a second or
+            # two against the value the CLOB actually stored).
+            expiration_ts = result.expiration_ts or (
+                int(time.time()) + effective_lifetime
+            )
             order = TrackedOrder(
                 client_order_id=cid,
                 server_order_id=server_id,
@@ -183,7 +214,12 @@ class OrderManager:
                 tier_name=tier_name,
                 price=adjusted_price,  # the price actually sent to CLOB
                 size=size,
-                lifetime_s=lifetime_s,
+                # M-1: CLOB may round-down size_q to a tick boundary; the
+                # engine must size tier.size_expected against the size the
+                # CLOB actually accepted, not the naive notional/price
+                # quotient (which can be off by one tick).
+                placed_size=result.tokens if result.tokens > 0 else size,
+                lifetime_s=effective_lifetime,
                 expires_at=float(expiration_ts),
                 placed_at=time.time(),
                 status="live",
@@ -205,6 +241,266 @@ class OrderManager:
                 tier=tier_name,
             )
             return order
+
+    # ------------------------------------------------------------------
+    # Place SELL (GTD limit, maker-first)
+    # ------------------------------------------------------------------
+
+    async def place_gtd_sell(
+        self,
+        token_id: str,
+        size: float,
+        price: float,
+        round_start_ts: int,
+        tier_name: str,
+        tick_size: float,
+        lifetime_s: int | None = None,
+        # B-4 fix: when True, skip the ask-side snap and use the engine's
+        # exact bid as the order price. Used by the TP path so the actual
+        # sale price matches the trigger-condition bid (no spread surprise).
+        price_lock: bool = False,
+    ) -> TrackedOrder | None:
+        """
+        Place a GTD limit SELL at `price` (typically the current bid).
+
+        Unlike `place_sell` (which is a FAK taker) this returns *immediately*
+        with a TrackedOrder in `live` status. The caller decides when to
+        follow up with a taker fallback.
+
+        Returns None on post failure.
+        """
+        async with self._lock:
+            # H-3 fix: enforce the same effective lifetime as the BUY path —
+            # CLOBClient clamps to GTD_MIN_SEC+1 = 181 s. The tracked
+            # expires_at must mirror that, otherwise the expiry watcher
+            # races with the server-side expiration and cancels orders
+            # that have already self-expired (or vice versa).
+            from src.execution.clob_client import CLOBClient as _CC
+            gtd_lifetime = lifetime_s if lifetime_s is not None else TP_GTD_LIFETIME_S
+            effective_lifetime = max(gtd_lifetime, _CC.GTD_MIN_SEC + 1)
+            cid = f"{round_start_ts}-{tier_name}-{uuid.uuid4().hex[:8]}"
+
+            # B-4 fix: TP path uses engine's exact bid as the limit price
+            # so the actual fill aligns with the trigger-condition bid.
+            # BUY tiers still snap to ask-SELL_STEP for fill probability.
+            adjusted_price = (
+                price if price_lock
+                else await self._adjust_sell_price(token_id, price)
+            )
+            result: FillResult = await self._clob.place_gtd_sell(
+                token_id=token_id,
+                price=adjusted_price,
+                size=size,
+                lifetime_s=gtd_lifetime,
+                tick_size=tick_size,
+            )
+
+            if not result.success or not result.order_id:
+                log.warning(
+                    "order_manager.gtd_sell.failed",
+                    token=token_id[:16], size=size, price=adjusted_price,
+                    tier=tier_name, error=result.error,
+                )
+                # Even partial fills are returned in result.tokens; surface them.
+                if result.tokens > 0:
+                    log.info(
+                        "order_manager.gtd_sell.partial_via_failure",
+                        filled=result.tokens,
+                    )
+                return None
+
+            server_id = result.order_id
+            # H-3 fix: trust the server-side expiration_ts from FillResult
+            # so the watcher's `expires_at` matches the CLOB's wall clock
+            # exactly (was previously computed locally and could drift).
+            expiration_ts = result.expiration_ts or (
+                int(time.time()) + effective_lifetime
+            )
+            order = TrackedOrder(
+                client_order_id=cid,
+                server_order_id=server_id,
+                round_start_ts=round_start_ts,
+                side="SELL",
+                token_id=token_id,
+                tier_name=tier_name,
+                price=adjusted_price,
+                size=size,
+                placed_size=result.tokens if result.tokens > 0 else size,
+                lifetime_s=gtd_lifetime,
+                expires_at=float(expiration_ts),
+                placed_at=time.time(),
+                status="live",
+                size_matched=result.tokens,
+            )
+            self._orders[cid] = order
+            if server_id:
+                self._by_server[server_id] = cid
+
+            log.info(
+                "order_manager.gtd_sell.posted",
+                client_id=cid,
+                server_id=server_id[:16] if server_id else "",
+                token=token_id[:16],
+                size=size,
+                price=adjusted_price,
+                tier=tier_name,
+                lifetime_s=gtd_lifetime,
+                initial_match=result.tokens,
+            )
+            return order
+
+    # ------------------------------------------------------------------
+    # Two-stage TP: place GTD sell, then FAK fallback if not fully filled.
+    # ------------------------------------------------------------------
+
+    async def place_tp_with_fallback(
+        self,
+        token_id: str,
+        size: float,
+        price: float,
+        round_start_ts: int,
+        tier_name: str = "TP",
+        tick_size: float = 0.01,
+    ) -> tuple[TrackedOrder | None, TrackedOrder | None, str, str]:
+        """
+        TP exit with maker-first / taker-fallback design.
+
+        Returns (gtd, fak, gtd_error, fak_error):
+          * gtd_error ∈ {"", "gtd_post_failed"}            — empty on success
+          * fak_error ∈ {"", "fak_post_error:...", "fak_no_fills",
+                          "below_min_5", "fak_no_response", "fak_cancelled"}
+
+        H-4 fix: stage-level error codes let the router distinguish network
+        errors from book-rejected FAKs and choose the right mutex policy.
+
+        B-4 fix: passes price_lock=True into place_gtd_sell so the actual
+        GTD limit = the engine's bid at trigger time, not the snapped
+        ask-SELL_STEP value (which would push the sale above the trigger).
+        """
+        gtd: TrackedOrder | None = None
+        fak: TrackedOrder | None = None
+        gtd_error: str = ""
+        fak_error: str = ""
+
+        # ── Stage 1: GTD limit sell at bid ──────────────────────────────
+        gtd = await self.place_gtd_sell(
+            token_id=token_id,
+            size=size,
+            price=price,
+            round_start_ts=round_start_ts,
+            tier_name=tier_name,
+            tick_size=tick_size,
+            lifetime_s=TP_GTD_LIFETIME_S,
+            price_lock=True,   # B-4: use engine's exact bid as limit
+        )
+
+        if not gtd:
+            gtd_error = "gtd_post_failed"
+            log.warning(
+                "order_manager.tp.gtd_post_failed_skip_to_fak",
+                token=token_id[:16], size=size,
+            )
+            # Jump straight to FAK fallback
+            fak, fak_error = await self._place_fak_with_error(
+                token_id=token_id,
+                size=size,
+                price=price,
+                round_start_ts=round_start_ts,
+                tier_name=tier_name,
+                tick_size=tick_size,
+            )
+            return (None, fak, gtd_error, fak_error)
+
+        # ── Wait for the GTD to fill or near-expire ──────────────
+        # H-3 fix: sleep must align with the *server-side* GTD deadline, not
+        # the user-configured TP_GTD_LIFETIME_S. Since the CLOB client clamps
+        # lifetime to GTD_MIN_SEC+1 = 181s, the watcher/cancel must wait
+        # roughly that long before deciding whether to fire the FAK
+        # fallback — otherwise we cancel a still-live maker order mid-life
+        # and pay the taker spread unnecessarily. We use the same effective
+        # lifetime as place_gtd_sell so client-side and server-side clocks
+        # agree.
+        from src.execution.clob_client import CLOBClient as _CC
+        wait_s = max(TP_GTD_LIFETIME_S, _CC.GTD_MIN_SEC + 1) - TP_FALLBACK_BUFFER_S
+        await asyncio.sleep(wait_s)
+
+        # Refresh size_matched before deciding fallback qty.
+        server_id = gtd.server_order_id
+        if server_id:
+            try:
+                status = await self._clob._run(self._clob._client.get_order, server_id)
+                if status:
+                    gtd.size_matched = float(status.get("size_matched") or gtd.size_matched)
+            except Exception as exc:
+                log.debug("order_manager.tp.status_poll_failed", error=str(exc))
+
+        sold_so_far = gtd.size_matched
+        remaining = max(0.0, size - sold_so_far)
+
+        # ── Stage 2: FAK fallback for the residual ───────────────────────
+        if remaining >= 5.0:  # CLOB 5-shares minimum
+            log.info(
+                "order_manager.tp.fak_fallback",
+                token=token_id[:16],
+                sold=sold_so_far,
+                residual=remaining,
+                limit_bid=price,
+            )
+            fak, fak_error = await self._place_fak_with_error(
+                token_id=token_id,
+                size=remaining,
+                price=price,
+                round_start_ts=round_start_ts,
+                tier_name=tier_name,
+                tick_size=tick_size,
+            )
+        else:
+            log.info(
+                "order_manager.tp.gtd_full",
+                token=token_id[:16], sold=sold_so_far, target=size,
+            )
+
+        # Promote GTD to filled if it's now fully matched
+        if gtd.size_matched >= size * 0.995:
+            self.mark_filled(gtd.client_order_id)
+
+        return (gtd, fak, gtd_error, fak_error)
+
+    async def _place_fak_with_error(
+        self,
+        token_id: str,
+        size: float,
+        price: float,
+        round_start_ts: int,
+        tier_name: str,
+        tick_size: float,
+    ) -> tuple[TrackedOrder | None, str]:
+        """Wrapper around place_sell that maps failures to stage-level error tags.
+
+        Returns (tracked_or_None, error_tag). error_tag is "" on success.
+        H-4 fix: distinguishes network errors from book-rejected FAKs so the
+        router can choose the right mutex policy.
+        """
+        if size < 5.0:
+            return (None, "below_min_5")
+        try:
+            tracked = await self.place_sell(
+                token_id=token_id,
+                size=size,
+                price=price,
+                round_start_ts=round_start_ts,
+                tier_name=tier_name,
+                tick_size=tick_size,
+            )
+        except Exception as exc:
+            log.warning("order_manager.tp.fak_caller_error", error=str(exc))
+            return (None, f"fak_caller_error:{exc}")
+        if tracked is None:
+            # place_sell returns None on failure but swallows the cause;
+            # we conservatively treat any None as a transient post error
+            # and let the router keep the mutex.
+            return (None, "fak_post_error")
+        return (tracked, "")
 
     # ------------------------------------------------------------------
     # Place SELL (FAK market)
@@ -369,16 +665,52 @@ class OrderManager:
     # State mutations from callbacks
     # ------------------------------------------------------------------
 
-    def mark_filled(self, server_order_id: str) -> None:
-        """Mark an order as filled (called from trade events)."""
+    def mark_filled(self, server_order_id: str) -> bool:
+        """Mark an order as filled only if cumulative matched >= expected size.
+
+        Returns True if the order was promoted to filled status.
+        Returns False if the order is unknown, already terminal, or partially
+        filled (caller should keep watching for more fill events).
+        """
         order = self.by_server_id(server_order_id)
-        if order:
-            order.status = "filled"
-            log.info(
-                "order_manager.mark_filled",
+        if not order:
+            return False
+        if order.status in ("filled", "cancelled", "expired"):
+            return order.status == "filled"
+        # Guard against treating partial fills as fully filled.
+        # CLOB sends a fill event on EVERY trade that crosses our order, so
+        # if we have only received N of M tokens we are not done yet.
+        if order.size_matched > 0 and order.size_matched + 1e-9 < order.size * 0.995:
+            log.debug(
+                "order_manager.partial_fill_skip_mark_filled",
                 client_id=order.client_order_id,
-                server_id=server_order_id[:16],
+                matched=order.size_matched,
+                expected=order.size,
             )
+            return False
+        order.status = "filled"
+        log.info(
+            "order_manager.mark_filled",
+            client_id=order.client_order_id,
+            server_id=server_order_id[:16],
+            matched=order.size_matched,
+            expected=order.size,
+        )
+        return True
+
+    def apply_fill_event(
+        self,
+        server_order_id: str,
+        size_matched: float,
+        fill_price: float | None = None,
+    ) -> None:
+        """Update matched size for a GTD order and report any newly-completed status."""
+        order = self.by_server_id(server_order_id)
+        if not order:
+            return
+        # size_matched is monotonic — keep the max
+        if size_matched > order.size_matched:
+            order.size_matched = size_matched
 
     def mark_size_matched(self, server_order_id: str, size_matched: float) -> None:
         """Update matched size (called from order UPDATE events)."""

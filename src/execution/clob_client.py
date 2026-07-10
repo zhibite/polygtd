@@ -50,6 +50,104 @@ class FillResult:
     fill_price: float
     success: bool
     error: str = ""
+    # Server-side GTD expiration (Unix ts). Forwarded into TrackedOrder
+    # so client/watch and CLOB share the exact same wall-clock deadline
+    # (audit H-3 / L-3). 0 when not applicable.
+    expiration_ts: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Fill deduper
+# ---------------------------------------------------------------------------
+
+
+class FillDeduper:
+    """Authoritative dedup layer for fill events.
+
+    Multiple sources (per-order polling, UserWS maker-fill, FAK post-response)
+    can each independently observe that a given `server_order_id` is "more
+    filled than before". Previously every fire of the cumulative size was
+    forwarded to the engine, which then did `size_filled += cumulative`,
+    double-counting partial fills and double-firing tier promotion + TP.
+
+    Design (B-3 fix):
+      - `bookmark[order_id]` = the cumulative matched size we have already
+        notified the engine about.  Strictly monotonic.
+      - `_lock` protects `bookmark` and `seen_trade_ids` against concurrent
+        fire paths from the same / different coroutines.
+      - `seen_trade_ids` is a fallback dedup set keyed by `(order_id,
+        trade_id)` for SDK responses that expose individual fill rows.
+        Either path is sufficient by itself; we keep both for defence in
+        depth (the monotonic bookmark is the primary guard, the trade-id
+        set protects against curl-level replay / FAK re-send).
+      - `submit(token_id, order_id, fill_price, fill_total_size, fill_id)`
+        returns `(delta, total_after)`. If `delta <= 0` we have already
+        accounted for this event and skip notification.
+      - All exceptions raised by user callback are caught and logged so
+        that a malformed fill never tears down the polling thread.
+    """
+
+    def __init__(self) -> None:
+        # order_id -> last-acknowledged cumulative matched size
+        self._bookmark: dict[str, float] = {}
+        # (order_id, fill_id or "") -> True. Empty fill_id is treated as a
+        # generic dedup marker for SDK responses without per-fill rows.
+        self._seen_trades: set[tuple[str, str]] = set()
+        self._lock = asyncio.Lock()
+
+    async def submit(
+        self,
+        token_id: str,
+        order_id: str,
+        fill_price: float,
+        fill_total_size: float,
+        fill_id: str = "",
+    ) -> tuple[float, float]:
+        """Return (delta, total_after) for this fill observation.
+
+        Always safe to call from any source. Returns (0.0, current_bookmark)
+        for already-seen events so callers can skip downstream work.
+        """
+        if not order_id or fill_total_size <= 0:
+            return 0.0, self._bookmark.get(order_id or "", 0.0)
+
+        async with self._lock:
+            trade_key = (order_id, fill_id) if fill_id else None
+            if trade_key is not None and trade_key in self._seen_trades:
+                # Exact fill-row already seen — return current bookmark, delta=0.
+                return 0.0, self._bookmark.get(order_id, 0.0)
+
+            prior = self._bookmark.get(order_id, 0.0)
+            # Some SDK responses report cumulative size in the same value but
+            # the network can rearrange event order; clamp to non-negative.
+            delta = fill_total_size - prior
+            if delta <= 1e-9:
+                # Matched size has not advanced (or went sideways) since the
+                # last fire — already covered by a previous observation.
+                # Still record the trade_id so we don't repeat the comparison.
+                if trade_key is not None:
+                    self._seen_trades.add(trade_key)
+                return 0.0, prior
+
+            self._bookmark[order_id] = fill_total_size
+            if trade_key is not None:
+                self._seen_trades.add(trade_key)
+
+            # Light garbage collection: cap seen_trades so it doesn't grow
+            # unbounded for long-lived sessions. We prune any trade-id set
+            # whose bookmark has not advanced in 24 hours of activity, and
+            # the bookmark itself stays forever (it is tiny).
+            if len(self._seen_trades) > 4096:
+                self._seen_trades = {
+                    k for k in self._seen_trades
+                    if self._bookmark.get(k[0], 0.0) >= fill_total_size
+                }
+
+        return delta, fill_total_size
+
+    def get_bookmark(self, order_id: str) -> float:
+        """Current high-water for an order (debug / inspection)."""
+        return self._bookmark.get(order_id, 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -89,8 +187,17 @@ class CLOBClient:
         self._signature_type = signature_type
         self._client: Optional[ClobClient] = None
 
-        # fill_callback: (token_id, order_id, fill_price, fill_size) -> None
+        # fill_callback signature (B-3 fix):
+        #   (token_id, order_id, fill_price, fill_delta_size, fill_total_size)
+        # fill_delta_size is monotonically increasing (cumulative - last
+        # bookmark). The cumulative fill_total_size is provided so that the
+        # OrderManager can keep its own size_matched bookkeeping in sync
+        # without having to compute the cumulative itself.
         self.fill_callback: Optional[Callable] = None
+
+        # Deduper protects against double-counting when WS, polling and FAK
+        # all observe the same fill. See FillDeduper docstring.
+        self._deduper = FillDeduper()
 
         self._init_client()
 
@@ -187,7 +294,7 @@ class CLOBClient:
         price_q = _round_down(price, tick_d)
 
         if size_q < 5.0:
-            return FillResult("", 0, 0, price_q, False, "tokens below CLOB 5-shares minimum")
+            return FillResult("", 0, 0, price_q, False, "tokens below CLOB 5-shares minimum", expiration_ts)
 
         log.debug(
             "clob.gtd_buy",
@@ -213,15 +320,15 @@ class CLOBClient:
             )
         except Exception as exc:
             log.warning("clob.gtd_buy.post_error", error=str(exc))
-            return FillResult("", 0, 0, price_q, False, str(exc))
+            return FillResult("", 0, 0, price_q, False, str(exc), expiration_ts)
 
         if not resp:
-            return FillResult("", 0, 0, price_q, False, "GTD post returned None")
+            return FillResult("", 0, 0, price_q, False, "GTD post returned None", expiration_ts)
 
         order_id = str(resp.get("orderID") or resp.get("order_id") or "")
         if not order_id:
             err = resp.get("errorMsg") or resp.get("error") or "no orderID"
-            return FillResult("", 0, 0, price_q, False, err)
+            return FillResult("", 0, 0, price_q, False, err, expiration_ts)
 
         # Poll until filled or timed out
         deadline = time.monotonic() + self.GTD_CLIENT_TIMEOUT_SEC
@@ -260,8 +367,9 @@ class CLOBClient:
                         usdc=_round_down(total_usdc, Decimal("0.01")),
                         fill_price=_round_down(avg_px, tick_d),
                         success=True,
+                        expiration_ts=expiration_ts,
                     )
-                    self._fire_fill_callback(token_id, order_id, avg_px, total_sz)
+                    await self._fire_fill_callback(token_id, order_id, avg_px, total_sz)
                     return result
 
             order_status = (status_resp.get("status") or "").lower()
@@ -271,6 +379,7 @@ class CLOBClient:
                     order_id=order_id, tokens=0, usdc=0,
                     fill_price=price_q, success=False,
                     error=f"gtd_{order_status}",
+                    expiration_ts=expiration_ts,
                 )
 
         # Timeout — cancel and return failure
@@ -282,6 +391,181 @@ class CLOBClient:
             order_id=order_id, tokens=0, usdc=0,
             fill_price=price_q, success=False,
             error="gtd_poll_timeout",
+            expiration_ts=expiration_ts,
+        )
+
+    async def place_gtd_sell(
+        self,
+        token_id: str,
+        price: float,
+        size: float,
+        lifetime_s: int,
+        tick_size: float,
+    ) -> FillResult:
+        """
+        Post a GTD limit SELL order (maker) and poll until filled or expired.
+
+        Behaviour:
+          - Returns a *live* GTD sell. Caller (OrderManager) decides how long to
+            wait. We poll here for at most `GTD_CLIENT_TIMEOUT_SEC` (10 minutes)
+            since the server enforces expiration.
+          - Fires the fill callback incrementally on every fill so the position
+            state can stay in sync while the order lives.
+        """
+        if not self._client:
+            return FillResult("", 0, 0, price, False, "ClobClient not initialised")
+
+        gtd_seconds = max(lifetime_s, self.GTD_MIN_SEC + 1)
+        expiration_ts = int(time.time()) + gtd_seconds
+
+        tick_d = Decimal(str(tick_size))
+        size_q = _round_down(size, Decimal("0.0001"))
+        price_q = _round_down(price, tick_d)
+
+        if size_q < 5.0:
+            return FillResult("", 0, 0, price_q, False, "tokens below CLOB 5-shares minimum", expiration_ts)
+
+        log.debug(
+            "clob.gtd_sell",
+            token=token_id[:12], size=size_q, price=price_q,
+            tick=tick_size, expires=expiration_ts,
+        )
+
+        try:
+            order_args = OrderArgsV2(
+                token_id=token_id,
+                price=float(price_q),
+                size=float(size_q),
+                side=ClobSide.SELL,
+                expiration=expiration_ts,
+            )
+            opts = PartialCreateOrderOptions(tick_size=str(tick_size), neg_risk=False)
+            resp = await self._run(
+                self._client.create_and_post_order,
+                order_args=order_args,
+                options=opts,
+                order_type=OrderType.GTD,
+                post_only=False,
+            )
+        except Exception as exc:
+            log.warning("clob.gtd_sell.post_error", error=str(exc))
+            return FillResult("", 0, 0, price_q, False, str(exc), expiration_ts)
+
+        if not resp:
+            return FillResult("", 0, 0, price_q, False, "GTD post returned None", expiration_ts)
+
+        order_id = str(resp.get("orderID") or resp.get("order_id") or "")
+        if not order_id:
+            err = resp.get("errorMsg") or resp.get("error") or "no orderID"
+            return FillResult("", 0, 0, price_q, False, err, expiration_ts)
+
+        # Poll until filled or GTD timeout.
+        # B-3 fix: deduper is the single source of truth for delta
+        # computation. We fire cumulative matched size on every poll and let
+        # CLOBClient._fill_deduper translate to delta — that way WS / polling
+        # / FAK responses can all observe the same order without double
+        # counting regardless of who fires first.
+        deadline = time.monotonic() + min(
+            self.GTD_CLIENT_TIMEOUT_SEC, gtd_seconds + 5
+        )
+        poll_interval = 0.5
+        total_sz = 0.0
+        total_usdc = 0.0
+
+        while time.monotonic() < deadline:
+            await asyncio.sleep(poll_interval)
+
+            try:
+                status_resp = await self._run(self._client.get_order, order_id)
+            except Exception as exc:
+                log.debug("clob.gtd_sell.get_order error", error=str(exc))
+                continue
+
+            if not status_resp:
+                continue
+
+            fills = status_resp.get("fills") or []
+            if fills:
+                for f in fills:
+                    try:
+                        sz = float(f.get("size", 0))
+                        px = float(f.get("price", price_q))
+                        total_sz += sz
+                        total_usdc += sz * px
+                    except (TypeError, ValueError):
+                        continue
+
+            order_status = (status_resp.get("status") or "").lower()
+            matched_sz = float(status_resp.get("size_matched") or total_sz)
+
+            # Fire cumulative matched size. The CLOBClient-level FillDeduper
+            # translates cumulative -> delta so partial fills remain monotonic
+            # and idempotent regardless of which source (WS, polling, FAK)
+            # observed the order. (B-3 fix — previously emitted_sz here was
+            # a per-thread throttle that did not catch WS / FAK re-fires.)
+            if matched_sz > 0:
+                avg_px = (total_usdc / matched_sz) if matched_sz > 0 else price_q
+                await self._fire_fill_callback(
+                    token_id, order_id, avg_px, matched_sz
+                )
+
+            # Terminal states
+            if order_status in ("matched", "filled"):
+                if total_sz > 0:
+                    avg_px = total_usdc / total_sz
+                    return FillResult(
+                        order_id=order_id,
+                        tokens=_round_down(total_sz, Decimal("0.0001")),
+                        usdc=_round_down(total_usdc, Decimal("0.01")),
+                        fill_price=_round_down(avg_px, tick_d),
+                        success=True,
+                        expiration_ts=expiration_ts,
+                    )
+                return FillResult(
+                    order_id=order_id, tokens=0, usdc=0,
+                    fill_price=price_q, success=False, error="gtd_matched_zero",
+                    expiration_ts=expiration_ts,
+                )
+
+            if order_status in ("cancelled", "expired", "failed"):
+                # Partial fills are valid — return what we have.
+                if total_sz > 0:
+                    avg_px = total_usdc / total_sz
+                    log.info(
+                        "clob.gtd_sell partial_then_expired",
+                        status=order_status, filled=total_sz,
+                    )
+                    return FillResult(
+                        order_id=order_id,
+                        tokens=_round_down(total_sz, Decimal("0.0001")),
+                        usdc=_round_down(total_usdc, Decimal("0.01")),
+                        fill_price=_round_down(avg_px, tick_d),
+                        success=True,
+                        expiration_ts=expiration_ts,
+                    )
+                return FillResult(
+                    order_id=order_id, tokens=0, usdc=0,
+                    fill_price=price_q, success=False,
+                    error=f"gtd_{order_status}",
+                    expiration_ts=expiration_ts,
+                )
+
+        # Client poll timeout — but the order may still be live server-side.
+        # Surface what we know to the caller, leaving the order book-still-posted.
+        log.warning(
+            "clob.gtd_sell poll_timeout",
+            order_id=order_id, matched=total_sz,
+        )
+        return FillResult(
+            order_id=order_id,
+            tokens=_round_down(total_sz, Decimal("0.0001")),
+            usdc=_round_down(total_usdc, Decimal("0.01")),
+            fill_price=_round_down(
+                (total_usdc / total_sz) if total_sz > 0 else 0, tick_d
+            ),
+            success=False,
+            error="gtd_poll_timeout",
+            expiration_ts=expiration_ts,
         )
 
     async def place_fak_sell(
@@ -322,14 +606,25 @@ class CLOBClient:
                 self._client.create_and_post_market_order, mkt_args
             )
         except Exception as exc:
+            # H-4 fix: classify post-error distinctly from "FAK got no
+            # fills". The router treats these differently:
+            #   * "FAK_post_error"  → network / SDK — keep in-flight mutex
+            #                          so the next tick can re-fire;
+            #   * "FAK_no_fills"    → book was empty, the round-trip
+            #                          succeeded with zero size — release
+            #                          the mutex, no work to do;
+            #   * None / unexpected → keep mutex, log warning.
             log.warning("clob.fak_sell.post_error", error=str(exc))
-            return FillResult("", 0, 0, sell_price, False, str(exc))
+            return FillResult("", 0, 0, sell_price, False, f"FAK_post_error:{exc}")
 
         if not resp:
-            return FillResult("", 0, 0, sell_price, False, "FAK post returned None")
+            return FillResult("", 0, 0, sell_price, False, "FAK_no_response")
 
         fills = resp.get("fills") or []
         if not fills:
+            # FAK was rejected by the book (no resting liquidity at our
+            # price). This is the common "FAK gets nothing" case — the
+            # router must distinguish it from a network error (above).
             return FillResult("", 0, 0, sell_price, False, "FAK_no_fills")
 
         total_sz = 0.0
@@ -354,7 +649,7 @@ class CLOBClient:
             fill_price=_round_down(avg_px, tick_d),
             success=True,
         )
-        self._fire_fill_callback(token_id, result.order_id, avg_px, total_sz)
+        await self._fire_fill_callback(token_id, result.order_id, avg_px, total_sz)
         return result
 
     # ------------------------------------------------------------------
@@ -439,14 +734,44 @@ class CLOBClient:
     # Internal
     # ------------------------------------------------------------------
 
-    def _fire_fill_callback(
-        self, token_id: str, order_id: str, fill_price: float, fill_size: float
+    async def _fire_fill_callback(
+        self,
+        token_id: str,
+        order_id: str,
+        fill_price: float,
+        fill_size: float,
+        fill_id: str = "",
     ) -> None:
-        if self.fill_callback:
-            try:
-                self.fill_callback(token_id, order_id, fill_price, fill_size)
-            except Exception as exc:
-                log.debug("fill_callback error", error=str(exc))
+        """Forward a confirmed fill to the user callback, exactly once per delta.
+
+        `fill_size` is the *cumulative* matched size observed by this call
+        site (whether polling or FAK post-response). The deduper translates
+        cumulative -> delta so that the engine is never told about a fill it
+        already accounted for, irrespective of how many parallel paths
+        happened to observe it (WS / polling / FAK response).
+        """
+        if not self.fill_callback or not order_id:
+            return
+        try:
+            delta, total_after = await self._deduper.submit(
+                token_id=token_id,
+                order_id=order_id,
+                fill_price=fill_price,
+                fill_total_size=fill_size,
+                fill_id=fill_id,
+            )
+            if delta <= 0:
+                return  # already notified by another source
+            self.fill_callback(
+                token_id, order_id, fill_price, delta, total_after
+            )
+        except Exception as exc:
+            # Single malformed fill must not tear down the polling loop.
+            log.exception(
+                "fill_callback.error",
+                order_id=order_id[:16],
+                error=str(exc),
+            )
 
     @staticmethod
     async def _run(fn, *args, **kwargs):

@@ -105,12 +105,28 @@ class StrategySettings(BaseSettings):
     TIER3_NOTIONAL: float = 4.0
     TIER4_NOTIONAL: float = 8.0
 
+    # Per-tier notional hard cap (multiplier over planned notional).
+    # Anything above this is treated as the tier being "saturated" and the
+    # engine will refuse to place another order for that tier.
+    # Example: 1.25 means T3 may spend at most 4 * 1.25 = 5 USD before being
+    # blocked. Prevents GTD loops / repeated partial fills from silently
+    # over-spending into the next tier's budget.
+    TIER_NOTIONAL_MAX_MULT: float = 1.1
+
     # ── Strategy thresholds ───────────────────────────────────────────────
     ENTRY_PRICE_CAP: float = 0.40      # max token price to enter
     TIER2_DROP_PCT: float = 0.20       # T2 triggers at baseline * (1 - 20%)
     TIER3_DROP_PCT: float = 0.40
     TIER4_DROP_PCT: float = 0.60
     TP_PROFIT_PCT: float = 0.20         # take profit target as fraction of avg cost
+    # TP decreases by this amount per averaging tier fired. Final value is
+    # clamped at TP_MIN_PCT to avoid a sub-cost lock-loss TP target.
+    #   N=0 (T1 only)        → TP_PROFIT_PCT                  (e.g. 20%)
+    #   N=1 (T1+T2 fired)    → TP_PROFIT_PCT - 1*DECREMENT    (e.g. 17%)
+    #   N=2 (T1..T3)         → TP_PROFIT_PCT - 2*DECREMENT    (e.g. 14%)
+    #   N=3 (T1..T4)         → TP_PROFIT_PCT - 3*DECREMENT    (e.g. 11%)
+    TP_DECREMENT_PCT: float = 0.03
+    TP_MIN_PCT: float = 0.05             # floor (5%) so TP can never lock in a loss
     BASELINE_DRIFT_LIMIT: float = 0.0015  # 0.15% BTC spot drift cap
 
     # T1 entry time gate: T1 must enter within this many seconds of window open.
