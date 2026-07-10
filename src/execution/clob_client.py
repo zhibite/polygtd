@@ -102,8 +102,8 @@ class CLOBClient:
         if not self._api_key or not self._api_secret:
             log.warning(
                 "CLOBClient: L2 credentials not provided — "
-                "trading disabled. Set POLY_API_KEY / POLY_API_SECRET / "
-                "POLY_API_PASSPHRASE in .env"
+                "trading disabled. Set API_KEY / API_SECRET / "
+                "API_PASSPHRASE in .env"
             )
             self._client = None
             return

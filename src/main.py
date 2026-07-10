@@ -347,24 +347,24 @@ async def main() -> None:
 
     # ── CLOB credentials ─────────────────────────────────────────────────
     # Priority: env L2 creds > L1 private key derivation
-    poly_api_key = cfg_strategy.POLY_API_KEY
-    poly_api_secret = cfg_strategy.POLY_API_SECRET
-    poly_api_passphrase = cfg_strategy.POLY_API_PASSPHRASE
+    api_key = cfg_strategy.API_KEY
+    api_secret = cfg_strategy.API_SECRET
+    api_passphrase = cfg_strategy.API_PASSPHRASE
 
-    if not (poly_api_key and poly_api_secret and poly_api_passphrase):
-        if cfg_strategy.POLY_PRIVATE_KEY:
+    if not (api_key and api_secret and api_passphrase):
+        if cfg_strategy.WALLET_PRIVATE_KEY:
             try:
                 creds = create_or_derive_clob_api_creds(
                     host=cfg_strategy.POLYMARKET_HOST,
-                    private_key=cfg_strategy.POLY_PRIVATE_KEY,
+                    private_key=cfg_strategy.WALLET_PRIVATE_KEY,
                     chain_id=137,
                 )
-                poly_api_key = creds.api_key
-                poly_api_secret = creds.api_secret
-                poly_api_passphrase = creds.api_passphrase
+                api_key = creds.api_key
+                api_secret = creds.api_secret
+                api_passphrase = creds.api_passphrase
                 log.info(
                     "clob_l1_auth.derived key={}...",
-                    poly_api_key[:8],
+                    api_key[:8],
                 )
             except ClobL1Error as exc:
                 log.error(
@@ -374,17 +374,17 @@ async def main() -> None:
                 )
         else:
             log.warning(
-                "CLOB credentials missing: set POLY_API_KEY/POLY_API_SECRET/POLY_API_PASSPHRASE "
-                "or POLY_PRIVATE_KEY in .env"
+                "CLOB credentials missing: set API_KEY/API_SECRET/API_PASSPHRASE "
+                "or WALLET_PRIVATE_KEY in .env"
             )
 
     # ── CLOB client ──────────────────────────────────────────────────────
     s.clob = CLOBClient(
         host=cfg_strategy.POLYMARKET_HOST,
-        private_key=cfg_strategy.POLY_PRIVATE_KEY,
-        api_key=poly_api_key,
-        api_secret=poly_api_secret,
-        api_passphrase=poly_api_passphrase,
+        private_key=cfg_strategy.WALLET_PRIVATE_KEY,
+        api_key=api_key,
+        api_secret=api_secret,
+        api_passphrase=api_passphrase,
         signature_type=cfg_strategy.SIGNATURE_TYPE,
     )
 
@@ -416,18 +416,18 @@ async def main() -> None:
     )
 
     # ── User WebSocket (order events) ────────────────────────────────────
-    if cfg_strategy.POLY_API_KEY and cfg_strategy.POLY_API_SECRET:
+    if cfg_strategy.API_KEY and cfg_strategy.API_SECRET:
         s.user_ws = UserWS(
-            api_key=cfg_strategy.POLY_API_KEY,
-            api_secret=cfg_strategy.POLY_API_SECRET,
-            api_passphrase=cfg_strategy.POLY_API_PASSPHRASE,
+            api_key=cfg_strategy.API_KEY,
+            api_secret=cfg_strategy.API_SECRET,
+            api_passphrase=cfg_strategy.API_PASSPHRASE,
             on_maker_fill=_make_maker_fill_callback(s),
             on_order=_make_user_ws_order_callback(s),
         )
     else:
         log.warning(
             "bot.no_credentials",
-            msg="POLY_API_KEY not set — UserWS disabled, fill events will not be received"
+            msg="API_KEY not set — UserWS disabled, fill events will not be received"
         )
         s.user_ws = None
 
@@ -449,7 +449,7 @@ async def main() -> None:
         log.error(
             "bot.no_clob_credentials",
             msg="CLOB not configured — cannot start heartbeat. "
-                "Set POLY_API_KEY / POLY_API_SECRET / POLY_API_PASSPHRASE in .env",
+                "Set API_KEY / API_SECRET / API_PASSPHRASE in .env",
         )
 
     # Status printer

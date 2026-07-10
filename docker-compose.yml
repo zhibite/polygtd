@@ -4,7 +4,7 @@ services:
     container_name: polymarket-gtd
     restart: unless-stopped
     ports:
-      - "8004:8004"
+      - "8034:8034"
     volumes:
       - polymarket_data:/app/data
     env_file:

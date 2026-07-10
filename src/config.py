@@ -66,14 +66,14 @@ class StrategySettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=str(_ROOT.parent / ".env"), extra="ignore")
 
     # ── CLOB Credentials ──────────────────────────────────────────────────
-    # Option A: provide all three (recommended — most stable)
-    POLY_API_KEY: str = ""
-    POLY_API_SECRET: str = ""
-    POLY_API_PASSPHRASE: str = ""
+    # Option A: provide all three L2 API credentials directly (recommended)
+    API_KEY: str = ""
+    API_SECRET: str = ""
+    API_PASSPHRASE: str = ""
 
-    # Option B: provide private key + signature type (key is derived at startup)
-    POLY_PRIVATE_KEY: str = ""
-    POLY_WALLET_ADDRESS: str = ""
+    # Option B: provide private key + wallet address (key is derived at startup)
+    WALLET_PRIVATE_KEY: str = ""
+    WALLET_ADDRESS: str = ""
     # Signature types:
     #   0 = EOA (standard wallet, gas paid by signer)
     #   1 = POLY_PROXY (Magic Link / email login)
@@ -129,7 +129,7 @@ class StrategySettings(BaseSettings):
     @property
     def has_credentials(self) -> bool:
         """True if L2 API credentials are available."""
-        return bool(self.POLY_API_KEY and self.POLY_API_SECRET)
+        return bool(self.API_KEY and self.API_SECRET)
 
 
 # ---------------------------------------------------------------------------
