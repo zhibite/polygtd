@@ -27,6 +27,7 @@ import time
 from pathlib import Path
 
 from src.config import general, binance, baseline_cfg, log_config, strategy
+from src.clob_l1_auth import create_or_derive_clob_api_creds, ClobL1Error
 from src.execution.clob_client import CLOBClient
 from src.execution.gtd_expiry_watcher import GtdExpiryWatcher
 from src.execution.heartbeat import HeartbeatLoop
@@ -344,13 +345,46 @@ async def main() -> None:
 
     cfg_strategy = strategy()
 
+    # ── CLOB credentials ─────────────────────────────────────────────────
+    # Priority: env L2 creds > L1 private key derivation
+    poly_api_key = cfg_strategy.POLY_API_KEY
+    poly_api_secret = cfg_strategy.POLY_API_SECRET
+    poly_api_passphrase = cfg_strategy.POLY_API_PASSPHRASE
+
+    if not (poly_api_key and poly_api_secret and poly_api_passphrase):
+        if cfg_strategy.POLY_PRIVATE_KEY:
+            try:
+                creds = create_or_derive_clob_api_creds(
+                    host=cfg_strategy.POLYMARKET_HOST,
+                    private_key=cfg_strategy.POLY_PRIVATE_KEY,
+                    chain_id=137,
+                )
+                poly_api_key = creds.api_key
+                poly_api_secret = creds.api_secret
+                poly_api_passphrase = creds.api_passphrase
+                log.info(
+                    "clob_l1_auth.derived key={}...",
+                    poly_api_key[:8],
+                )
+            except ClobL1Error as exc:
+                log.error(
+                    "clob_l1_auth.failed: {} — trading disabled. "
+                    "Ensure wallet has pUSD balance and is logged into Polymarket.com",
+                    exc,
+                )
+        else:
+            log.warning(
+                "CLOB credentials missing: set POLY_API_KEY/POLY_API_SECRET/POLY_API_PASSPHRASE "
+                "or POLY_PRIVATE_KEY in .env"
+            )
+
     # ── CLOB client ──────────────────────────────────────────────────────
     s.clob = CLOBClient(
         host=cfg_strategy.POLYMARKET_HOST,
         private_key=cfg_strategy.POLY_PRIVATE_KEY,
-        api_key=cfg_strategy.POLY_API_KEY,
-        api_secret=cfg_strategy.POLY_API_SECRET,
-        api_passphrase=cfg_strategy.POLY_API_PASSPHRASE,
+        api_key=poly_api_key,
+        api_secret=poly_api_secret,
+        api_passphrase=poly_api_passphrase,
         signature_type=cfg_strategy.SIGNATURE_TYPE,
     )
 
