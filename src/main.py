@@ -326,7 +326,7 @@ async def _midpoint_poll_loop() -> None:
     while True:
         await asyncio.sleep(2.0)
         s = STATE
-        if not s.pm or not s.current_market:
+        if not s.pm_client or not s.current_market:
             continue
 
         up_token = s.current_market.up_token
@@ -335,8 +335,8 @@ async def _midpoint_poll_loop() -> None:
             continue
 
         try:
-            up_mid = await s.pm.get_midpoint(up_token)
-            down_mid = await s.pm.get_midpoint(down_token)
+            up_mid = await s.pm_client.get_midpoint(up_token)
+            down_mid = await s.pm_client.get_midpoint(down_token)
             s.price_cache.midpoint[up_token] = up_mid
             s.price_cache.midpoint[down_token] = down_mid
         except Exception:
@@ -534,8 +534,9 @@ async def main() -> None:
                 "Set API_KEY / API_SECRET / API_PASSPHRASE in .env",
         )
 
-    # Status printer
+    # Status printer + midpoint poller
     status_task = asyncio.create_task(_status_loop())
+    midpoint_task = asyncio.create_task(_midpoint_poll_loop())
 
     # ── Graceful shutdown ───────────────────────────────────────────────
     def _signal_handler() -> None:
@@ -554,6 +555,7 @@ async def main() -> None:
     # ── Cleanup ─────────────────────────────────────────────────────────
     log.info("bot.shutdown_initiated")
     status_task.cancel()
+    midpoint_task.cancel()
 
     if s.gtd_expiry:
         await s.gtd_expiry.stop()
