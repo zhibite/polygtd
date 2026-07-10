@@ -160,25 +160,25 @@ class WindowManager:
                     continue
 
                 mkt = result  # MarketInfo
+                ctx = self._ctxs[asset]
+
+                # Save prev window BTC close price before any state changes
+                prev_close: Optional[float] = None
+                if ctx.market is not None and ctx.condition_id:
+                    try:
+                        prev_close = float(
+                            getattr(ctx.market, "btc_spot_now", 0.0) or 0.0
+                        )
+                        if prev_close > 0:
+                            ctx.prev_window_btc_close = prev_close
+                    except Exception:
+                        pass
 
                 # Detect new window: window_end increases = new window online
-                ctx = self._ctxs[asset]
                 prev_end = ctx.window_end if ctx.condition_id else None
                 is_new = (prev_end is None) or (mkt.window_end > prev_end)
 
                 if is_new:
-                    # Save prev window BTC close price before reset
-                    prev_close: Optional[float] = None
-                    if prev_end is not None and ctx.market is not None:
-                        try:
-                            prev_close = float(
-                                getattr(ctx.market, "btc_spot_now", 0.0) or 0.0
-                            )
-                            if prev_close > 0:
-                                ctx.prev_window_btc_close = prev_close
-                        except Exception:
-                            pass
-
                     # New window: allocate new WindowContext (or reset existing)
                     await self._on_new_window(ctx, mkt)
 

@@ -69,6 +69,7 @@ class MarketWS:
         self._task: asyncio.Task[None] | None = None
         self._url = MARKET_WS_URL
         self._pending_tokens: set[str] = set()
+        self._ws: websockets.WebSocketClientProtocol | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -76,8 +77,12 @@ class MarketWS:
 
     def subscribe_tokens(self, token_ids: list[str]) -> None:
         """Queue token subscriptions and send immediately if WS is connected."""
-        for tid in token_ids:
+        new_tokens = [tid for tid in token_ids if tid not in self._pending_tokens]
+        for tid in new_tokens:
             self._pending_tokens.add(tid)
+        if new_tokens and self._ws is not None and self._ws.open:
+            # WS is already connected — send subscription right away
+            asyncio.create_task(self._subscribe(self._ws, new_tokens))
 
     @property
     def subscribed_tokens(self) -> frozenset[str]:
@@ -108,7 +113,9 @@ class MarketWS:
 
         while self._running:
             try:
+                try:
                 async with websockets.connect(self._url, ping_interval=10) as ws:
+                    self._ws = ws
                     delay = 1.0
                     log.debug("market_ws.connected")
 
@@ -122,6 +129,8 @@ class MarketWS:
                         if not self._running:
                             break
                         await self._process(raw)
+            finally:
+                self._ws = None
 
             except asyncio.CancelledError:
                 break
