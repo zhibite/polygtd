@@ -113,7 +113,6 @@ class MarketWS:
 
         while self._running:
             try:
-                try:
                 async with websockets.connect(self._url, ping_interval=10) as ws:
                     self._ws = ws
                     delay = 1.0
@@ -129,9 +128,6 @@ class MarketWS:
                         if not self._running:
                             break
                         await self._process(raw)
-            finally:
-                self._ws = None
-
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -140,6 +136,8 @@ class MarketWS:
                     self._on_disconnect()
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, max_delay)
+            finally:
+                self._ws = None
 
     async def _subscribe(self, ws: websockets.WebSocketClientProtocol, tokens: list[str]) -> None:
         payload = {
