@@ -2,10 +2,28 @@
 from __future__ import annotations
 
 import tomllib
+from functools import lru_cache
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _ROOT = Path(__file__).parent.parent
+_TOML_PATH = _ROOT.parent / "config.toml"
+
+
+@lru_cache(maxsize=1)
+def _toml_data() -> dict:
+    """Load config.toml once per process. Returns {} if file missing."""
+    if not _TOML_PATH.exists():
+        return {}
+    with _TOML_PATH.open("rb") as f:
+        raw = tomllib.load(f)
+    return {k.lower(): v for k, v in raw.items()}
+
+
+def _toml_section(key: str) -> dict:
+    """Return TOML section with env-var override semantics (uppercase keys)."""
+    section = _toml_data().get(key.lower(), {})
+    return {k.upper(): v for k, v in section.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -14,33 +32,37 @@ _ROOT = Path(__file__).parent.parent
 
 
 class GeneralConfig(BaseSettings):
-    model_config = SettingsConfigDict(toml_file=str(_ROOT.parent / "config.toml"), extra="ignore")
-
     ROUND_PERIOD_S: int = 900
     WINDOW_PRE_OPEN_S: int = 300
 
+    def __init__(self, **kwargs):
+        super().__init__(**{**_toml_section("GENERAL"), **kwargs})
+
 
 class BinanceConfig(BaseSettings):
-    model_config = SettingsConfigDict(toml_file=str(_ROOT.parent / "config.toml"), extra="ignore")
-
     WS_URL: str = "wss://stream.binance.com:9443/ws/btcusdt@trade"
     RECONNECT_BASE_S: float = 1.0
     RECONNECT_MAX_S: float = 30.0
     BUFFER_RETENTION_S: int = 1200
 
+    def __init__(self, **kwargs):
+        super().__init__(**{**_toml_section("BINANCE"), **kwargs})
+
 
 class BaselineConfig(BaseSettings):
-    model_config = SettingsConfigDict(toml_file=str(_ROOT.parent / "config.toml"), extra="ignore")
-
     WINDOW_S: int = 300
     MIN_SAMPLES: int = 30
 
+    def __init__(self, **kwargs):
+        super().__init__(**{**_toml_section("BASELINE"), **kwargs})
+
 
 class LogConfig(BaseSettings):
-    model_config = SettingsConfigDict(toml_file=str(_ROOT.parent / "config.toml"), extra="ignore")
-
     LEVEL: str = "INFO"
     HEARTBEAT_S: int = 5
+
+    def __init__(self, **kwargs):
+        super().__init__(**{**_toml_section("LOG"), **kwargs})
 
 
 # ---------------------------------------------------------------------------
