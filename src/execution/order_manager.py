@@ -22,6 +22,7 @@ from typing import Literal
 from src.config import strategy as _s
 from src.execution.clob_client import CLOBClient, FillResult
 from src.infra.logging import get_logger
+from src.market.market_ws import PriceCache
 
 log = get_logger(__name__)
 
@@ -46,12 +47,51 @@ class TrackedOrder:
 class OrderManager:
     """Serialized order executor with in-memory state."""
 
-    def __init__(self, clob: CLOBClient) -> None:
+    # How close to the book to post GTD orders (in ticks).
+    # BUY: bid + BUY_STEP ticks → slightly above bid so taker hits us first.
+    # SELL: ask - SELL_STEP ticks → slightly below ask so taker hits us first.
+    BUY_STEP: float = 0.001
+    SELL_STEP: float = 0.001
+
+    def __init__(
+        self,
+        clob: CLOBClient,
+        price_cache: PriceCache | None = None,
+    ) -> None:
         self._clob = clob
         self._s = _s()
+        self._cache = price_cache
         self._lock = asyncio.Lock()
         self._orders: dict[str, TrackedOrder] = {}          # client_order_id -> order
         self._by_server: dict[str, str] = {}               # server_id -> client_id
+
+    # ------------------------------------------------------------------
+    # Price helpers
+    # ------------------------------------------------------------------
+
+    def _adjust_buy_price(self, token_id: str, desired_price: float) -> float:
+        """
+        Snap GTD buy price just above the current best bid so a taker is
+        more likely to cross the spread and fill us immediately.
+        Falls back to desired_price if the book is unavailable.
+        """
+        if self._cache:
+            bid = self._cache.bid(token_id)
+            if bid > 0:
+                return round(bid + self.BUY_STEP, 4)
+        return desired_price
+
+    def _adjust_sell_price(self, token_id: str, desired_price: float) -> float:
+        """
+        Snap GTD sell price just below the current best ask so a taker is
+        more likely to cross the spread and fill us immediately.
+        Falls back to desired_price if the book is unavailable.
+        """
+        if self._cache:
+            ask = self._cache.ask(token_id)
+            if ask > 0:
+                return round(ask - self.SELL_STEP, 4)
+        return desired_price
 
     # ------------------------------------------------------------------
     # Public read access
@@ -95,6 +135,8 @@ class OrderManager:
             expiration_ts = int(time.time()) + 60 + lifetime_s
             cid = f"{round_start_ts}-{tier_name}-{uuid.uuid4().hex[:8]}"
 
+            # Snap to just above the current bid for better fill probability
+            price = self._adjust_buy_price(token_id, price)
             result: FillResult = await self._clob.place_gtd_buy(
                 token_id=token_id,
                 price=price,
@@ -161,10 +203,12 @@ class OrderManager:
         async with self._lock:
             cid = f"{round_start_ts}-{tier_name}-{uuid.uuid4().hex[:8]}"
 
+            # Snap to just below the current ask for better fill probability
+            sell_price = self._adjust_sell_price(token_id, price)
             result: FillResult = await self._clob.place_fak_sell(
                 token_id=token_id,
                 size=size,
-                price=price,
+                price=sell_price,
                 tick_size=tick_size,
                 slippage_pct=self._s.SELL_SLIPPAGE_PCT,
             )

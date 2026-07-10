@@ -389,7 +389,7 @@ async def main() -> None:
     )
 
     # ── Execution layer ─────────────────────────────────────────────────
-    s.order_manager = OrderManager(s.clob)
+    s.order_manager = OrderManager(s.clob, price_cache=s.price_cache)
     s.heartbeat = HeartbeatLoop(s.clob)
 
     # ── GTD expiry watcher ──────────────────────────────────────────────
