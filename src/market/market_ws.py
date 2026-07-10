@@ -195,15 +195,17 @@ class MarketWS:
             if price is not None:
                 self._cache.last_trade_price[token] = float(price)
 
-        # price_change (incremental)
-        pc = msg.get("price_change")
-        if isinstance(pc, dict):
-            pc_token = pc.get("asset_id") or pc.get("assetID") or token
-            bids = pc.get("bids", [])
-            asks = pc.get("asks", [])
-            if bids and isinstance(bids, list) and len(bids) > 0:
-                v = bids[0]
-                self._cache.best_bid[pc_token] = float(v) if isinstance(v, (int, float)) else float(v["price"]) if isinstance(v, dict) else 0.0
-            if asks and isinstance(asks, list) and len(asks) > 0:
-                v = asks[0]
-                self._cache.best_ask[pc_token] = float(v) if isinstance(v, (int, float)) else float(v["price"]) if isinstance(v, dict) else 0.0
+        # price_changes (list of incremental updates) - Plural!
+        pcs = msg.get("price_changes", [])
+        if isinstance(pcs, list):
+            for pc in pcs:
+                if isinstance(pc, dict):
+                    pc_token = pc.get("asset_id") or pc.get("assetID") or token
+                    bids = pc.get("bids", [])
+                    asks = pc.get("asks", [])
+                    if bids and isinstance(bids, list) and len(bids) > 0:
+                        v = bids[0]
+                        self._cache.best_bid[pc_token] = float(v) if isinstance(v, (int, float)) else float(v["price"]) if isinstance(v, dict) else 0.0
+                    if asks and isinstance(asks, list) and len(asks) > 0:
+                        v = asks[0]
+                        self._cache.best_ask[pc_token] = float(v) if isinstance(v, (int, float)) else float(v["price"]) if isinstance(v, dict) else 0.0
