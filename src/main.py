@@ -555,7 +555,8 @@ async def main() -> None:
     log.info("bot.shutdown_initiated")
     status_task.cancel()
 
-    s.gtd_expiry.stop()
+    if s.gtd_expiry:
+        await s.gtd_expiry.stop()
     if s.wm:
         await s.wm.stop()
     if s.market_ws:
