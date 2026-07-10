@@ -106,10 +106,18 @@ class WindowManager:
         """
         Drive window discovery with precise boundary detection.
 
-        Strategy: sleep until 3 s before each 15-min boundary, then poll every
-        second (up to 3 times) to catch the exact moment the window switches.
-        Once detected, run discovery once and return to idle.
+        Boot step: discover current window immediately (needed for token IDs).
+        Steady state: sleep until 3 s before each 15-min boundary, then poll every
+        second until the new window is detected.
         """
+        # ── Boot: discover the window that's already running ──────────────────
+        # On startup we already know _last_round_start = current 15-min floor,
+        # so the existing window's market needs to be fetched once for token IDs.
+        try:
+            await self.tick(self._symbols, force_discovery=True)
+        except Exception:
+            log.exception("window_mgr.boot tick raised")
+
         while self._running:
             now = time.time()
             now_start = self._round_start_of(now)
