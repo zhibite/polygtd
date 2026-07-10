@@ -228,6 +228,16 @@ class WindowManager:
                 # Detect window switch by condition_id change (more reliable than window_end)
                 cid_changed = ctx.condition_id and ctx.condition_id != mkt.condition_id
 
+                # Snapshot prev window BTC close for cross-window drift guard
+                prev_close: Optional[float] = None
+                if cid_changed and ctx.market is not None:
+                    try:
+                        prev_close = float(getattr(ctx.market, "btc_spot_now", 0.0) or 0.0)
+                        if prev_close > 0:
+                            ctx.prev_window_btc_close = prev_close
+                    except Exception:
+                        pass
+
                 if cid_changed:
                     log.info(
                         "window_mgr.window_switch_detected",
