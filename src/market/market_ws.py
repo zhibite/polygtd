@@ -204,17 +204,19 @@ class MarketWS:
                 self._cache.last_trade_price[token] = float(price)
 
         # price_changes (list of incremental updates) - Plural!
+        # Structure: {'asset_id': '...', 'price': '0.26', 'size': '708.79', 'side': 'SELL', 'hash': '...'}
         pcs = msg.get("price_changes", [])
         if isinstance(pcs, list):
             for pc in pcs:
                 if isinstance(pc, dict):
-                    # Get token from price_changes entry or fall back to message level
-                    pc_token = pc.get("asset_id") or pc.get("assetID") or token
-                    bids = pc.get("bids", [])
-                    asks = pc.get("asks", [])
-                    if bids and isinstance(bids, list) and len(bids) > 0:
-                        v = bids[0]
-                        self._cache.best_bid[pc_token] = float(v) if isinstance(v, (int, float)) else float(v["price"]) if isinstance(v, dict) else 0.0
-                    if asks and isinstance(asks, list) and len(asks) > 0:
-                        v = asks[0]
-                        self._cache.best_ask[pc_token] = float(v) if isinstance(v, (int, float)) else float(v["price"]) if isinstance(v, dict) else 0.0
+                    pc_token = pc.get("asset_id") or token
+                    price_str = pc.get("price")
+                    side = pc.get("side", "").upper()
+                    if price_str:
+                        price = float(price_str)
+                        if side == "SELL":
+                            # A sell at this price means it's the best ask
+                            self._cache.best_ask[pc_token] = price
+                        elif side == "BUY":
+                            # A buy at this price means it's the best bid
+                            self._cache.best_bid[pc_token] = price
