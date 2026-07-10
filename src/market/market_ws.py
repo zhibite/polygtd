@@ -80,7 +80,7 @@ class MarketWS:
         new_tokens = [tid for tid in token_ids if tid not in self._pending_tokens]
         for tid in new_tokens:
             self._pending_tokens.add(tid)
-        if new_tokens and self._ws is not None and self._ws.state == websockets.protocol.WebSocketState.OPEN:
+        if new_tokens and self._ws is not None and self._ws.state == websockets.WebSocketState.OPEN:
             # WS is already connected — send subscription right away
             asyncio.create_task(self._subscribe(self._ws, new_tokens))
 
