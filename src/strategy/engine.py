@@ -589,7 +589,61 @@ class StrategyEngine:
         # the design -20% from the original bid, not -20% from a
         # slippage-shifted avg. Falls back to the actual baseline for
         # older round-state objects constructed before this field existed.
-        baseline = pos.baseline_target_price or pos.baseline_price
+        #
+        # H-V6-14 fix: prior priority was [baseline_target_price,
+        # baseline_price], which kept martingale maths anchored to the bid
+        # at T1-decision-time even after T1 had filled at a much lower
+        # price. The intended-bid value is what the bot USED to send a buy
+        # GTD at — but the CLOB may fill that buy at a noticeably lower
+        # price (slippage against thin orderbook). With "design" baseline,
+        # T2's trigger at 0.41 * (1-0.20) = 0.328 fired when actual cost was
+        # 0.34, i.e. only a 3% drop from the *real* entry — not a 20%
+        # drop. Operator observed: "why did T2 fire at 0.33? it should have
+        # waited for 0.27 (=0.34*0.80)."
+        #
+        # New priority:
+        #   1. baseline_realized_price (set once T1 receives any fill) —
+        #      cost-basis-truth; this is what martingale spacing SHOULD be
+        #      anchored to.
+        #   2. baseline_target_price (set by bind_server_order_id after T1
+        #      GTD post) — used only before any T1 fill arrives. Stays as
+        #      a defensive interim so the bot has something meaningful to
+        #      show in logs even mid-flight.
+        #   3. baseline_price (legacy anchor from old round-state objects) —
+        #      kept for back-compat, should never actually trip in current
+        #      builds.
+        #
+        # A one-shot baseline.rebased log fires the cycle in which
+        # baseline_realized_price first becomes set so operators can
+        # observe the trigger math reanchoring.
+        if pos.baseline_set_realized and pos.baseline_realized_price is not None:
+            new_baseline = pos.baseline_realized_price
+            prev = getattr(pos, "_last_used_baseline_value", None)
+            if prev is not None and abs(prev - new_baseline) > 1e-9:
+                # already logged the rebasing transition elsewhere;
+                # this branch is just here so future readers know the
+                # value can change silently across partial T1 fills
+                # before the rebased flag trips.
+                pass
+            if not getattr(pos, "_baseline_rebased_logged", False):
+                log.info(
+                    "baseline.rebased",
+                    side=pos.entry_side,
+                    from_target=pos.baseline_target_price,
+                    from_realized=pos.baseline_realized_price,
+                    tick_size=pos.tiers[0].size_expected if pos.tiers else None,
+                    note="T2/T3/T4 trigger lines now anchored to actual T1 "
+                         "fill avg (weighted across partials) instead of "
+                         "intended bid at T1 decision time",
+                )
+                pos._baseline_rebased_logged = True
+            baseline = new_baseline
+        else:
+            baseline = pos.baseline_target_price or pos.baseline_price
+        # Remember what we actually used this tick so the next tick can
+        # detect the transition (and so future code paths that re-read
+        # baseline inherit a consistent state).
+        pos._last_used_baseline_value = baseline
         s = self._s
 
         for tier in pos.tiers[1:]:  # T2, T3, T4

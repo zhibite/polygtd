@@ -177,6 +177,21 @@ class Position:
     # drives `_avg_cost` and TP via `baseline_price` — only the T2/T3/T4
     # trigger lines use this target.
     baseline_target_price: float | None = None
+    # H-V6-14 fix: baseline_realized_price is the T1 avg fill price we
+    # actually paid (Σ price*size / Σ size across all T1 partial fills),
+    # used as the authoritative baseline for T2/T3/T4 trigger lines once
+    # at least one T1 fill has landed. Before any T1 fill, the engine falls
+    # back to baseline_target_price (the intended bid) — this preserves the
+    # "don't fire T2 before T1 is partially filled" guard from H-NEW-2 but
+    # rebases the trigger math to the *real* cost basis, not the design
+    # price. Symptom this fixes: prod 2026-07-11 around the 17m-ago round,
+    # T1 GTD submitted @ 0.41, fill landed @ 0.34, T2 then triggered at
+    # 0.41*0.80 = 0.328 (in user's words: "why did T2 fire at 0.33? it
+    # should have waited for a real 20% drop from 0.34 → 0.27"). Now that
+    # baseline is 0.34 once T1 has at least one fill, T2's real trigger
+    # is 0.272 — i.e. it would not have fired at 0.33.
+    baseline_realized_price: float | None = None
+    baseline_set_realized: bool = False
 
     # Cached position-level stats (recalculated after each fill)
     _total_qty: float = 0.0
@@ -404,6 +419,35 @@ class Position:
         if tier.tier == 1 and not self.baseline_set and tier.size_filled > 0:
             self.baseline_price = tier.avg_fill_price or price
             self.baseline_set = True
+
+        # H-V6-14: baseline_realized_price is the AUTHORITATIVE baseline for
+        # T2/T3/T4 trigger lines once T1 has any fills. We compute it as the
+        # LIVE volume-weighted average fill price on every T1 partial fill
+        # (= Σ price*size / Σ size at the moment of this fill), so that
+        # subsequent trigger evaluations are anchored to the real cost basis
+        # even when T1 fills in many small partials (or slips between
+        # partials against a thin orderbook).
+        #
+        # The first time baseline_set_realized flips True is the moment T2+
+        # trigger math rebases from "design price" to "real cost basis"; the
+        # transition is observable in logs as a one-shot `baseline.rebased`
+        # event. After that, baseline_realized_price continues to track the
+        # live T1 VWAP (so a continued drop on T1 — e.g. another 6-share
+        # partial at 0.30 — would shift the baseline lower, and T2 trigger
+        # re-evaluates against the new value on the next tick).
+        #
+        # IMPORTANT: this only updates on T1 fills. T2/T3/T4 fills do NOT
+        # change baseline_realized_price — the anchor reflects what we paid
+        # for our *initial position size*, not the running average across
+        # all averaging tiers (which lives in _avg_cost for PnL math
+        # already; we don't want averaging tiers to rebaseline themselves
+        # — that would defeat the whole martingale math).
+        if tier.tier == 1 and tier.size_filled > 1e-9:
+            new_realized = tier.cost_filled / tier.size_filled
+            if self.baseline_realized_price is None or abs(new_realized - self.baseline_realized_price) > 1e-9:
+                self.baseline_realized_price = new_realized
+            if not self.baseline_set_realized:
+                self.baseline_set_realized = True
 
         log.info(
             "position.fill_recorded",
