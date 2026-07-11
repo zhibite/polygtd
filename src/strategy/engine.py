@@ -98,6 +98,29 @@ class StrategyEngine:
         # binance + WS book ticker) from re-entering _evaluate while the
         # previous run is awaiting an action handler. Drop-on-re-entry.
         self._eval_inflight: bool = False
+        # Per-reason throttle for T1 skip logs. DecisionLoop ticks at 250ms;
+        # without throttling a 5-minute round where UP stays above ENTRY_PRICE_CAP
+        # would produce ~1200 `t1_skip_too_expensive` lines. We collapse to one
+        # line per (reason, side) every 5 seconds — enough to diagnose from
+        # production logs while keeping the firehose down.
+        self._t1_skip_last_log_ts: dict[str, float] = {}
+
+    def _t1_skip_log(self, reason: str, *, side: str, **fields) -> None:
+        """Log a T1 skip event with per-(reason,side) throttle.
+
+        Production symptom this exists for: bot is alive, evaluate loop is
+        running, STATUS shows `tiers=[T1=○]`, but no `engine.trigger_t1` ever
+        fires. Without these logs the operator cannot tell which condition
+        is the blocker (price cap, drift, no best_bid, etc.) — they are all
+        silent `continue` branches upstream.
+        """
+        key = f"{reason}|{side}"
+        now = time.time()
+        last = self._t1_skip_last_log_ts.get(key, 0.0)
+        if now - last < 5.0:
+            return
+        self._t1_skip_last_log_ts[key] = now
+        log.info(reason, side=side, **fields)
 
     # ------------------------------------------------------------------
     # Round lifecycle
@@ -416,11 +439,19 @@ class StrategyEngine:
         for side, token in [("UP", up_tok), ("DOWN", down_tok)]:
             mid_price = self._pc.get_midpoint(token)
             if mid_price <= 0:
+                self._t1_skip_log(
+                    "engine.t1_skip_no_mid", side=side, token=token[:16],
+                    detail="midpoint cache empty (REST /midpoint poll hasn't seeded it yet)",
+                )
                 continue
 
             # Price cap check
             if mid_price > s.ENTRY_PRICE_CAP:
-                log.debug("engine.t1_skip_too_expensive", side=side, mid_price=mid_price)
+                self._t1_skip_log(
+                    "engine.t1_skip_too_expensive",
+                    side=side, token=token[:16],
+                    mid_price=mid_price, cap=s.ENTRY_PRICE_CAP,
+                )
                 continue
 
             # ── T1 entry time gate ───────────────────────────────────────
@@ -442,17 +473,30 @@ class StrategyEngine:
 
             # BTC drift gate
             if not self._gate.can_enter(bc_now, mid_price):
+                gs = self._gate.state(bc_now)
+                self._t1_skip_log(
+                    "engine.t1_skip_drift",
+                    side=side, mid_price=mid_price,
+                    drift=gs.drift, within_limit=gs.within_limit,
+                )
                 continue
 
             bid_price = self._pc.bid(token)
             if bid_price <= 0:
+                self._t1_skip_log(
+                    "engine.t1_skip_no_bid", side=side, token=token[:16],
+                    detail="best_bid cache empty — MarketWS has not received "
+                           "a best_bid_ask event for this token yet",
+                )
                 continue
 
             # Stake cap check — don't overcommit
             if pos.stake_cap_remaining < s.TIER1_NOTIONAL:
-                log.debug(
+                self._t1_skip_log(
                     "engine.t1_skip_cap_reached",
-                    stake_remaining=pos.stake_cap_remaining, needed=s.TIER1_NOTIONAL,
+                    side=side,
+                    stake_remaining=pos.stake_cap_remaining,
+                    needed=s.TIER1_NOTIONAL,
                 )
                 continue
 
