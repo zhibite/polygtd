@@ -7,13 +7,19 @@ Covers:
   H-V6-3  — WindowManager fires on_new_round on successful boundary + boot,
             so engine._round is never None while a market is active
             (production symptom: STATUS shows baseline=PASS but no T1 fires)
+  H-V6-4  — engine.on_new_round() pins the baseline from
+            market.btc_spot_at_window_open so the gate is ready immediately
+            (production symptom: STATUS shows `baseline=pending` for the
+            entire 15-min window after a round transition)
 
 Run via `pytest tests/test_audit_fixes_2026_07_11_v5.py`.
 """
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 import pytest
@@ -414,3 +420,139 @@ async def test_h_v6_3_evaluate_short_circuits_when_round_is_none() -> None:
         "Either the round-None guard was removed (bug) or the engine "
         "constructed _round automatically (also a bug)."
     )
+
+
+# ---------------------------------------------------------------------------
+# H-V6-4: on_new_round pins baseline from market.btc_spot_at_window_open
+# so the gate is ready immediately. Before the fix, baseline=pending lasted
+# the full 15-min window because on_round_end cleared _gate and the
+# separate _on_window_baseline callback was wiped by the same on_round_end.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_h_v6_4_on_new_round_pins_gate_from_market_window_open_price() -> None:
+    """After on_new_round, engine._gate must be set and aligned with
+    `market.btc_spot_at_window_open`. This is the whole point of the fix:
+    no more 15-min window of `baseline=pending`.
+
+    Before the fix:
+      - `engine.on_round_end` cleared `_gate = None`
+      - WM fired `_on_baseline` BEFORE WM fired `_on_new_round`
+      - so the baseline was applied to the OLD round and immediately wiped
+      - the new round never got a baseline until the NEXT boundary (15 min)
+    After the fix:
+      - `engine.on_round_end` keeps `_gate` in place
+      - `engine.on_new_round` pins `_gate` directly from
+        `market.btc_spot_at_window_open` (the price WM just fetched)
+      - drift gating resumes within the first evaluate tick of the new round
+    """
+    from src.market.models import MarketInfo
+    from src.strategy.engine import StrategyEngine
+
+    class _StubBC:
+        last_price = 0.0
+
+    class _StubPC:
+        def get_midpoint(self, t: str) -> float:
+            return 0.0
+
+        def bid(self, t: str) -> float:
+            return 0.0
+
+    captured: list[Any] = []
+
+    async def handler(action: Any) -> None:
+        captured.append(action)
+
+    eng = StrategyEngine(_StubBC(), _StubPC(), handler)  # type: ignore[arg-type]
+    assert eng._gate is None
+
+    mkt = MarketInfo(
+        asset="BTC",
+        slug="btc-updown-15m-fake",
+        condition_id="0x" + "ab" * 32,
+        token_up_id="1",
+        token_down_id="2",
+        window_start=datetime.now(timezone.utc),  # type: ignore[arg-type]
+        window_end=datetime.now(timezone.utc),    # type: ignore[arg-type]
+        tick_size=0.01,
+        btc_spot_at_window_open=64125.17,
+        btc_spot_now=0.0,
+    )
+
+    round_ts = 1783728900
+    await eng.on_new_round(round_ts, mkt)
+
+    # H-V6-4: gate must be set IMMEDIATELY after on_new_round returns.
+    assert eng._gate is not None, (
+        "H-V6-4 violation: engine._gate is None after on_new_round — "
+        "STATUS would log `baseline=pending` for the entire 15-min window."
+    )
+    assert eng._gate.baseline == pytest.approx(64125.17), (
+        f"H-V6-4 violation: gate baseline is {eng._gate.baseline}, expected "
+        "market.btc_spot_at_window_open (64125.17)."
+    )
+    assert eng._gate.can_act(64125.17) is True
+
+
+@pytest.mark.asyncio
+async def test_h_v6_4_on_new_round_falls_back_to_binance_cache() -> None:
+    """If `market.btc_spot_at_window_open` is 0 (rare fetcher edge case),
+    fall back to `binance_cache.last_price`. This avoids the previous
+    `baseline=pending` window in those cases.
+    """
+    from src.market.models import MarketInfo
+    from src.strategy.engine import StrategyEngine
+
+    class _StubBC:
+        last_price = 64100.0
+
+    class _StubPC:
+        def get_midpoint(self, t: str) -> float:
+            return 0.0
+
+        def bid(self, t: str) -> float:
+            return 0.0
+
+    async def handler(action: Any) -> None:
+        return None
+
+    eng = StrategyEngine(_StubBC(), _StubPC(), handler)  # type: ignore[arg-type]
+
+    mkt = MarketInfo(
+        asset="BTC",
+        slug="btc-updown-15m-fake",
+        condition_id="0x" + "cd" * 32,
+        token_up_id="1",
+        token_down_id="2",
+        window_start=datetime.now(timezone.utc),  # type: ignore[arg-type]
+        window_end=datetime.now(timezone.utc),    # type: ignore[arg-type]
+        tick_size=0.01,
+        btc_spot_at_window_open=0.0,  # ← not yet filled
+        btc_spot_now=0.0,
+    )
+
+    await eng.on_new_round(1783728900, mkt)
+
+    assert eng._gate is not None
+    assert eng._gate.baseline == pytest.approx(64100.0)
+
+
+def test_h_v6_4_on_round_end_keeps_gate() -> None:
+    """Static check: `engine.on_round_end` MUST NOT clear `_gate`.
+
+    We grep the source for any line assigning `self._gate = None` inside
+    `on_round_end`. The fix removed that assignment so the gate survives
+    the round transition and `STATUS` never logs `baseline=pending`.
+    """
+    from src.strategy.engine import StrategyEngine
+
+    src = inspect.getsource(StrategyEngine.on_round_end)
+    lines = [ln.strip() for ln in src.splitlines()]
+    for ln in lines:
+        if "self._gate" in ln and "None" in ln and "=" in ln:
+            raise AssertionError(
+                "H-V6-4 violation: engine.on_round_end still clears _gate. "
+                f"Found line: {ln!r}"
+            )

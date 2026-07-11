@@ -104,20 +104,72 @@ class StrategyEngine:
     # ------------------------------------------------------------------
 
     async def on_new_round(self, round_start_ts: int, market: MarketInfo | None = None) -> None:
-        """Called when the 15-min window rolls over."""
+        """Called when the 15-min window rolls over.
+
+        H-V6-4: pin the gate baseline HERE from `market.btc_spot_at_window_open`
+        (the value the WindowManager already fetched via fetch_at_window_open()).
+        Previously we waited for the separate `_on_window_baseline` callback to
+        arrive, but the WM tick ordering caused a timing race: the baseline was
+        applied to the just-finished round and immediately wiped by
+        `on_round_end`, leaving the gate at None for the full 15-min window
+        (STATUS logged `baseline=pending`, no drift gating ran).
+        """
         log.info("engine.new_round", round_start_ts=round_start_ts)
         self._round = RoundState(round_start_ts=round_start_ts, market=market)
         self._gate = None
 
-    def set_binance_baseline(self, baseline: float) -> None:
-        """Call after collecting the round-start Binance median."""
-        if self._round:
+        # Pin baseline from the market the WM just discovered. The WM has
+        # already called `fetch_at_window_open()` for this asset; the price
+        # lives on `market.btc_spot_at_window_open`. If it's missing (rare
+        # boot case where WM fetched via spot fallback but did not write back),
+        # fall back to the most recent Binance WS price, and as a last resort
+        # leave _gate as None — `_on_window_baseline` will cover it within a
+        # couple of ticks.
+        baseline: float | None = None
+        baseline_src = ""
+        if market is not None and getattr(market, "btc_spot_at_window_open", 0.0) > 0:
+            baseline = float(market.btc_spot_at_window_open)
+            baseline_src = "market.btc_spot_at_window_open"
+        elif self._bc.last_price > 0:
+            baseline = self._bc.last_price
+            baseline_src = "binance_cache.last_price"
+
+        if baseline is not None and baseline > 0:
+            self._gate = GateKeeper(baseline)
             self._round.binance_baseline = baseline
+            log.info(
+                "engine.baseline_set",
+                baseline=baseline,
+                round_start_ts=round_start_ts,
+                source=baseline_src,
+            )
+        else:
+            log.warning(
+                "engine.baseline_pending",
+                round_start_ts=round_start_ts,
+                hint="neither market.btc_spot_at_window_open nor binance_cache.last_price available",
+            )
+
+    def set_binance_baseline(self, baseline: float) -> None:
+        """Replace the gate baseline (called by `_on_window_baseline`).
+
+        Always overwrites whatever the gate was — safer than guarding on
+        `_round.round_start_ts` because WM sometimes re-fires the same
+        window's K-line value a few seconds later (K-line backtrack lag).
+        """
         self._gate = GateKeeper(baseline)
         log.info("engine.baseline_set", baseline=baseline)
 
     async def on_round_end(self) -> None:
-        """Called at round close."""
+        """Called at round close.
+
+        H-V6-4: keep `self._gate` here — don't clear it. The new round will
+        re-pin the baseline inside `on_new_round` from
+        `market.btc_spot_at_window_open` (which the WM already fetched via
+        `fetch_at_window_open()`). Until that runs, the previous round's
+        baseline stays in place so drift checks keep responding (better
+        than 0–15 min of `baseline=pending`).
+        """
         if self._round:
             self._round.finished = True
             log.info(
@@ -126,7 +178,6 @@ class StrategyEngine:
                 position=self._round.position,
             )
         self._round = None
-        self._gate = None
 
     # ------------------------------------------------------------------
     # Order event handlers — these drive tier state machine
