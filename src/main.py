@@ -678,10 +678,23 @@ async def _status_loop() -> None:
             )
             pos_str = f" | tiers=[{tiers_str}] qty={pos.total_qty:.2f} cost=${pos.total_cost:.2f}"
 
+        # H-V6-9: surface the cached best_bid for UP/DOWN so the operator
+        # can tell from STATUS whether the WS bba path is actually feeding
+        # the strategy. Before this, REST midpoint was visible but best_bid
+        # was hidden — leaving us blind to the fact that `cache.best_bid`
+        # was 0 while the WS was pumping `best_bid_ask` events we never
+        # parsed (production symptom: 2026-07-11 01:17 round 01:15).
+        if up_token and down_token:
+            up_bid = s.price_cache.best_bid.get(up_token, 0.0)
+            down_bid = s.price_cache.best_bid.get(down_token, 0.0)
+            bid_str = f" | bids=UP={up_bid:.4f}/DOWN={down_bid:.4f}"
+        else:
+            bid_str = ""
+
         log.info(
             f"STATUS  binance={bc:,.1f}  {gate_str}"
             f"  window_end={window_end_str}({next_in:.0f}s)  "
-            f"UP={up_last:.4f}  DOWN={down_last:.4f}{pos_str}"
+            f"UP={up_last:.4f}  DOWN={down_last:.4f}{bid_str}{pos_str}"
         )
 
 

@@ -171,52 +171,132 @@ class MarketWS:
         if not isinstance(msg, dict):
             return
 
-        msg_type = msg.get("type", "")
+        # ── Polymarket Market Channel payload schema ─────────────────────────
+        # Real messages (event_type-driven):
+        #   best_bid_ask:  { event_type, market, asset_id, best_bid, best_ask,
+        #                    spread, timestamp }
+        #   price_change:  { event_type, market, price_changes: [{ asset_id,
+        #                    price, size, side, hash, best_bid, best_ask }],
+        #                    timestamp }
+        #   book:          { event_type, asset_id, market, bids:[{price,size}],
+        #                    asks:[{price,size}], timestamp, hash }
+        #   last_trade_price: { event_type, asset_id, price, side, size,
+        #                       fee_rate_bps, timestamp }
+        # Legacy / defensive reads kept below for older shapes (price-only or
+        # nested best_bid_ask dict).
+        event_type = msg.get("event_type") or msg.get("type") or ""
 
-        # Extract token - may be in 'market' field
-        token = msg.get("token") or msg.get("asset_id") or ""
-        market_field = msg.get("market", {})
+        # Extract token id — best_bid_ask / book / last_trade_price use top-
+        # level `asset_id`; price_change puts it inside each price_changes[].
+        token = (
+            msg.get("asset_id")
+            or msg.get("token")
+            or ""
+        )
+        market_field = msg.get("market")
         if not token and isinstance(market_field, dict):
             token = market_field.get("asset_id") or market_field.get("assetID") or ""
 
-        # best_bid_ask - can be nested dict, flat dict, or list of {price, size}
+        # ── best_bid / best_ask ──────────────────────────────────────────────
+        # Polymarket sends these as TOP-LEVEL scalars in best_bid_ask events
+        # and inside each price_changes[] item. We seed the cache from
+        # whichever shape is present.
+        if event_type == "best_bid_ask":
+            bb_raw = msg.get("best_bid")
+            ba_raw = msg.get("best_ask")
+            try:
+                if bb_raw is not None and bb_raw != "":
+                    self._cache.best_bid[token] = float(bb_raw)
+            except (TypeError, ValueError):
+                pass
+            try:
+                if ba_raw is not None and ba_raw != "":
+                    self._cache.best_ask[token] = float(ba_raw)
+            except (TypeError, ValueError):
+                pass
+
+        # price_change → per-asset updates (each carries its own best_bid/ask)
+        pcs = msg.get("price_changes", [])
+        if isinstance(pcs, list):
+            for pc in pcs:
+                if not isinstance(pc, dict):
+                    continue
+                pc_token = pc.get("asset_id") or token
+                if not pc_token:
+                    continue
+                # Bump last_trade_price from price_changes too (these are
+                # trade executions, the price is the actual fill).
+                pc_price = pc.get("price")
+                if pc_price is not None and pc_price != "":
+                    try:
+                        self._cache.last_trade_price[pc_token] = float(pc_price)
+                    except (TypeError, ValueError):
+                        pass
+                # Many price_changes carry best_bid / best_ask (older docs).
+                # When present, prefer them over a stale cache value.
+                for key, cache_attr in (("best_bid", "best_bid"),
+                                        ("best_ask", "best_ask")):
+                    raw = pc.get(key)
+                    if raw is None or raw == "":
+                        continue
+                    try:
+                        self._cache.__dict__[cache_attr][pc_token] = float(raw)
+                    except (TypeError, ValueError):
+                        pass
+
+        # book event — top-level bids/asks arrays (full snapshot)
+        if event_type == "book":
+            bids = msg.get("bids") or []
+            asks = msg.get("asks") or []
+            if token and isinstance(bids, list) and bids:
+                try:
+                    self._cache.best_bid[token] = float(bids[0].get("price"))
+                except (AttributeError, TypeError, ValueError):
+                    pass
+            if token and isinstance(asks, list) and asks:
+                try:
+                    self._cache.best_ask[token] = float(asks[0].get("price"))
+                except (AttributeError, TypeError, ValueError):
+                    pass
+
+        # ── Legacy / defensive paths (kept for forward-compat) ──────────────
+        # Some messages (older servers, debug echoes) carry a nested
+        # `best_bid_ask` dict. Read it as a last resort; do NOT clobber a
+        # better value we just wrote above.
         bba = msg.get("best_bid_ask")
         if isinstance(bba, dict):
             bba_token = bba.get("asset_id") or bba.get("assetID") or token
             bids = bba.get("bids", [])
             asks = bba.get("asks", [])
             if bids and isinstance(bids, list) and len(bids) > 0:
-                self._cache.best_bid[bba_token] = float(bids[0])
+                try:
+                    self._cache.best_bid.setdefault(bba_token, float(bids[0]))
+                except (TypeError, ValueError):
+                    pass
             if asks and isinstance(asks, list) and len(asks) > 0:
-                self._cache.best_ask[bba_token] = float(asks[0])
-        elif isinstance(bba, list) and len(bba) > 0:
-            # Flat list format: [{"price": "0.55", "size": "100"}, ...]
-            for x in bba:
-                if isinstance(x, dict) and "price" in x:
-                    self._cache.best_bid[token] = float(x["price"])
-                    break
-        elif bba is not None:
-            # Log unknown best_bid_ask format for debugging
-            log.debug("market_ws.unknown_bba_format", bba=str(bba)[:100])
+                try:
+                    self._cache.best_ask.setdefault(bba_token, float(asks[0]))
+                except (TypeError, ValueError):
+                    pass
 
-        # last_trade_price
+        # last_trade_price (top-level field on dedicated event_type)
         ltp = msg.get("last_trade_price")
         if isinstance(ltp, list) and len(ltp) >= 1:
-            # [price, size] format
-            self._cache.last_trade_price[token] = float(ltp[0])
+            try:
+                self._cache.last_trade_price[token] = float(ltp[0])
+            except (TypeError, ValueError):
+                pass
         elif isinstance(ltp, dict):
             price = ltp.get("price") or ltp.get("last_trade_price")
-            if price is not None:
-                self._cache.last_trade_price[token] = float(price)
-
-        # price_changes (list of incremental updates) - Plural!
-        # Structure: {'asset_id': '...', 'price': '0.26', 'size': '708.79', 'side': 'SELL', 'hash': '...'}
-        # These are trade executions - price is the actual trade/transaction price
-        pcs = msg.get("price_changes", [])
-        if isinstance(pcs, list):
-            for pc in pcs:
-                if isinstance(pc, dict):
-                    pc_token = pc.get("asset_id") or token
-                    price_str = pc.get("price")
-                    if price_str:
-                        self._cache.last_trade_price[pc_token] = float(price_str)
+            if price not in (None, ""):
+                try:
+                    self._cache.last_trade_price[token] = float(price)
+                except (TypeError, ValueError):
+                    pass
+        elif isinstance(ltp, str) and ltp and token:
+            # top-level last_trade_price event: { event_type, asset_id,
+            # price, side, size, fee_rate_bps, timestamp }
+            try:
+                self._cache.last_trade_price[token] = float(ltp)
+            except (TypeError, ValueError):
+                pass
