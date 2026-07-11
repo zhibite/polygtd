@@ -1331,18 +1331,27 @@ def _make_maker_fill_callback(state: AppState):
         # Build the candidate list. If user_ws supplied the keyword arg we
         # use it; otherwise fall back to the legacy single-order_id flow.
         if candidates:
-            # Each row: (order_id, asset_id, matched_amount). All FULL hashes.
+            # Each row: (order_id, asset_id, matched_amount, maker_price).
+            # All FULL hashes; per-row values come straight from
+            # maker_orders[] in user_ws so per-maker attribution is exact.
             candidate_pairs = [
-                (oid, aid, float(amt or 0))
-                for (oid, aid, amt) in candidates
+                (oid, aid, float(amt or 0), float(mprice or 0))
+                for (oid, aid, amt, mprice) in candidates
                 if oid
             ]
         else:
-            candidate_pairs = [(fill.maker_order_id, fill.asset_id, fill.size)]
+            candidate_pairs = [(fill.maker_order_id, fill.asset_id, fill.size, fill.price)]
 
         # Pick the first candidate that lives in our OrderManager.
         # om.by_server_id does a full-hash dict lookup — no prefix matching.
-        chosen: tuple[str, str, float] | None = None
+        # H-NEW-2026-07-11 (audit, prod 14:03 round): the top-level
+        # `fill.price` and `fill.size` describe the TAKER side of the trade
+        # (the counterparty who crossed the book). When our maker is one of
+        # many makers that the taker matched, the top-level price/size is
+        # NOT necessarily our fill price / our share count — the per-row
+        # values in maker_orders[] are. We pick the candidate row that is
+        # ours and use ITS (asset_id, size, price) for downstream routing.
+        chosen: tuple[str, str, float, float] | None = None
         for cand in candidate_pairs:
             if om.by_server_id(cand[0]):
                 chosen = cand
@@ -1355,15 +1364,20 @@ def _make_maker_fill_callback(state: AppState):
             # delta for us.
             log.info(
                 "router.maker_fill.no_match",
-                candidates=[oid[:16] for oid, _, _ in candidate_pairs],
+                candidates=[oid[:16] for oid, _, _, _ in candidate_pairs],
                 reason="none of the candidate order_ids match OrderManager",
             )
             return
 
         order_id = chosen[0]
         asset_id = chosen[1] or fill.asset_id
-        fill_price = fill.price
-        fill_size_inc = fill.size
+        # Use the maker-row amount — NOT fill.size. Top-level fill.size
+        # describes the taker side and overcounts our maker by a factor of
+        # (taker_total / our_maker_amount).
+        fill_size_inc = chosen[2] if chosen[2] > 0 else fill.size
+        # Use the maker-row price when present — fall back to top-level
+        # only if the row didn't carry a price.
+        fill_price = chosen[3] if chosen[3] > 0 else fill.price
 
         if not order_id or fill_size_inc <= 0:
             # Same breadcrumb the legacy router had — keep the spelling for
@@ -1391,20 +1405,24 @@ def _make_maker_fill_callback(state: AppState):
             )
             return
 
-        # Decide what *increment* to forward to the engine. The UserWS
-        # delivers one maker-fill row per trade — most of the time the
-        # increment is exactly fill.size. But the exchange can also send a
-        # MOMENTUM / UPDATE event that reports the order's NEW cumulative
-        # matched size (not a delta). We unify on delta semantics here:
-        # `prev_cumulative + delta == new_cumulative`, so `delta = max(0,
-        # new_cumulative - prev_cumulative)`. Anything beyond that is
-        # treated as already accounted for and dropped. (B-3 fix — earlier
-        # versions ignored this and double-counted on UPDATE-style events.)
+        # Decide what *increment* to forward to the engine.
+        #
+        # After H-NEW-2026-07-11 per-maker attribution, chosen[2] is the
+        # AUTHORITATIVE share count for OUR maker on this single TRADE
+        # event (not the taker side, not a cumulative since the same
+        # trade_id is dedup'd at the top of this function). For a T2 BUY
+        # DOWN @0.32 that the taker partially filled across multiple
+        # maker_orders rows of the SAME taker-side trade, OM gets one
+        # router call per (trade_id, matched_maker_row) and accumulates
+        # them via apply_fill_event's monotonic max.
+        #
+        # Two consecutive MATCHED events for the same trade_id are
+        # blocked by the trade_id dedupe gate above. So fill_size_inc
+        # is the delta for THIS trade; cumulative = prev + inc.
         prev_cumulative = tracked.size_matched or 0.0
         new_cumulative = prev_cumulative + fill_size_inc
-        delta = max(0.0, fill_size_inc)
-        # Only emit when there is net new matched size to report.
-        if new_cumulative - prev_cumulative <= 1e-9:
+        delta = fill_size_inc
+        if delta <= 1e-9:
             log.debug(
                 "router.maker_fill.no_new",
                 order_id=order_id, prev=prev_cumulative, inc=fill_size_inc,
@@ -1427,6 +1445,8 @@ def _make_maker_fill_callback(state: AppState):
             "router.maker_fill",
             maker_order_id=order_id,    # full id — never truncate
             asset_id=asset_id[:16],
+            chosen_maker_amount=chosen[2],
+            chosen_maker_price=chosen[3],
             fill_price=fill_price,
             fill_size=delta,
             fill_total_size=new_cumulative,

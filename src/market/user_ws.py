@@ -417,19 +417,32 @@ class UserWS:
         # Preserve first-occurrence order so a taker-trade with one maker
         # row doesn't accidentally appear as "MAKER" by repeating the taker
         # order in both fields.
+        # Each candidate is one row from maker_orders[] (or the taker row).
+        # Tuple layout: (order_id, asset_id, matched_amount, maker_price).
+        # The asset_id and matched_amount are the AUTHORITATIVE values for
+        # THIS maker row — never to be silently swapped for the top-level
+        # trade values. maker_price is the row's own matched price (often
+        # == top-level taker price for the simplest case, but always trust
+        # the row when present so we attribute per-maker correctly).
+        # H-NEW-2026-07-11 (audit, prod 14:03 round): prior code used
+        # `fill.price` / `fill.size` from the top-level TRADE event, which
+        # describe the TAKER side. When our maker is one of many makers
+        # in the same trade, this overcounts our shares by the ratio
+        # (taker_total / our_maker_amount) and uses the wrong-side price
+        # (e.g. we BUY DOWN @0.32, taker BUY UP, top_price=UP price).
         seen: set[str] = set()
-        candidates: list[tuple[str, str, float]] = []  # (order_id, asset_id, matched_amount)
+        candidates: list[tuple[str, str, float, float]] = []  # (oid, aid, amt, price)
 
-        def _add_candidate(oid: str, aid: str, amt: float) -> None:
+        def _add_candidate(oid: str, aid: str, amt: float, mprice: float = 0.0) -> None:
             if not oid:
                 return
             if oid in seen:
                 return
             seen.add(oid)
-            candidates.append((oid, aid or "", float(amt or 0)))
+            candidates.append((oid, aid or "", float(amt or 0), float(mprice or 0)))
 
         if taker_order_id:
-            _add_candidate(taker_order_id, top_asset_id, top_size)
+            _add_candidate(taker_order_id, top_asset_id, top_size, top_price)
 
         # maker_orders[].order_id  with their PER-ROW asset_id (the row's
         # asset is the AUTHORITATIVE token that maker was on — never
@@ -442,7 +455,12 @@ class UserWS:
                 or ""
             )
             mo_amount = self._extract_size_from_payload(mo)
-            _add_candidate(mo_id, mo_asset, mo_amount)
+            mo_price_raw = mo.get("price", "") or mo.get("px", "") or ""
+            try:
+                mo_price = float(mo_price_raw) if mo_price_raw else 0.0
+            except (TypeError, ValueError):
+                mo_price = 0.0
+            _add_candidate(mo_id, mo_asset, mo_amount, mo_price)
 
         if not candidates:
             log.debug(
@@ -459,7 +477,7 @@ class UserWS:
         # delta wins (M-2 cumulative→delta dedupe is applied per order_id).
         effective_size = top_size
         if effective_size <= 0 and status in ("MATCHED", "MINED", "CONFIRMED"):
-            for oid, _aid, _amt in candidates:
+            for oid, _aid, _amt, _mp in candidates:
                 filled = await self._rest_filled_size(oid)
                 if filled and filled > 0:
                     prev_cum = self._last_rest_cumulative.get(oid, 0.0)
@@ -484,7 +502,7 @@ class UserWS:
         if effective_size <= 0:
             log.debug(
                 "user_ws.trade.zero_size",
-                candidates=[oid[:16] for oid, _, _ in candidates],
+                candidates=[oid[:16] for oid, _, _, _ in candidates],
                 trader_side_hint=trader_side_hint or "UNKNOWN",
                 top_size=top_size, status=status,
             )
@@ -515,7 +533,7 @@ class UserWS:
             asset_id=(candidates[0][1] or top_asset_id)[:16],
             side=top_side,
             trader_side_hint=trader_side_hint or "UNKNOWN",
-            candidates=[oid[:16] for oid, _, _ in candidates],
+            candidates=[oid[:16] for oid, _, _, _ in candidates],
             top_size=top_size,
             status=status,
         )
