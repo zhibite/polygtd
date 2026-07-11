@@ -104,6 +104,23 @@ class StrategyEngine:
         # line per (reason, side) every 5 seconds — enough to diagnose from
         # production logs while keeping the firehose down.
         self._t1_skip_last_log_ts: dict[str, float] = {}
+        # Per-round breadcrumb for the price-cap rejection. The throttled
+        # `t1_skip_too_expensive` lines themselves are DEBUG (H-V6-15), but we
+        # still want a single INFO per round that says "T1 was rejected on
+        # price for X seconds this round" so operators can confirm the bot
+        # is alive and patiently waiting without scrolling through DEBUG.
+        # Key: (round_start_ts, side). Reset on round rollover when
+        # `on_round_end` swaps in a new round_start_ts.
+        self._t1_cap_reject_first_seen: dict[tuple[int, str], float] = {}
+        self._t1_cap_reject_summary_logged: dict[tuple[int, str], bool] = {}
+
+    # H-NEW-2026-07-11: helper that reads PRICE_PRE_MARGIN safely even for
+    # tests that construct engine via __new__ (bypassing __init__).
+    def _get_price_pre_margin(self) -> float:
+        if hasattr(self, "_s") and self._s is not None:
+            return float(getattr(self._s, "PRICE_PRE_MARGIN", 0.0) or 0.0)
+        # Fallback to config directly for test stubs.
+        return float(getattr(_s(), "PRICE_PRE_MARGIN", 0.0) or 0.0)
 
     def _t1_skip_log(self, reason: str, *, side: str, **fields) -> None:
         """Log a T1 skip event with per-(reason,side) throttle.
@@ -119,6 +136,14 @@ class StrategyEngine:
         fresh round; a 5s throttle would still fire 12 times in that
         window with no diagnostic value. Other skip reasons stay at 5s
         because their price/drift values change meaningfully every tick.
+
+        H-V6-15: `engine.t1_skip_too_expensive` is downgraded to DEBUG.
+        Operationally this reason fires every 5s for as long as the token
+        stays above ENTRY_PRICE_CAP — easily 20-40 INFO lines per round
+        on a typical BTC 15m. The decision itself is fully reflected by
+        STATUS `tiers=[T1=○]`, and a single per-round INFO summary is
+        emitted via `_t1_cap_reject_summary()` so operators can still
+        confirm T1 was rejected on price without the firehose.
         """
         key = f"{reason}|{side}"
         now = time.time()
@@ -127,7 +152,70 @@ class StrategyEngine:
         if now - last < throttle:
             return
         self._t1_skip_last_log_ts[key] = now
+        # H-V6-15: price-cap rejection is a high-frequency, low-information
+        # event once a token is well above cap. Surface at DEBUG so it is
+        # still inspectable via --log-level=DEBUG without spamming INFO.
+        if reason == "engine.t1_skip_too_expensive":
+            log.debug(reason, side=side, **fields)
+            # ...and record first-occurrence so _t1_cap_reject_summary can
+            # emit a single per-round INFO breadcrumb about how long the
+            # cap rejection lasted.
+            if self._round is not None:
+                rk = (self._round.round_start_ts, side)
+                self._t1_cap_reject_first_seen.setdefault(rk, now)
+            return
         log.info(reason, side=side, **fields)
+
+    def _t1_cap_reject_summary(self) -> None:
+        """Emit one INFO summary line per (round, side) after T1 enters or
+        the round ends — reports how long the price-cap rejection lasted.
+
+        H-V6-15: companion to the DEBUG-downgrade of
+        `engine.t1_skip_too_expensive`. The actual per-tick line is now
+        silent in INFO logs; this preserves a single human-readable
+        breadcrumb per round at INFO so operators can see "T1 was
+        rejected on price for X seconds this round" without scrolling
+        DEBUG.
+        """
+        if self._round is None:
+            return
+        rk_round = self._round.round_start_ts
+        # Iterate over all sides we've tracked for this round
+        seen = list(self._t1_cap_reject_first_seen.keys())
+        for rk in seen:
+            if rk[0] != rk_round:
+                continue  # stale entry from previous round — clear below
+            side = rk[1]
+            if self._t1_cap_reject_summary_logged.get(rk):
+                continue
+            first_seen = self._t1_cap_reject_first_seen[rk]
+            duration_s = time.time() - first_seen
+            log.info(
+                "engine.t1_cap_rejected_summary",
+                side=side,
+                duration_s=round(duration_s, 1),
+                cap=self._s.ENTRY_PRICE_CAP,
+                note="T1 was above ENTRY_PRICE_CAP for this many seconds; "
+                     "no T1 entry was made this side",
+            )
+            self._t1_cap_reject_summary_logged[rk] = True
+
+    def _t1_cap_reject_reset_round(self) -> None:
+        """Drop per-round price-cap tracking when a new round starts.
+
+        Called from on_new_round() and on_round_end(). Without this, dict
+        entries from the previous round would leak across round rollovers
+        and become stale (their round_start_ts no longer matches the
+        current `_round.round_start_ts`). The summary() path filters out
+        stale entries already, but this is a cleaner GC for prod memory.
+        """
+        if not self._t1_cap_reject_first_seen:
+            return
+        current = self._round.round_start_ts if self._round else None
+        for rk in list(self._t1_cap_reject_first_seen.keys()):
+            if current is None or rk[0] != current:
+                self._t1_cap_reject_first_seen.pop(rk, None)
+                self._t1_cap_reject_summary_logged.pop(rk, None)
 
     # ------------------------------------------------------------------
     # Round lifecycle
@@ -145,6 +233,11 @@ class StrategyEngine:
         (STATUS logged `baseline=pending`, no drift gating ran).
         """
         log.info("engine.new_round", round_start_ts=round_start_ts)
+        # H-V6-15: clear stale price-cap tracking from the previous round
+        # (if on_round_end ran) so the new round starts with a clean slate.
+        # summary() will be re-armed when t1_skip_log observes the first
+        # too-expensive event under the new round_start_ts.
+        self._t1_cap_reject_reset_round()
         self._round = RoundState(round_start_ts=round_start_ts, market=market)
         self._gate = None
 
@@ -207,7 +300,12 @@ class StrategyEngine:
                 round_start_ts=self._round.round_start_ts,
                 position=self._round.position,
             )
+            # H-V6-15: emit any pending per-round price-cap rejection
+            # summary *before* we drop the round reference, then clear
+            # the tracking dicts.
+            self._t1_cap_reject_summary()
         self._round = None
+        self._t1_cap_reject_reset_round()
 
     # ------------------------------------------------------------------
     # Order event handlers — these drive tier state machine
@@ -431,7 +529,30 @@ class StrategyEngine:
             self._eval_inflight = False
 
     async def _check_t1_entry(self, bc_now: float) -> None:
-        """Check both sides for T1 entry trigger."""
+        """Check both sides for T1 entry trigger.
+
+        H-NEW-2026-07-11 refactor — pre-arm trigger model:
+
+          Trigger line : `strategy_price = ENTRY_PRICE_CAP` (e.g. 0.40)
+          Fire line    : mid <= strategy_price * (1 + PRICE_PRE_MARGIN)
+                         (e.g. mid <= 0.44 when margin=0.10)
+          GTD posted at: strategy_price exactly (e.g. 0.40)
+
+        The previous version fired only when mid had already crossed
+        strategy_price (i.e. mid <= 0.40). The new model posts the GTD
+        at 0.40 as soon as mid drops to 0.44, so the maker sits on the
+        book and gets filled when a taker crosses 0.40. This both:
+
+          1. Eliminates the orderbook fetch (the previous
+             `_adjust_buy_price` REST /book call) — the bot no longer
+             needs to know the live bid, only the mid.
+          2. Removes timing latency: by the time the previous code saw
+             mid <= 0.40 and adjusted to bid+half_tick, the taker had
+             usually already cleared 0.40 and moved on.
+
+        Output is still `ActionOpenT1(price=strategy_price)`; the router
+        calls `place_buy_by_strategy_price` which uses `price_lock=True`.
+        """
         if not self._round or not self._gate or not self._round.up_token:
             return
 
@@ -443,6 +564,14 @@ class StrategyEngine:
         up_tok = self._round.up_token
         down_tok = self._round.down_token
 
+        margin = float(getattr(s, "PRICE_PRE_MARGIN", 0.0) or 0.0)
+        # Strategy price = ENTRY_PRICE_CAP; the new model pre-arms at this
+        # level. We use ENTRY_PRICE_CAP as the "design price" so the trigger
+        # margin is consistent with the price-cap semantics.
+        strategy_price = float(s.ENTRY_PRICE_CAP)
+        # Fire when mid has dropped to (or below) strategy_price * (1 + margin).
+        trigger_line = strategy_price * (1.0 + margin)
+
         for side, token in [("UP", up_tok), ("DOWN", down_tok)]:
             mid_price = self._pc.get_midpoint(token)
             if mid_price <= 0:
@@ -452,12 +581,16 @@ class StrategyEngine:
                 )
                 continue
 
-            # Price cap check
-            if mid_price > s.ENTRY_PRICE_CAP:
+            # ── Pre-arm trigger: fire when mid <= strategy_price * (1 + margin) ──
+            # We do NOT require mid <= strategy_price exactly — the new model
+            # pre-arms the GTD ahead of time so it can sit on the book.
+            if mid_price > trigger_line:
                 self._t1_skip_log(
                     "engine.t1_skip_too_expensive",
                     side=side, token=token[:16],
-                    mid_price=mid_price, cap=s.ENTRY_PRICE_CAP,
+                    mid_price=mid_price, cap=trigger_line,
+                    strategy_price=strategy_price,
+                    detail="pre-arm: mid > strategy_price * (1 + PRICE_PRE_MARGIN)",
                 )
                 continue
 
@@ -488,22 +621,6 @@ class StrategyEngine:
                 )
                 continue
 
-            bid_price = self._pc.bid(token)
-            if bid_price <= 0:
-                # H-V6-12: with the new REST /book fallback in main.py this
-                # is expected to clear within REST_BOOK_POLL_S (default 2s)
-                # without any restart. Use a longer throttle so we don't
-                # flood logs while REST catches up — this branch will not
-                # typically fire more than once per round once the fallback
-                # is healthy. Set throttle to 30s (was 5s).
-                self._t1_skip_log(
-                    "engine.t1_skip_no_bid", side=side, token=token[:16],
-                    detail="best_bid cache empty — MarketWS has not received "
-                           "a best_bid_ask event for this token yet; REST "
-                           "/book poller should fill within REST_BOOK_POLL_S",
-                )
-                continue
-
             # Stake cap check — don't overcommit
             if pos.stake_cap_remaining < s.TIER1_NOTIONAL:
                 self._t1_skip_log(
@@ -519,7 +636,8 @@ class StrategyEngine:
                 side=side,
                 token=token[:16],
                 mid=mid_price,
-                best_bid=bid_price,
+                trigger_line=trigger_line,
+                strategy_price=strategy_price,
                 drift=self._gate.state(bc_now).drift,
             )
 
@@ -541,10 +659,19 @@ class StrategyEngine:
             # the order has been posted, so we get a more accurate anchor.
             pos.entry_side = side
             pos.entry_token = token
+            # H-V6-15: if we hit a clean T1 entry while a price-cap
+            # rejection was happening on the same side (e.g. mid dropped
+            # below cap during the round), flush that summary now so the
+            # operator sees the cap-spell duration in INFO alongside the
+            # actual entry decision.
+            self._t1_cap_reject_summary()
+            # H-NEW-2026-07-11: pass `strategy_price` (not bid_price).
+            # The GTD is posted at this exact limit; the watcher waits
+            # for the maker to be lifted by a taker crossing strategy_price.
             await self._handler(ActionOpenT1(
                 side=side,
                 token=token,
-                price=bid_price,
+                price=strategy_price,
                 notional=s.TIER1_NOTIONAL,
             ))
             return  # enter only once per round
@@ -553,12 +680,27 @@ class StrategyEngine:
         """
         Check if the next averaging tier should be triggered.
 
-        Mutex rules:
-          - A tier is skipped if it is already *complete* (is_complete=True)
-          - A tier is skipped if it is currently *in-flight* (placed=True but not complete)
-          - A tier is triggered only if it is *not placed yet*
+        H-NEW-2026-07-11 refactor — pre-arm trigger model:
 
-        This prevents double-triggering the same tier.
+          Trigger line : `strategy_price = baseline * (1 - tier_drop_pct)`
+          Fire line    : mid <= strategy_price * (1 + PRICE_PRE_MARGIN)
+                         (e.g. T2 with baseline=0.40, drop=20%, margin=10%
+                              → strategy_price=0.32, fire when mid <= 0.352)
+          GTD posted at: strategy_price exactly
+
+        This matches the T1 pre-arm design. The bot no longer waits until
+        mid crosses strategy_price before posting the GTD; it posts early
+        and the maker waits for takers to come up.
+
+        Mutex rules:
+          - Skip a tier if it's already complete (`is_complete=True`)
+          - Skip a tier if it's currently being watched (`watching=True`)
+          - Trigger only if `placed=False, watching=False`
+
+        Refactor: replaced the `tier.placed` mutex with `tier.watching`
+        (set by the watcher spawn, cleared when the watcher terminates).
+        `placed=True` alone no longer holds the slot — the GTD may have
+        been cancelled / expired while the watcher is still terminating.
         """
         if not self._round or not self._gate:
             return
@@ -567,14 +709,6 @@ class StrategyEngine:
         if not pos.baseline_set or pos.entry_token is None:
             return
 
-        # H-NEW-2 fix: while a TP runner is in flight (pos._tp_inflight=True),
-        # suppress averaging-down. Reason: the TP runner is working a GTD
-        # sell at the bid; opening a new BUY would (a) widen the position we
-        # intend to close and (b) interact with B-NEW-1's old bug where BUY
-        # fills incorrectly cleared _tp_inflight. Suppressing averaging here
-        # keeps the close path deterministic — once TP resolves (fill or
-        # GTD expiry → _tp_inflight cleared), the next evaluate() resumes
-        # normal averaging-down decisions.
         if pos._tp_inflight:
             return
 
@@ -582,49 +716,10 @@ class StrategyEngine:
         if mid_price <= 0:
             return
 
-        # H-3 v2 fix: anchor the averaging trigger lines to the INTENDED
-        # entry price (the bid at T1 decision time), not to the actual
-        # fill average. This keeps martingale spacing stable across T1
-        # slippage — if T1 fills 5% above the bid, T2 still triggers at
-        # the design -20% from the original bid, not -20% from a
-        # slippage-shifted avg. Falls back to the actual baseline for
-        # older round-state objects constructed before this field existed.
-        #
-        # H-V6-14 fix: prior priority was [baseline_target_price,
-        # baseline_price], which kept martingale maths anchored to the bid
-        # at T1-decision-time even after T1 had filled at a much lower
-        # price. The intended-bid value is what the bot USED to send a buy
-        # GTD at — but the CLOB may fill that buy at a noticeably lower
-        # price (slippage against thin orderbook). With "design" baseline,
-        # T2's trigger at 0.41 * (1-0.20) = 0.328 fired when actual cost was
-        # 0.34, i.e. only a 3% drop from the *real* entry — not a 20%
-        # drop. Operator observed: "why did T2 fire at 0.33? it should have
-        # waited for 0.27 (=0.34*0.80)."
-        #
-        # New priority:
-        #   1. baseline_realized_price (set once T1 receives any fill) —
-        #      cost-basis-truth; this is what martingale spacing SHOULD be
-        #      anchored to.
-        #   2. baseline_target_price (set by bind_server_order_id after T1
-        #      GTD post) — used only before any T1 fill arrives. Stays as
-        #      a defensive interim so the bot has something meaningful to
-        #      show in logs even mid-flight.
-        #   3. baseline_price (legacy anchor from old round-state objects) —
-        #      kept for back-compat, should never actually trip in current
-        #      builds.
-        #
-        # A one-shot baseline.rebased log fires the cycle in which
-        # baseline_realized_price first becomes set so operators can
-        # observe the trigger math reanchoring.
+        # Baseline anchoring (unchanged from H-V6-14 — realized price wins
+        # once T1 has any fill, else target/legacy fallback).
         if pos.baseline_set_realized and pos.baseline_realized_price is not None:
             new_baseline = pos.baseline_realized_price
-            prev = getattr(pos, "_last_used_baseline_value", None)
-            if prev is not None and abs(prev - new_baseline) > 1e-9:
-                # already logged the rebasing transition elsewhere;
-                # this branch is just here so future readers know the
-                # value can change silently across partial T1 fills
-                # before the rebased flag trips.
-                pass
             if not getattr(pos, "_baseline_rebased_logged", False):
                 log.info(
                     "baseline.rebased",
@@ -640,39 +735,29 @@ class StrategyEngine:
             baseline = new_baseline
         else:
             baseline = pos.baseline_target_price or pos.baseline_price
-        # Remember what we actually used this tick so the next tick can
-        # detect the transition (and so future code paths that re-read
-        # baseline inherit a consistent state).
         pos._last_used_baseline_value = baseline
         s = self._s
+        margin = self._get_price_pre_margin()
 
         for tier in pos.tiers[1:]:  # T2, T3, T4
-            # Skip if already complete or currently in-flight
             if tier.is_complete:
                 continue
-            if tier.placed:
-                # M-V4-2 fix: `tier.placed=True` but `server_order_id is None`
-                # is a stale state — it can only arise if a previous
-                # `bind_server_order_id` call did not run (router-level
-                # failure, see B-V4-2) or was unwound. Treat this as a
-                # half-placed tier and reset so we can re-fire cleanly,
-                # rather than skipping forever or duplicating the order.
-                if not tier.server_order_id:
-                    log.warning(
-                        "engine.tier_stale_placed_reset",
-                        tier=tier.tier,
-                        size_filled=tier.size_filled,
-                        cost_filled=tier.cost_filled,
-                    )
-                    tier.placed = False
-                    tier.expires_at = 0.0
-                else:
-                    continue
+            # H-NEW-2026-07-11: `watching` is the new in-flight mutex.
+            # Skip if a watcher is still actively polling this tier.
+            if tier.watching:
+                continue
+            # M-V4-2 fallback: stale placed=True without watcher (e.g.
+            # bind failed and watcher never spawned). Reset and re-fire.
+            if tier.placed and not tier.server_order_id:
+                log.warning(
+                    "engine.tier_stale_placed_reset",
+                    tier=tier.tier,
+                    size_filled=tier.size_filled,
+                    cost_filled=tier.cost_filled,
+                )
+                tier.placed = False
+                tier.expires_at = 0.0
 
-            # Per-tier hard cap: refuse to (re)place this tier if it has
-            # already absorbed > tier.notional * TIER_NOTIONAL_MAX_MULT.
-            # This stops GTD loops / repeated partial fills from silently
-            # spending into the next tier's budget.
             if pos.tier_is_saturated(tier):
                 log.warning(
                     "engine.tier_saturated_skip",
@@ -683,22 +768,16 @@ class StrategyEngine:
                 )
                 continue
 
-            trigger = tier.trigger_price(baseline)
-            if trigger is None:
+            strategy_price = tier.trigger_price(baseline)
+            if strategy_price is None:
                 continue
 
-            # Price must have dropped to or below the trigger
-            if mid_price > trigger:
-                continue
-
-            bid_price = self._pc.bid(pos.entry_token)
-            if bid_price <= 0:
+            # Pre-arm fire line: mid <= strategy_price * (1 + margin).
+            fire_line = strategy_price * (1.0 + margin)
+            if mid_price > fire_line:
                 continue
 
             # BTC drift gate for averaging.
-            # Drift is bypassed when the price has already dropped to the *next*
-            # tier's trigger line (e.g. checking T2 but price already hit T3's -40%).
-            # In that case price momentum justifies the averaging entry.
             next_drop = TierSnapshot._next_tier_drop(tier.tier)
             if not self._gate.can_double_down(bc_now, mid_price, tier.tier, next_drop, baseline):
                 continue
@@ -712,7 +791,6 @@ class StrategyEngine:
                 )
                 continue
 
-            # Stake cap check — don't overcommit
             if pos.stake_cap_remaining < tier.notional:
                 log.debug(
                     "engine.tN_skip_cap",
@@ -724,23 +802,32 @@ class StrategyEngine:
                 "engine.trigger_tN",
                 tier=tier.tier,
                 mid=mid_price,
-                trigger=trigger,
+                fire_line=fire_line,
+                strategy_price=strategy_price,
                 baseline=baseline,
-                bid=bid_price,
                 notional=tier.notional,
             )
 
+            # H-NEW-2026-07-11: pass strategy_price (not bid_price).
+            # Same pre-arm logic as T1.
             await self._handler(ActionOpenTN(
                 tier=tier.tier,
                 token=pos.entry_token,
-                price=bid_price,
+                price=strategy_price,
                 notional=tier.notional,
-                trigger_price=trigger,
+                trigger_price=fire_line,
             ))
             return  # place one tier at a time
 
     async def _check_take_profit(self, bc_now: float) -> None:
         """Check if take-profit should trigger.
+
+        H-NEW-2026-07-11 refactor — pre-arm trigger model (SELL side):
+
+          strategy_price = tp_target (e.g. 0.40)
+          fire line      = strategy_price * (1 - PRICE_PRE_MARGIN)
+                           (e.g. 0.36 when margin=0.10)
+          GTD SELL posted at: strategy_price exactly
 
         Mutex: while a TP sell is in-flight (awaiting CLOB ack / partial fill
         callback), do not enqueue a new TP action. The flag is cleared by the
@@ -758,14 +845,6 @@ class StrategyEngine:
             return
 
         # H-V5-1 fix: TP must wait for any in-flight averaging tier to settle.
-        # Reason: tp_target() counts only is_complete averaging tiers when
-        # computing the TP pct. If a tier is placed but not yet filled, the
-        # current _avg_cost is artificially high (it doesn't include the
-        # cheaper tier yet), so the TP target is correspondingly optimistic.
-        # Letting TP fire on that stale avg_cost would lock in profit at the
-        # wrong level — the user expects TP to reflect the lower avg_cost
-        # once the in-flight tier actually fills. Symmetric to averaging-down
-        # being suppressed while a TP is in flight.
         if pos.has_inflight_tier:
             return
 
@@ -777,15 +856,15 @@ class StrategyEngine:
         if tp_target is None:
             return
 
-        # B-4 fix: trigger on bid, not mid. With mid/bid gap of ~1-3% in
-        # the 0.95-zone tokens, mid-based triggers over-state the profit
-        # window and lead to actual sale prices that miss the target.
-        # Using bid here keeps trigger-condition and sale-price identical.
-        bid_price = self._pc.bid(pos.entry_token)
-        if bid_price <= 0:
-            return
+        # Pre-arm fire line: mid >= tp_target * (1 - margin).
+        # The TP GTD posts at tp_target exactly; we just wait for mid to
+        # reach the pre-arm zone.
+        # get_price_pre_margin() is a module-level helper so tests that
+        # construct engine via __new__ (bypassing __init__) still work.
+        margin = self._get_price_pre_margin()
+        fire_line = tp_target * (1.0 - margin)
 
-        if bid_price < tp_target:
+        if mid_price < fire_line:
             return
 
         if not self._gate.can_act(bc_now):
@@ -799,15 +878,18 @@ class StrategyEngine:
         log.info(
             "engine.trigger_tp",
             mid=mid_price,
-            bid=bid_price,
+            fire_line=fire_line,
             tp_target=tp_target,
             tp_pct=pos.tp_pct_for_current_state(),
             avg_cost=pos.avg_cost,
             qty=pos.total_qty,
         )
 
+        # H-NEW-2026-07-11: pass tp_target as the GTD limit (not bid_price).
+        # The SELL GTD posts at tp_target exactly; the watcher waits for
+        # the maker to be lifted by a taker crossing tp_target.
         await self._handler(ActionTakeProfit(
             token=pos.entry_token,
-            price=bid_price,
+            price=tp_target,
             qty=pos.total_qty,
         ))

@@ -301,25 +301,57 @@ class CLOBClient:
             log.debug("clob.get_token_balance.error", error=str(exc))
             return 0.0
 
-    # Polymarket CLOB uses 6-decimal fixed-math for all numeric order fields
-    # (size, size_matched, amount, amount_matched, etc.). 1 share = 1_000_000
-    # base units; $1 USDC = 1_000_000 micro-USDC. The same convention is used
-    # in `get_pusd_balance` (see line ~287). Without this divide, a 5.71
-    # share fill would be reported as 5_710_000 — which then corrupts the
-    # engine's position state by 1_000_000x. (Audit H-V6-12 finding C-1.)
+    # H-V6-15: the 6-decimal fixed-math convention applies to some CLOB
+    # fields but NOT to `get_order` (the WS-fill REST fallback). Evidence
+    # from the 2026-07-11 08:19 production trace:
+    #   order_size = 5.12 (shares)
+    #   REST size_matched raw = 5.12 (shares — NOT 5_120_000 base units)
+    # So:
+    #   - /data/order/<id>  .size_matched  → SHARES (no divide)
+    #   - /trades           fills[].size    → BASE UNITS (divide, kept)
+    #   - POST /order       .original_size  → SHARES (we already pass shares)
+    # The remaining divides in place_gtd_buy / place_gtd_sell on fills[].size
+    # are kept for now; if production ever shows them wrong, revisit with
+    # the same unit-test pattern as the size_matched fix.
     _CLOB_BASE_UNITS = 1_000_000
 
     async def get_order_filled_size(self, order_id: str) -> float | None:
         """
-        H-V6-12 fix: read the authoritative `size_matched` for an order via
-        REST. Used as a fallback when the User WS delivers a fill event
-        but the WS payload's `size` field is 0 (a known Polymarket WS
-        quirk — the size key is sometimes `size`, sometimes `size_matched`,
-        and for SAFE / PROXY wallets the WS payload omits it entirely
-        from the top-level fields). Polymart3's working sibling project
+        Read the authoritative `size_matched` for an order via REST.
+
+        Used as a fallback when the User WS delivers a fill event but the
+        WS payload's size field is 0 (a known Polymarket WS quirk — the
+        size key is sometimes `size`, sometimes `size_matched`, and for
+        some wallets the WS payload omits it entirely from the
+        maker_orders[] entries). Polymart3's working sibling project
         uses the same fallback in its buy_token polling loop.
-        Returns size in SHARES (human units, base-units ÷ 1_000_000),
-        or None if the call fails.
+
+        H-V6-15: the previous H-V6-12 audit (finding C-1) interpreted
+        Polymarket's docs as saying this endpoint returns `size_matched`
+        in 6-decimal base units and added a divide-by-1_000_000. The
+        2026-07-11 08:19 production trace shows that interpretation is
+        WRONG for this endpoint:
+
+          order_size        = 5.12     (shares we asked for)
+          REST size_matched = 5.12     (raw — already in shares)
+          post-divide       = 5.12e-06 (5.12 × 10⁻⁶ — the bug)
+
+        The 5.12e-06 value flowed through the WS→REST fallback into
+        the router, then into `position.total_qty`. STATUS rounded it
+        to "0.00" so the operator couldn't see the problem, but the
+        underlying position state was off by 1_000_000×.
+
+        The 6-decimal convention DOES apply to:
+          - `/trades` fills[].size (returned in base units — polling
+            loops at line ~464 / ~697 still divide those)
+          - The order request payload `original_size` field (when we
+            POST `/order` we already pass shares; py-clob-client
+            converts server-side)
+
+        …but NOT to:
+          - `GET /data/order/<id>` size_matched — returns shares.
+
+        Returns size in SHARES, or None if the call fails.
         """
         if not self._client:
             return None
@@ -339,8 +371,10 @@ class CLOBClient:
                 if v is not None:
                     try:
                         f = float(v)
+                        # H-V6-15: no divide. This endpoint returns
+                        # shares directly (production-validated 2026-07-11).
                         if f > 0:
-                            return f / self._CLOB_BASE_UNITS
+                            return f
                     except (TypeError, ValueError):
                         continue
             return 0.0
@@ -702,12 +736,16 @@ class CLOBClient:
                         continue
 
             order_status = (status_resp.get("status") or "").lower()
-            # H-V6-12 fix (audit C-2): size_matched is 6-decimal base units.
-            # Divide before using. If absent, fall back to total_sz which
-            # was already divided inside the fills[] loop above.
+            # H-V6-15 fix: `size_matched` returned by GET /data/order/<id>
+            # is in SHARES, NOT 6-decimal base units (H-V6-12 audit C-2
+            # interpretation was wrong — see get_order_filled_size docstring
+            # for the production-validated evidence from 2026-07-11 08:19).
+            # If absent, fall back to total_sz which was already divided
+            # inside the fills[] loop above.
             matched_sz_raw = status_resp.get("size_matched")
             if matched_sz_raw is not None and float(matched_sz_raw) > 0:
-                matched_sz = float(matched_sz_raw) / self._CLOB_BASE_UNITS
+                # H-V6-15: no divide — this endpoint returns shares directly.
+                matched_sz = float(matched_sz_raw)
             else:
                 matched_sz = total_sz
 

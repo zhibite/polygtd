@@ -119,10 +119,14 @@ async def test_t1_skip_logs_when_above_price_cap(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_t1_skip_logs_when_best_bid_empty() -> None:
+async def test_t1_does_not_skip_when_best_bid_empty() -> None:
+    """After the pre-arm refactor, T1 entry is driven by midpoint, not
+    best_bid. With a valid midpoint and empty best_bid, the engine should
+    still emit ActionOpenT1 instead of silently skipping.
+    """
     eng, pc = _make_engine()
-    pc.midpoint["UP_TOKEN"] = 0.30  # would otherwise pass
-    pc.best_bid["UP_TOKEN"] = 0.0   # ← the silent skip we want to expose
+    pc.midpoint["UP_TOKEN"] = 0.30  # below cap, so entry should fire
+    pc.best_bid["UP_TOKEN"] = 0.0   # best_bid is no longer the entry gate
 
     seen: dict[str, dict[str, Any]] = {}
 
@@ -132,7 +136,12 @@ async def test_t1_skip_logs_when_best_bid_empty() -> None:
     eng._t1_skip_log = capture  # type: ignore[method-assign]
     await _drive_one_evaluate(eng)
 
-    assert "engine.t1_skip_no_bid" in seen, (
-        "T1 skip path for empty best_bid did not log — this is exactly "
-        "the production symptom we want to detect."
+    assert "engine.t1_skip_no_bid" not in seen, (
+        "T1 must not skip just because best_bid is empty; midpoint is the "
+        "entry signal after the pre-arm refactor."
     )
+    # The handler in _make_engine records actions in a closure list. Verify
+    # the action was emitted by checking the round's claimed entry state.
+    assert eng._round is not None
+    assert eng._round.position.entry_token == "UP_TOKEN"
+    assert eng._round.position.entry_side == "UP"

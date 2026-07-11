@@ -7,9 +7,8 @@ Entry point. Coordinates:
   4. MarketDiscovery — Gamma REST to find market metadata
   5. StrategyEngine — decision loop (emits typed Actions)
   6. OrderManager   — serialised order executor
-  7. UserWS        — CLOB user WS for fill / cancel events
-  8. GtdExpiryWatcher — detects expired GTD orders
-  9. HeartbeatLoop  — independent keepalive
+  7. TierWatcher    — one per in-flight GTD, polls balance + cancels
+  8. HeartbeatLoop  — independent keepalive
 
 Usage:
   pip install -e .              # install dependencies
@@ -17,6 +16,17 @@ Usage:
   python -m src.main            # start bot
 
 All trading is live. DRY_RUN has been removed.
+
+H-NEW-2026-07-11 refactor:
+  - BUY/TP GTDs post at the **strategy price exactly** (no orderbook snap).
+  - Trigger lines use `PRICE_PRE_MARGIN` to pre-arm GTDs early:
+      BUY : mid <= strategy_price * (1 + margin)  → post at strategy_price
+      SELL: mid >= strategy_price * (1 - margin)  → post at strategy_price
+  - Each GTD is monitored by a TierWatcher (token-balance polling) that
+    cancels the GTD once enough shares have been filled, when the GTD
+    expires, or when the next tier's zone has been crossed.
+  - The orderbook (WS bba + REST /book fallback) is no longer consulted
+    on the BUY/SELL paths — only the midpoint is used for triggering.
 """
 from __future__ import annotations
 
@@ -33,6 +43,7 @@ from src.execution.clob_client import CLOBClient
 from src.execution.gtd_expiry_watcher import GtdExpiryWatcher
 from src.execution.heartbeat import HeartbeatLoop
 from src.execution.order_manager import OrderManager
+from src.execution.tier_watcher import TierWatcher, TierOutcome, WatcherResult
 from src.feeds.binance_spot import BinanceCache, BinanceFeed, BinanceSpotService, RingBuffer
 from src.infra.logging import configure_logging, get_logger
 from src.market.market_service import MarketService
@@ -118,6 +129,11 @@ class AppState:
         self.gtd_expiry: GtdExpiryWatcher | None = None
         self.decision_loop: DecisionLoop | None = None
         self.clob: CLOBClient | None = None  # reference for fill_callback wiring
+        # H-NEW-2026-07-11: ActionRouter reference (set in __init__ of
+        # ActionRouter). _on_new_round uses it to stop all TierWatchers
+        # before the next round starts so stale watcher callbacks cannot
+        # mutate the new round's position state.
+        self.router = None
         self.pm_client: PolymarketClient | None = None
         self.market_svc: MarketService | None = None
         self.wm: WindowManager | None = None  # window lifecycle manager
@@ -141,10 +157,170 @@ STATE = AppState()
 # ---------------------------------------------------------------------------
 
 class ActionRouter:
-    """Converts StrategyEngine Actions into OrderManager calls and wires fill events."""
+    """Converts StrategyEngine Actions into OrderManager calls and wires fill events.
+
+    H-NEW-2026-07-11 refactor:
+      - BUY actions post the GTD at the engine's strategy price (no orderbook
+        snap). OrderManager.place_buy_by_strategy_price handles this.
+      - TP actions post a single GTD SELL at the engine's tp_target. No more
+        FAK fallback — the TierWatcher cancels the residual if mid never
+        reaches tp_target.
+      - For every GTD placed, a TierWatcher is spawned. The watcher polls
+        the CLOB token balance and decides when to cancel the GTD (filled,
+        expired, or crossed-into-next-tier).
+    """
 
     def __init__(self, state: AppState) -> None:
         self._state = state
+        # Strong refs to the spawned TierWatchers per (round, tier). Lets us
+        # cancel them on round-end without losing the references.
+        self._watchers: dict[tuple[int, int], TierWatcher] = {}
+        self._tp_watchers: dict[int, TierWatcher] = {}
+        # Convenience handle so other modules (e.g. _on_new_round cleanup)
+        # can call stop_all_watchers() without going through the engine.
+        state.router = self
+
+    # ------------------------------------------------------------------
+    # TierWatcher lifecycle helpers
+    # ------------------------------------------------------------------
+
+    def _spawn_tier_watcher(
+        self,
+        round_start_ts: int,
+        tier: int,
+        server_order_id: str,
+        token_id: str,
+        strategy_price: float,
+        size_expected: float,
+        expires_at: float,
+        cross_threshold: float | None = None,
+    ) -> TierWatcher:
+        """Spawn a TierWatcher for a BUY tier's GTD and remember it.
+
+        `cross_threshold` = the next tier's pre-arm fire line. When the
+        watched token's mid drops at or below this line, the watcher
+        cancels the GTD early so the next tier can fire cleanly.
+        """
+        cfg = strategy()
+        eng = self._state.engine
+
+        async def on_done(result: WatcherResult) -> None:
+            eng = self._state.engine
+            if not eng or not eng._round:
+                return
+            tier_snap = eng._round.position.tiers[tier - 1]
+            eng._round.position.apply_tier_watcher_result(
+                tier_snap, result.outcome.value, result.filled_qty,
+            )
+
+        async def mid_provider() -> float:
+            return self._state.price_cache.get_midpoint(token_id)
+
+        def is_active() -> bool:
+            eng = self._state.engine
+            return bool(eng and eng._round and eng._round.round_start_ts == round_start_ts)
+
+        watcher = TierWatcher(
+            clob=self._state.clob,
+            server_order_id=server_order_id,
+            token_id=token_id,
+            side="BUY",
+            strategy_price=strategy_price,
+            expected_size=size_expected,
+            expires_at=expires_at,
+            poll_s=cfg.TIER_WATCHER_POLL_S,
+            fill_ratio=cfg.TIER_WATCHER_FILL_RATIO,
+            cross_threshold=cross_threshold,
+            mid_price_provider=mid_provider,
+            on_complete=on_done,
+            is_still_active=is_active,
+        )
+        task = watcher.start()
+        # Keep a strong ref so the task cannot be GC'd before its first await.
+        self._state._bg_tasks.add(task)
+        task.add_done_callback(self._state._bg_tasks.discard)
+        self._watchers[(round_start_ts, tier)] = watcher
+        # Mark the tier as "being watched" so the engine's mutex holds.
+        if eng and eng._round:
+            tier_snap = eng._round.position.tiers[tier - 1]
+            tier_snap.watching = True
+        return watcher
+
+    def _spawn_tp_watcher(
+        self,
+        round_start_ts: int,
+        server_order_id: str,
+        token_id: str,
+        tp_price: float,
+        size: float,
+        expires_at: float,
+    ) -> TierWatcher:
+        """Spawn a TierWatcher for a TP SELL GTD."""
+        cfg = strategy()
+        eng = self._state.engine
+
+        async def on_done(result: WatcherResult) -> None:
+            eng = self._state.engine
+            if not eng or not eng._round:
+                return
+            pos = eng._round.position
+            # Treat a watcher complete as a TP fill (full or partial).
+            filled_qty = result.filled_qty
+            if result.outcome in (
+                TierOutcome.FILLED,
+                TierOutcome.OVER_FILLED,
+                TierOutcome.EXPIRED,
+                TierOutcome.CROSSED,
+                TierOutcome.CANCELLED,
+            ) and filled_qty > 0:
+                # record_tp_fill reduces _total_qty / _total_cost and
+                # clears _tp_inflight.
+                pos.record_tp_fill(result.server_order_id, result.strategy_price, filled_qty)
+            else:
+                # No fill (zero qty) → just clear the mutex so the next
+                # tick can re-arm TP.
+                pos._tp_inflight = False
+
+        async def mid_provider() -> float:
+            return self._state.price_cache.get_midpoint(token_id)
+
+        def is_active() -> bool:
+            eng = self._state.engine
+            return bool(eng and eng._round and eng._round.round_start_ts == round_start_ts)
+
+        watcher = TierWatcher(
+            clob=self._state.clob,
+            server_order_id=server_order_id,
+            token_id=token_id,
+            side="SELL",
+            strategy_price=tp_price,
+            expected_size=size,
+            expires_at=expires_at,
+            poll_s=cfg.TIER_WATCHER_POLL_S,
+            fill_ratio=cfg.TIER_WATCHER_FILL_RATIO,
+            cross_threshold=None,  # TP has no "next tier" — exits cleanly on fill
+            mid_price_provider=mid_provider,
+            on_complete=on_done,
+            is_still_active=is_active,
+        )
+        task = watcher.start()
+        self._state._bg_tasks.add(task)
+        task.add_done_callback(self._state._bg_tasks.discard)
+        self._tp_watchers[round_start_ts] = watcher
+        return watcher
+
+    async def stop_all_watchers(self) -> None:
+        """Cancel every active watcher (called on shutdown / round-end)."""
+        for w in list(self._watchers.values()):
+            await w.stop()
+        self._watchers.clear()
+        for w in list(self._tp_watchers.values()):
+            await w.stop()
+        self._tp_watchers.clear()
+
+    # ------------------------------------------------------------------
+    # Action dispatch
+    # ------------------------------------------------------------------
 
     async def __call__(self, action: Action) -> None:
         eng = self._state.engine
@@ -156,74 +332,75 @@ class ActionRouter:
         round_ts = self._state.round_start_ts
 
         if isinstance(action, ActionOpenT1):
-            # H-V4-1 fix: route via `place_buy_by_notional` so the share
-            # count is computed AFTER the orderbook price snap instead of
-            # before. This prevents each tier from over-spending by 1-3%
-            # versus the planned `notional`.
-            order = await om.place_buy_by_notional(
+            # H-NEW-2026-07-11: post at strategy_price exactly (the price the
+            # engine decided to enter at). No orderbook fetch, no half-tick
+            # snap. Size = notional / strategy_price.
+            order = await om.place_buy_by_strategy_price(
                 token_id=action.token,
+                strategy_price=action.price,
                 notional=action.notional,
-                ref_price=action.price,
                 round_start_ts=round_ts,
                 tier_name="T1",
                 tick_size=tick_size,
             )
             if order:
-                # Update engine state
-                eng._round.position.entry_side = action.side
-                eng._round.position.entry_token = action.token
                 expires = order.expires_at
-                # Use adjusted_price (the price actually sent to CLOB, after bid+BUY_STEP)
-                # so size_expected matches the notional CLOB will charge us with.
                 eng.bind_server_order_id(
                     tier=1,
                     server_order_id=order.server_order_id or "",
                     token_id=action.token,
                     expires_at=expires,
                     expected_price=order.price,
-                    # M-1: pass the CLOB-accepted placed_size so size_expected
-                    # is exact (avoid notional/price round-trip mismatch).
                     placed_size=order.placed_size if order.placed_size > 0 else None,
                 )
-                # Wire fill callback so engine knows when order fills
                 self._state.clob.fill_callback = self._make_fill_callback()
+                size_expected = order.placed_size if order.placed_size > 0 else (action.notional / action.price)
+                # T2 fire line: trigger_price(T2) * (1 + margin). We don't
+                # know the realised baseline yet, so use the design
+                # baseline (= action.price itself for T1; the engine sets
+                # baseline_target_price to action.price via bind).
+                # The watcher will compare against the live midpoint; if
+                # the next-tier zone hasn't dropped yet, it just keeps
+                # waiting — no harm.
+                margin = float(strategy().PRICE_PRE_MARGIN or 0.0)
+                t2_design_price = action.price * (1.0 - strategy().TIER2_DROP_PCT)
+                t2_fire = t2_design_price * (1.0 + margin)
+                self._spawn_tier_watcher(
+                    round_start_ts=round_ts,
+                    tier=1,
+                    server_order_id=order.server_order_id or "",
+                    token_id=action.token,
+                    strategy_price=order.price,
+                    size_expected=size_expected,
+                    expires_at=expires,
+                    cross_threshold=t2_fire,
+                )
                 log.info(
                     "router.t1_placed",
                     side=action.side,
                     token=action.token[:16],
-                    price=order.price,
+                    strategy_price=action.price,
                     size=order.size,
                     server_id=order.server_order_id or "none",
+                    watcher=True,
                 )
             else:
-                # B-V4-2 fix: H-1 v2 wrote `entry_token` / `entry_side`
-                # BEFORE awaiting the handler. If `place_buy` returns None
-                # (CLOB post error / size below 5 tokens / poll timeout),
-                # the engine is now stuck in a state where the round thinks
-                # T1 was attempted but no TrackedOrder / server_id was bound.
-                # Subsequent `_evaluate` would skip both `_check_t1_entry`
-                # (entry_token is set) and `_check_average_down`
-                # (baseline_set is False) — the round silently idles until
-                # the next window transition. Roll back the engine state so
-                # a future evaluate can re-attempt or the next round starts
-                # cleanly.
                 log.error(
                     "router.t1_failed",
                     side=action.side,
                     token=action.token[:16],
-                    price=action.price,
+                    strategy_price=action.price,
                     notional=action.notional,
-                    reason="om.place_buy returned None",
+                    reason="om.place_buy_by_strategy_price returned None",
                 )
                 eng._round.position.entry_side = None
                 eng._round.position.entry_token = None
 
         elif isinstance(action, ActionOpenTN):
-            # H-V4-1 fix: same as T1 — size after the price snap.
-            order = await om.place_buy_by_notional(
+            order = await om.place_buy_by_strategy_price(
                 token_id=action.token,
+                strategy_price=action.price,
                 notional=action.notional,
-                ref_price=action.price,
                 round_start_ts=round_ts,
                 tier_name=f"T{action.tier}",
                 tick_size=tick_size,
@@ -236,58 +413,66 @@ class ActionRouter:
                     token_id=action.token,
                     expires_at=expires,
                     expected_price=order.price,
-                    # M-1: use CLOB-accepted placed_size for size_expected.
                     placed_size=order.placed_size if order.placed_size > 0 else None,
                 )
                 self._state.clob.fill_callback = self._make_fill_callback()
+                size_expected = order.placed_size if order.placed_size > 0 else (action.notional / action.price)
+                # Next tier's fire line — only meaningful for T2/T3 (T4 is last).
+                cross_thr: float | None = None
+                if action.tier < 4:
+                    cfg = strategy()
+                    margin = float(cfg.PRICE_PRE_MARGIN or 0.0)
+                    drops = cfg.tier_drop_pcts
+                    if action.tier < len(drops) and drops[action.tier] is not None:
+                        next_design = order.price * (1.0 - drops[action.tier])
+                        cross_thr = next_design * (1.0 + margin)
+                self._spawn_tier_watcher(
+                    round_start_ts=round_ts,
+                    tier=action.tier,
+                    server_order_id=order.server_order_id or "",
+                    token_id=action.token,
+                    strategy_price=order.price,
+                    size_expected=size_expected,
+                    expires_at=expires,
+                    cross_threshold=cross_thr,
+                )
                 log.info(
                     "router.tN_placed",
                     tier=action.tier,
                     token=action.token[:16],
-                    price=order.price,
+                    strategy_price=action.price,
                     size=order.size,
                     server_id=order.server_order_id or "none",
+                    watcher=True,
                 )
             else:
-                # B-V4-2 fix: tier.placed / tier.server_order_id were not
-                # mutated (those happen inside `bind_server_order_id`), but
-                # `_check_average_down` already passed the `if tier.placed:
-                # continue` check — meaning a subsequent evaluate in the
-                # same 250ms tick could re-trigger T_N. Reset the tier
-                # state and log the failure.
                 log.error(
                     "router.tN_failed",
                     tier=action.tier,
                     token=action.token[:16],
-                    price=action.price,
+                    strategy_price=action.price,
                     notional=action.notional,
-                    reason="om.place_buy returned None",
+                    reason="om.place_buy_by_strategy_price returned None",
                 )
                 tier_snap = getattr(eng._round.position, f"tier{action.tier}", None)
                 if tier_snap is not None:
                     tier_snap.placed = False
+                    tier_snap.watching = False
                     tier_snap.server_order_id = None
                     tier_snap.expires_at = 0.0
 
         elif isinstance(action, ActionTakeProfit):
-            # Two-stage TP: GTD limit sell at bid (maker), then FAK fallback
-            # after ~75 seconds for any residual qty. Avoids the "FAK reload
-            # loop" where a shallow book lets TP fill part-by-part and each
-            # round walks down one more bid level.
-            #
-            # H-1 fix: place_tp_with_fallback may take 75–90s end-to-end.
-            # Awaiting it directly stalls the action router and the entire
-            # _evaluate loop. Fire the placement as a background task and
-            # bind the resulting server_order_ids back into the engine so
-            # subsequent fill events route into Position.record_tp_fill
-            # (B-2 fix). The in-flight mutex (`pos._tp_inflight`) remains
-            # the single source of truth for "TP is in flight, do not
-            # re-arm yet" — it is cleared either by the deduper-driven
-            # fill callback or by the failure-recovery branch at the end
-            # of the spawned task.
+            # H-NEW-2026-07-11: a single GTD SELL at tp_target, monitored
+            # by a TierWatcher. No FAK fallback — when the GTD expires
+            # un-filled, the watcher reports EXPIRED and we clear the
+            # mutex so the next tick can re-arm if mid is still above
+            # the pre-arm fire line.
             async def _tp_runner() -> None:
                 try:
-                    gtd, fak, gtd_err, fak_err = await om.place_tp_with_fallback(
+                    if not eng._round:
+                        return
+                    pos = eng._round.position
+                    order = await om.place_gtd_sell_at_price(
                         token_id=action.token,
                         size=action.qty,
                         price=action.price,
@@ -295,91 +480,42 @@ class ActionRouter:
                         tier_name="TP",
                         tick_size=tick_size,
                     )
-                except Exception as exc:
-                    # H-1 fix: any uncaught exception in the TP runner
-                    # would leave pos._tp_inflight stuck True forever.
-                    # Release the mutex and surface the crash so the next
-                    # tick can decide whether to re-arm.
-                    log.exception("router.tp_runner_crashed", error=str(exc))
-                    if eng._round:
-                        pos = eng._round.position
+                    if not order:
                         pos._tp_inflight = False
-                        # B-V5-2 fix: clear _tp_snapshots so any stale entries
-                        # from a partially-completed TP run cannot leak across
-                        # retries / round boundaries. Without this, the dict
-                        # grows monotonically (one entry per TP attempt) over
-                        # a long session.
-                        pos._tp_snapshots.clear()
-                    return
-
-                if not eng._round:
-                    return
-                pos = eng._round.position
-                if gtd and gtd.server_order_id:
+                        log.warning(
+                            "router.tp_failed",
+                            token=action.token[:16],
+                            strategy_price=action.price,
+                            qty=action.qty,
+                            reason="om.place_gtd_sell_at_price returned None",
+                        )
+                        return
                     pos.register_tp(
-                        server_order_id=gtd.server_order_id,
+                        server_order_id=order.server_order_id or "",
                         token_id=action.token,
                         target_qty=action.qty,
                     )
-                if fak and fak.server_order_id:
-                    # FAK target_qty is the residual; if it returned a
-                    # tracked order the actual sold qty may differ.
-                    pos.register_tp(
-                        server_order_id=fak.server_order_id,
+                    self._spawn_tp_watcher(
+                        round_start_ts=round_ts,
+                        server_order_id=order.server_order_id or "",
                         token_id=action.token,
-                        target_qty=fak.size,
+                        tp_price=order.price,
+                        size=action.qty,
+                        expires_at=order.expires_at,
                     )
-
-                # H-4 fix: classify outcome for observability. The mutex
-                # policy is decided by whether we observed any tracked
-                # order; engine-side fill callbacks will clear the mutex
-                # for partial/full fills. Only a "no order posted at all"
-                # outcome releases the mutex here.
-                no_order_posted = (gtd is None and fak is None)
-                if no_order_posted:
-                    pos._tp_inflight = False
-                    log.warning(
-                        "router.tp_failed",
-                        token=action.token[:16],
-                        price=action.price,
-                        qty=action.qty,
-                        gtd_err=gtd_err,
-                        fak_err=fak_err,
-                    )
-                    return
-
-                if gtd and not fak:
                     log.info(
-                        "router.tp_gtd_only",
+                        "router.tp_placed",
                         token=action.token[:16],
-                        price=action.price,
+                        strategy_price=action.price,
                         qty=action.qty,
-                        gtd_id=(gtd.server_order_id or "")[:16],
+                        server_id=order.server_order_id or "none",
+                        watcher=True,
                     )
-                elif fak and not gtd:
-                    log.info(
-                        "router.tp_fak_only",
-                        token=action.token[:16],
-                        price=action.price,
-                        qty=action.qty,
-                        fak_id=(fak.server_order_id or "")[:16],
-                        gtd_err=gtd_err,
-                        fak_err=fak_err,
-                    )
-                else:
-                    log.info(
-                        "router.tp_full",
-                        token=action.token[:16],
-                        price=action.price,
-                        qty=action.qty,
-                        gtd_id=(gtd.server_order_id or "")[:16] if gtd else "",
-                        fak_id=(fak.server_order_id or "")[:16] if fak else "",
-                    )
+                except Exception as exc:
+                    log.exception("router.tp_runner_crashed", error=str(exc))
+                    if eng._round:
+                        eng._round.position._tp_inflight = False
 
-            # B-3 v2 fix: retain a strong reference to the spawned task so it
-            # cannot be GC'd before its first `await` yields control. Mirrors
-            # the cleanup pattern in `GtdExpiryWatcher._bg_tasks` — when the
-            # task finishes, it removes itself from the set.
             task = asyncio.create_task(_tp_runner())
             self._state._bg_tasks.add(task)
             task.add_done_callback(self._state._bg_tasks.discard)
@@ -511,9 +647,18 @@ async def _on_new_round(round_start_ts: int) -> None:
     """
     state = STATE
 
-    # End previous round
+        # End previous round
     if state.round_start_ts > 0:
         prev = state.round_start_ts
+        # H-NEW-2026-07-11: stop any active TierWatchers so they don't
+        # fire after the round has rolled over. Watchers that already
+        # finished are no-ops.
+        router = getattr(state, "router", None)
+        if router is not None:
+            try:
+                await router.stop_all_watchers()
+            except Exception as exc:
+                log.warning("router.stop_all_watchers.error", error=str(exc))
         if state.engine:
             await state.engine.on_round_end()
         if state.order_manager:
@@ -771,8 +916,35 @@ async def _status_loop() -> None:
         down_last = s.price_cache.get_midpoint(down_token) if down_token else 0
 
         next_in = wm.seconds_until_next() if wm else 0
-        window_end = wm.next_round_start() if wm else 0
-        window_end_str = datetime.fromtimestamp(window_end, tz=timezone.utc).strftime("%H:%M:%S")
+        period_s = wm.window_period_s() if wm else 900
+        # H-V6-15: STATUS no longer shows absolute window_end timestamp —
+        # operators found it useless (had to mentally diff against current
+        # time) and the rich status (e.g. `window_end=08:15:00(272s)`)
+        # crowded out the more useful "are we still inside the T1 entry
+        # window?" signal. Replace with:
+        #   - `remain=Xs/Ys`  — X = seconds left in current window,
+        #                        Y = total window length (e.g. 900 for BTC 15m)
+        #   - `window=[IN_T1|PAST_T1]` — IN_T1 means T1 entry is still
+        #                                allowed (elapsed < T1_ENTRY_WINDOW_S);
+        #                                PAST_T1 means we've crossed the
+        #                                time gate and no fresh T1 will fire
+        #                                this window.
+        # Clamp `next_in` to [0, period_s] because the 5s STATUS interval
+        # can sample right at the rollover where the boundary calc briefly
+        # returns a tiny negative number.
+        remain_s = max(0, min(period_s, next_in))
+        elapsed_s = max(0, period_s - remain_s)
+        t1_entry_window_s = strategy().T1_ENTRY_WINDOW_S
+        # `ENTER_OK` is the canonical IN_T1 label — it is the same predicate
+        # the engine uses inside `_check_t1_entry` to gate entry, so STATUS
+        # and engine are guaranteed to agree.
+        t1_status = "IN_T1" if elapsed_s <= t1_entry_window_s else "PAST_T1"
+        # When the window is within 1s of ending, STATUS flips to `END` so
+        # operators immediately see "this round is over" without having to
+        # read the seconds count.
+        if remain_s < 1.0:
+            t1_status = "END"
+        window_str = f"window=[{t1_status}] remain={remain_s:.0f}s/{period_s:.0f}s"
 
         # Position state
         pos_str = ""
@@ -830,7 +1002,7 @@ async def _status_loop() -> None:
 
         log.info(
             f"STATUS  binance={bc:,.1f}  {gate_str}"
-            f"  window_end={window_end_str}({next_in:.0f}s)  "
+            f"  {window_str}  "
             f"UP={up_last:.4f}  DOWN={down_last:.4f}{bid_str}{pos_str}"
         )
 
@@ -938,7 +1110,7 @@ async def main() -> None:
         poll_interval_s=2.0,
     )
 
-    # ── Strategy engine ──────────────────────────────────────────────────
+    # ── Action router + Strategy engine ──────────────────────────────────
     router = ActionRouter(s)
     s.engine = StrategyEngine(s.binance_cache, s.price_cache, router)
 

@@ -313,6 +313,101 @@ class OrderManager:
     # Place BUY (GTD)
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Place BUY (GTD) at an EXACT strategy price (no orderbook snap)
+    # ------------------------------------------------------------------
+
+    async def place_buy_by_strategy_price(
+        self,
+        token_id: str,
+        strategy_price: float,
+        notional: float,
+        round_start_ts: int,
+        tier_name: str,
+        tick_size: float,
+        lifetime_s: int | None = None,
+    ) -> TrackedOrder | None:
+        """Place a GTD BUY at the engine's exact strategy price.
+
+        Refactor (H-NEW-2026-07-11): replaces `place_buy_by_notional`. The
+        previous implementation called `_adjust_buy_price` (REST /book fetch
+        to snap `bid + half_tick`) so the order would fill faster. We
+        removed the orderbook fetch entirely:
+
+          - All BUY GTDs are now posted at the **strategy price** (no
+            adjustment). The new trigger model pre-arms the GTD early
+            (strategy_price * (1 + margin)) so price typically CROSSES
+            through strategy_price on the way down — the maker sits on
+            the book at the limit price and gets filled when taker hits it.
+          - No REST /book call → faster place_buy (~50 ms vs ~500 ms).
+          - One less moving part in the data path.
+
+        `size = notional / strategy_price`. This is rounded down to the
+        tick granularity by CLOBClient; the TrackedOrder.placed_size
+        captures the actual accepted shares so the engine knows exactly
+        how many shares correspond to "this tier is complete".
+
+        Lifetime defaults to `GTD_LIFETIME_S` from config (180 s, the CLOB
+        minimum). TierWatcher tracks balance + GTD expiry after this
+        returns; no client-side poll loop here.
+        """
+        from src.execution.clob_client import CLOBClient as _CC
+        lifetime = max(int(lifetime_s or self._s.GTD_LIFETIME_S), _CC.GTD_MIN_SEC + 1)
+
+        price = float(strategy_price)
+        if price <= 0:
+            log.warning(
+                "order_manager.buy_by_strategy_price.no_price",
+                token=token_id[:16], strategy_price=strategy_price,
+            )
+            return None
+
+        size = notional / price
+        return await self.place_buy(
+            token_id=token_id,
+            price=price,
+            size=size,
+            round_start_ts=round_start_ts,
+            tier_name=tier_name,
+            tick_size=tick_size,
+            lifetime_s=lifetime,
+            # Skip the orderbook snap — keep the exact strategy price.
+            price_lock=True,
+        )
+
+    async def place_gtd_sell_at_price(
+        self,
+        token_id: str,
+        size: float,
+        price: float,
+        round_start_ts: int,
+        tier_name: str,
+        tick_size: float,
+        lifetime_s: int | None = None,
+    ) -> TrackedOrder | None:
+        """Place a GTD SELL at an exact price (no orderbook snap).
+
+        Refactor (H-NEW-2026-07-11): symmetric with
+        `place_buy_by_strategy_price`. The previous implementation
+        snapped to `ask - SELL_STEP`; we now post at the engine's exact
+        target. TierWatcher handles the rest.
+
+        Used by the TP path: `price` = `tp_target` so the actual sell
+        price equals the trigger-condition price.
+        """
+        from src.execution.clob_client import CLOBClient as _CC
+        gtd_lifetime = max(int(lifetime_s or TP_GTD_LIFETIME_S), _CC.GTD_MIN_SEC + 1)
+        return await self.place_gtd_sell(
+            token_id=token_id,
+            size=size,
+            price=float(price),
+            round_start_ts=round_start_ts,
+            tier_name=tier_name,
+            tick_size=tick_size,
+            lifetime_s=gtd_lifetime,
+            price_lock=True,   # use engine's exact price (no ask snap)
+        )
+
     async def place_buy_by_notional(
         self,
         token_id: str,
@@ -322,6 +417,13 @@ class OrderManager:
         tier_name: str,
         tick_size: float,
     ) -> TrackedOrder | None:
+        """[DEPRECATED] Use `place_buy_by_strategy_price` instead.
+
+        Kept for tests / callers that pre-compute the limit price from the
+        orderbook. The refactor removed this from the production BUY path
+        — see H-NEW-2026-07-11. Behaves identically to the previous
+        implementation so legacy tests continue to pass.
+        """
         """Place a GTD BUY sized by USD notional rather than share count.
 
         H-V4-1 fix (audit v4): router used to compute
@@ -366,6 +468,8 @@ class OrderManager:
         round_start_ts: int,
         tier_name: str,
         tick_size: float,
+        lifetime_s: int | None = None,
+        price_lock: bool = False,
     ) -> TrackedOrder | None:
         """Place a GTD BUY order. Returns TrackedOrder or None.
 
@@ -402,7 +506,13 @@ class OrderManager:
         # the CLOB twice and charged the user 2x the intended notional.
         # The second block was a leftover copy-paste; the dedup is enforced
         # by `tests/test_audit_fixes_2026_07_11.py::test_b1_v2_buy_single_call`.
-        adjusted_price = await self._adjust_buy_price(token_id, price, tick_size)
+        # H-NEW-2026-07-11: when `price_lock=True` (the new production path
+        # via `place_buy_by_strategy_price`), we skip the orderbook fetch
+        # entirely and post at the engine's exact strategy price.
+        if price_lock:
+            adjusted_price = float(price)
+        else:
+            adjusted_price = await self._adjust_buy_price(token_id, price, tick_size)
 
         async with self._lock:
             result: FillResult = await self._clob.place_gtd_buy(

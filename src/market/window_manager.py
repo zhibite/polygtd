@@ -139,6 +139,28 @@ class WindowManager:
     def seconds_until_next(self) -> float:
         return self.next_round_start() - time.time()
 
+    def window_period_s(self) -> int:
+        """Total seconds in a window (e.g. 900 for BTC 15m).
+
+        H-V6-15: surfaced publicly so STATUS log can show
+        `remain=Xs/Ys` (X=seconds left, Y=window length) without having
+        to know the asset-specific configuration. Operators reading the
+        STATUS line can immediately tell how close the current window
+        is to closing.
+        """
+        return self._round_period
+
+    def current_round_start(self) -> int:
+        """The unix timestamp at which the current window opened.
+
+        H-V6-15: needed by STATUS to compute "seconds since window
+        start" (= elapsed in current window) for the T1-entry-window
+        indicator. Returning the same boundary as `seconds_until_next`
+        uses, so `current_round_start() + window_period_s() ==
+        next_round_start()`.
+        """
+        return self._round_start_of(time.time())
+
     async def _run(self) -> None:
         """
         Drive window round boundaries.

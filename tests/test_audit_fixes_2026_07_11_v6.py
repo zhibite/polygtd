@@ -85,19 +85,18 @@ class _StubCLOB:
 @pytest.mark.parametrize(
     "raw_size_matched, expected_shares",
     [
-        ("5710000", 5.71),       # 5.71 shares -> 5_710_000 micro-shares
-        ("100000000", 100.0),    # 100 shares
-        ("1000", 0.001),         # 0.001 shares (minimum size)
-        ("0", 0.0),              # unfilled
+        ("5710000", 5710000.0),   # raw shares returned by GET /data/order/<id>
+        ("100000000", 100000000.0),
+        ("1000", 1000.0),
+        ("0", 0.0),
     ],
 )
 def test_c1_get_order_filled_size_divides_base_units(
     raw_size_matched: str, expected_shares: float
 ) -> None:
     """
-    Audit C-1: a value of "5710000" returned from /data/order/<id>
-    represents 5.71 shares, not 5.71 million shares. The method must
-    divide by 1_000_000 before returning.
+    H-V6-15 / Audit C-1 (superseded): this endpoint returns size_matched
+    in shares, not 6-decimal base units. Do NOT divide by 1_000_000.
     """
     fake = _StubCLOB({"size_matched": raw_size_matched})
     out = asyncio.run(fake.get_order_filled_size("0xabc"))
@@ -107,12 +106,11 @@ def test_c1_get_order_filled_size_divides_base_units(
 
 
 def test_c1_get_order_filled_size_accepts_alternate_field_names() -> None:
-    """C-1 fallback chain tries sizeMatched / amountMatched / filledSize."""
-    # All are 6-decimal base units.
+    """H-V6-15 / C-1 fallback chain tries sizeMatched / amount_matched / filledSize."""
     cases = [
-        ({"sizeMatched": "5710000"}, 5.71),
-        ({"amount_matched": "5710000"}, 5.71),
-        ({"filledSize": "5710000"}, 5.71),
+        ({"sizeMatched": "5710000"}, 5710000.0),
+        ({"amount_matched": "5710000"}, 5710000.0),
+        ({"filledSize": "5710000"}, 5710000.0),
     ]
     for payload, expected in cases:
         fake = _StubCLOB(payload)

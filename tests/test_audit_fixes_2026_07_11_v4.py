@@ -253,9 +253,12 @@ class _StubEngine:
 
 
 class _FailingOM:
-    """place_buy / place_gtd_sell / place_sell all return None."""
+    """place_buy / place_gtd_sell / place_sell / place_buy_by_strategy_price all return None."""
 
     async def place_buy_by_notional(self, **kw):
+        return None
+
+    async def place_buy_by_strategy_price(self, **kw):
         return None
 
     async def place_buy(self, **kw):
@@ -591,6 +594,7 @@ async def test_m_v4_2_valid_inflight_tier_still_skipped() -> None:
     pos._total_qty = 5.0
     pos._total_cost = 2.0
     pos.tier2.placed = True
+    pos.tier2.watching = True
     pos.tier2.server_order_id = "0xt2-live"  # valid mapping
     eng._round = type("R", (), {"position": pos})()
     eng._gate = _StubGate2()

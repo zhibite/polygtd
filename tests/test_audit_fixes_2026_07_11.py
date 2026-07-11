@@ -119,10 +119,15 @@ class _SlowClob:
         self.calls_started = 0
         self.calls_completed = 0
 
-    async def place_tp_with_fallback(self, *a, **kw):
+    async def place_gtd_sell_at_price(self, *a, **kw):
         self.calls_started += 1
         await asyncio.sleep(0.05)  # yield so GC has a chance to run
         self.calls_completed += 1
+        return (None, None, "gtd_post_failed", "fak_post_failed")
+
+    async def place_tp_with_fallback(self, *a, **kw):
+        # fallback path used when TP runner does not call
+        # place_gtd_sell_at_price directly
         return (None, None, "gtd_post_failed", "fak_post_failed")
 
 
@@ -203,6 +208,7 @@ async def test_h1_v2_entry_token_set_before_handler_await() -> None:
     set so a concurrent _evaluate tick cannot emit a duplicate ActionOpenT1.
     """
     eng = StrategyEngine.__new__(StrategyEngine)
+    eng._t1_cap_reject_first_seen = {}
     pos = Position()
     eng._round = type("R", (), {
         "position": pos,

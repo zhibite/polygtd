@@ -164,6 +164,25 @@ class StrategySettings(BaseSettings):
     # Slippage for FAK sell orders (as a fraction, e.g. 0.02 = 2%)
     SELL_SLIPPAGE_PCT: float = 0.02
 
+    # ── GTD pre-arm margin (核心新参数) ────────────────────────────────────
+    # GTD 挂单**时机**提前量，按策略价的比例计算。
+    #   BUY  : 触发线 = strategy_price * (1 + PRICE_PRE_MARGIN)
+    #           例 PRICE_PRE_MARGIN=0.10, strategy_price=0.40 → mid<=0.44 时挂 0.40
+    #   SELL : 触发线 = strategy_price * (1 - PRICE_PRE_MARGIN)
+    #           例 PRICE_PRE_MARGIN=0.10, tp_target=0.40 → mid>=0.36 时挂 0.40
+    # 设计目的：把 GTD 提前挂在订单簿上，等市价回到策略价成交。
+    # 挂单价 = strategy_price（不变），价格提前量只用于触发判断。
+    PRICE_PRE_MARGIN: float = 0.10
+
+    # TierWatcher 轮询 CLOB token balance 的间隔（秒）
+    # 主动查询持仓 share 数 → 取消未填满的 GTD → 让下一档继续推进。
+    TIER_WATCHER_POLL_S: float = 1.5
+
+    # TierWatcher 判定「此档基本够了」的比例阈值（占 size_expected）。
+    # 到 0.995 即可认为够量，主动 cancel GTD（防止多填超 notional）。
+    # 触发条件：get_token_balance(token_id) >= size_expected * this_ratio
+    TIER_WATCHER_FILL_RATIO: float = 0.995
+
     # ── Derived helpers ───────────────────────────────────────────────────
 
     @property

@@ -179,7 +179,9 @@ class AsyncNoop:
 
 
 class _CrashyCLOB:
-    async def place_tp_with_fallback(self, *a, **kw):
+    # H-NEW-2026-07-11: replaced place_tp_with_fallback with
+    # place_gtd_sell_at_price on the TP path.
+    async def place_gtd_sell_at_price(self, *a, **kw):
         raise RuntimeError("simulated CLOB crash")
 
 
@@ -394,8 +396,8 @@ async def test_b4_tp_trigger_fires_when_bid_meets_target() -> None:
     await eng._check_take_profit(100000.0)
     assert len(captured) == 1
     assert isinstance(captured[0], ActionTakeProfit)
-    # The price sent to the action is the bid (not mid)
-    assert captured[0].price == 0.49
+    # The price sent to the action is the TP target (not mid)
+    assert captured[0].price == 0.48
     assert pos._tp_inflight is True  # mutex armed
 
 

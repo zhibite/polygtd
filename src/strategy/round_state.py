@@ -34,29 +34,53 @@ class TierSnapshot:
     """State for a single martingale tier (T1..T4).
 
     Lifecycle:
-        placed=False   -> not yet sent
-        placed=True, filled=False -> in-flight (possibly partially filled)
-        placed=True, filled=True  -> fully filled
+        placed=False, watching=False   -> not yet sent
+        placed=True,  watching=True    -> GTD live on CLOB, watcher polling balance
+        watching=False, filled=False   -> GTD cancelled/expired, no fill
+        filled=True                    -> done (size_filled >= size_expected * 0.995)
 
-    size_filled accumulates across multiple partial fills; expected_size
-    is captured at placement time (= notional / price) so we can detect
-    when a tier is "complete enough" to flip filled=True.
+    size_filled accumulates across partial fills; filled flag only flips once
+    the expected stake has been delivered. The TierWatcher writes
+    `placed_qty` from the authoritative CLOB balance so that `is_complete`
+    reflects ground truth even when WS fill events are missed.
+
+    Two parallel paths drive `is_complete`:
+      - UserWS / CLOBClient fill callbacks → `record_fill` increments
+        `size_filled`, which feeds `is_complete`.
+      - TierWatcher → sets `filled=True` directly when the watched
+        balance crosses `expected_size * fill_ratio` (independent of fill
+        events). This is the primary path under the new model.
+
+    A tier can be "complete" via either path; both feed the same flag.
     """
 
     tier: int                         # 1, 2, 3, 4
     notional: float                   # USD amount for this tier
     placed: bool = False
+    # H-NEW-2026-07-11: True while a TierWatcher is actively polling this
+    # tier's GTD. Set when the watcher spawns, cleared when the watcher
+    # terminates. The engine uses `watching` (not `placed`) to decide
+    # whether a tier is "in flight" — a cancelled/expired GTD keeps
+    # `placed=True` for the cancel-grace window but `watching=False`.
+    watching: bool = False
     filled: bool = False
     server_order_id: str | None = None
     avg_fill_price: float | None = None
     size_filled: float = 0.0          # total shares filled (sum of partial fills)
     size_expected: float = 0.0        # expected shares = notional / price at placement
+    # H-NEW-2026-07-11: authoritative ground-truth fill count from
+    # TierWatcher polling get_token_balance. Always >= size_filled when
+    # fills were missed by the WS path. Used by `is_complete` as a
+    # second source of truth.
+    placed_qty: float = 0.0
     cost_filled: float = 0.0          # running notional of fills = Σ(px * sz)
     placed_at: float = 0.0
     expires_at: float = 0.0
     last_fill_ts: float = 0.0
     cancel_reason: str = ""
     token_id: str | None = None       # bound to the server order so fills can be matched
+    # Optional: id of the spawned TierWatcher task (for diagnostics only).
+    watcher_task: object | None = None
 
     def trigger_price(self, baseline: float) -> float | None:
         cfg = _s()
@@ -86,18 +110,22 @@ class TierSnapshot:
     def is_complete(self) -> bool:
         """True if the tier has fully filled (>= 99.5% of expected size).
 
-        M-NEW-2 review: kept the original size-based check. An additional
-        cost-based fallback was prototyped but it created false positives
-        when size_expected was inflated relative to notional (which happens
-        in unit tests that pre-set size_expected without a real CLOB post).
-        For production the 99.5% size check is sufficient — placed_size
-        (from CLOB) drives size_expected to the actual accepted share count,
-        and the cost-based assertion `cost_filled >= notional * TIER_NOTIONAL_MAX_MULT`
-        is enforced separately by `Position.tier_is_saturated` (see
-        engine._check_average_down).
+        H-NEW-2026-07-11: consults BOTH fill-callback state (`size_filled`)
+        and TierWatcher ground truth (`placed_qty`). Whichever reports
+        "complete" first wins — this guarantees `is_complete` flips even
+        when the UserWS missed fill events and only the watcher
+        observation caught it.
+
+        For SELL tiers (TP), `placed_qty` decreases over time (we are
+        selling), so we use `size_filled` only — the watcher's job is just
+        to know when to cancel the GTD (i.e. when balance hits 0).
         """
         if self.size_expected <= 0:
             return self.filled
+        # Watcher-driven path: balance >= 99.5% of expected.
+        if self.placed_qty + 1e-9 >= self.size_expected * 0.995:
+            return True
+        # Fill-callback-driven path: still kept as a backstop.
         return self.size_filled >= self.size_expected * 0.995
 
 
@@ -382,7 +410,9 @@ class Position:
         """Called when a tier receives (more) fills — supports partial fills.
 
         Strategy: size_filled and cost_filled always accumulate; filled flag
-        only flips once size_filled has reached >= 99.5% of expected_size.
+        only flips once size_filled has reached >= 99.5% of expected_size
+        (via `tier.is_complete` which also consults `placed_qty` from the
+        TierWatcher).
 
         For tier 1, baseline_price is set ONCE (on first partial fill) so
         averaging tiers can be triggered against the real cost basis.
@@ -469,8 +499,12 @@ class Position:
         We do NOT clear size_filled/cost_filled — partial fills must still
         be counted. We just reset placed so the strategy can decide whether
         to try again at the next averaging opportunity.
+
+        H-NEW-2026-07-11: also clear `watching` so the engine does not
+        treat this tier as in-flight any longer.
         """
         tier.placed = False
+        tier.watching = False
         tier.server_order_id = None
         tier.cancel_reason = reason
         log.warning(
@@ -479,6 +513,102 @@ class Position:
             size_filled=tier.size_filled,
             size_expected=tier.size_expected,
             reason=reason,
+        )
+
+    def apply_tier_watcher_result(
+        self,
+        tier: TierSnapshot,
+        outcome: str,
+        filled_qty: float,
+    ) -> None:
+        """Commit TierWatcher terminal state into the tier / position.
+
+        Called by the ActionRouter's watcher callback when a tier's GTD
+        has reached a final state (filled / expired / crossed / cancelled
+        / over_filled / error).
+
+        The watcher is the ground-truth source for "how many shares do I
+        actually hold"; this method reconciles that into:
+
+          * tier.placed_qty = max(prior, filled_qty)   # monotonic
+          * tier.filled     = True if outcome == "filled" (or over_filled)
+          * tier.watching   = False (watcher is done)
+          * position totals _total_qty / _total_cost if filled_qty >
+            tier.size_filled (catches fills missed by the WS path).
+        """
+        from src.execution.tier_watcher import TierOutcome
+
+        # Monotonic — fill events may have already incremented size_filled.
+        if filled_qty > tier.placed_qty:
+            tier.placed_qty = filled_qty
+
+        if outcome in (TierOutcome.FILLED.value, TierOutcome.OVER_FILLED.value):
+            tier.filled = True
+            # If the watcher caught fills that the WS path missed, advance
+            # position-level totals so STATUS / TP math see them.
+            if filled_qty > tier.size_filled + 1e-9:
+                # We don't know the exact per-fill price here, so use
+                # tier.avg_fill_price (set by record_fill) or the strategy
+                # price as a fallback. This is a best-effort fix-up for
+                # missed fill events; the size_filled path remains
+                # authoritative when it works.
+                fill_px = tier.avg_fill_price or 0.0
+                if fill_px <= 0 and tier.size_expected > 0 and tier.notional > 0:
+                    # Strategy price back-derivation = notional / size_expected.
+                    fill_px = tier.notional / tier.size_expected
+                if fill_px <= 0:
+                    fill_px = 0.0
+                missed = filled_qty - tier.size_filled
+                # Only add positive missed qty; never inflate.
+                if missed > 1e-9 and fill_px > 0:
+                    self._total_qty += missed
+                    self._total_cost += missed * fill_px
+                    if self._total_qty > 0:
+                        self._avg_cost = self._total_cost / self._total_qty
+                    tier.size_filled += missed
+                    tier.cost_filled += missed * fill_px
+                    log.info(
+                        "position.watcher_reconciled_missed_fills",
+                        tier=tier.tier,
+                        missed=missed,
+                        fill_px=fill_px,
+                        total_qty=self._total_qty,
+                    )
+
+            # Anchor baseline_realized on first T1 watcher fill (same as
+            # record_fill does for the size_filled path).
+            if tier.tier == 1 and tier.size_filled > 1e-9:
+                new_realized = tier.cost_filled / tier.size_filled
+                if (
+                    self.baseline_realized_price is None
+                    or abs(new_realized - self.baseline_realized_price) > 1e-9
+                ):
+                    self.baseline_realized_price = new_realized
+                self.baseline_set_realized = True
+
+        elif outcome == TierOutcome.EXPIRED.value:
+            # Cancel-after-expiry — do not mark filled (it didn't fill).
+            # keep partial fills in size_filled/cost_filled; just close out.
+            pass
+        elif outcome == TierOutcome.CROSSED.value:
+            # Cancel because mid dropped past the next tier's zone. The
+            # next tier watcher will fire from the next _evaluate tick.
+            pass
+        elif outcome in (TierOutcome.CANCELLED.value, TierOutcome.ERROR.value):
+            # External / unexpected — keep partial fills, close out.
+            pass
+
+        tier.watching = False
+
+        log.info(
+            "position.tier_watcher_done",
+            tier=tier.tier,
+            outcome=outcome,
+            filled_qty=filled_qty,
+            placed_qty=tier.placed_qty,
+            size_filled=tier.size_filled,
+            size_expected=tier.size_expected,
+            filled=tier.filled,
         )
 
     def tp_target(self) -> float | None:
