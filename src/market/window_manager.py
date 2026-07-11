@@ -27,6 +27,13 @@ log = get_logger(__name__)
 WindowCallback = Callable[[int], Awaitable[None]]
 # int = round_start_ts (Unix seconds, UTC)
 
+WindowBaselineCallback = Callable[[str, float, str], None]
+# (asset, baseline_price, source_tag) — source_tag is e.g. "window_open_kline",
+# "boot_now", or "retry_now". Synchronous callback (called from tick()); the
+# strategy layer should make any state mutation atomic.
+
+WindowContextCallback = Callable[[str, "WindowContext", "MarketInfo"], Awaitable[None]]
+
 
 class WindowManager:
     """
@@ -46,6 +53,8 @@ class WindowManager:
         binance_spot=None,
         entry_cfg=None,
         round_period_s: int = 900,
+        on_window_baseline: WindowBaselineCallback | None = None,
+        on_window_context_changed: WindowContextCallback | None = None,
     ):
         self._svc = market_svc
         self._symbols = symbols
@@ -54,6 +63,18 @@ class WindowManager:
         self._binance_spot = binance_spot
         self._entry_cfg = entry_cfg
         self._round_period = round_period_s
+        # H-V6-1 fix: synchronous callback fired with the BTC spot at each
+        # window's open, exactly once per (asset, round). The strategy layer
+        # uses this to seed its drift gate, replacing the previous median /
+        # latest-WS trade approximation that produced a baseline several
+        # seconds offset from the true window-open spot — sometimes enough
+        # to make the gate FAIL right after a round transition.
+        self._on_baseline = on_window_baseline
+        # B-V6-2 fix: async callback fired when the active WindowContext for
+        # an asset changes (window switch). The strategy layer can use this
+        # to set up per-window state without coupling to the discover_market
+        # internals.
+        self._on_ctx_changed = on_window_context_changed
         self._running = False
         self._task: asyncio.Task[None] | None = None
         self._last_round_start: int | None = None  # detect transitions
@@ -269,6 +290,25 @@ class WindowManager:
                             asset=asset, btc_price=btc_price,
                             window_start=mkt.window_start.isoformat(), age_sec=age_sec,
                         )
+                        # H-V6-1 fix: hand the window-open BTC spot to the
+                        # strategy layer exactly once per (asset, round).
+                        # Previously the gate baseline was seeded lazily via
+                        # binance_ws.last_price inside _on_new_round, which
+                        # is sampled at the moment WindowManager's poll loop
+                        # detected the boundary (1-15s late) — not at the
+                        # window boundary itself. That offset, combined with
+                        # a 0.15% drift threshold on a 64k BTC price, made
+                        # the gate FAIL every time BTC moved more than ~96
+                        # USD between the boundary and the lazy seed. Now we
+                        # fire as soon as the K-line value is backfilled.
+                        if self._on_baseline is not None:
+                            try:
+                                self._on_baseline(asset, btc_price, "window_open_kline")
+                            except Exception as exc:
+                                log.warning(
+                                    "window_mgr.baseline_callback_failed",
+                                    asset=asset, error=str(exc),
+                                )
                     else:
                         log.warning(
                             "window_mgr failed to get BTC spot at window_open",
@@ -444,3 +484,15 @@ class WindowManager:
                         "window_mgr boot-time window within grace",
                         asset=ctx.asset, age_sec=age_sec, grace_sec=grace_sec,
                     )
+
+        # B-V6-2 fix: notify subscribers that the active window context just
+        # changed. Subscribers (strategy) can use this to seed per-window
+        # state without having to walk discover_market internals.
+        if self._on_ctx_changed is not None:
+            try:
+                await self._on_ctx_changed(ctx.asset, ctx, mkt)
+            except Exception as exc:
+                log.warning(
+                    "window_mgr.ctx_changed_callback_failed",
+                    asset=ctx.asset, error=str(exc),
+                )

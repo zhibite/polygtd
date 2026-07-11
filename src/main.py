@@ -27,7 +27,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from src.config import general, binance, baseline_cfg, log_config, strategy
+from src.config import general, binance, log_config, strategy
 from src.clob_l1_auth import create_or_derive_clob_api_creds, ClobL1Error
 from src.execution.clob_client import CLOBClient
 from src.execution.gtd_expiry_watcher import GtdExpiryWatcher
@@ -52,6 +52,46 @@ from src.strategy.engine import (
 from src.strategy.loop import DecisionLoop
 
 log = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Window-open BTC baseline plumbing
+# ---------------------------------------------------------------------------
+
+def _on_window_baseline(asset: str, price: float, source: str) -> None:
+    """WindowManager -> GateKeeper bridge.
+
+    Receives the BTC spot captured at each window's open (K-line backtrack),
+    and applies it as the gate baseline. Source tag identifies the call site
+    so logs can attribute each baseline update.
+
+    Sync callback (WindowManager.tick() is async but this fires from inside
+    the synchronous portion after await fetch_at_window_open). Mutation is
+    idempotent: set_binance_baseline overwrites the existing baseline every
+    time it fires, so we add a small guard so we don't reset on every tick
+    of the same window — only the first applied value per round sticks.
+    """
+    if asset != "BTC":
+        return
+    eng = STATE.engine
+    if not eng:
+        return
+    # Idempotency: only apply when the engine's current round round_start_ts
+    # differs from the last baseline we applied. Without this, every
+    # window_discovery within the same 15-min window would reset the
+    # baseline to the same K-line value and re-flush logs.
+    if getattr(eng, "_last_applied_baseline_round_ts", None) == STATE.round_start_ts:
+        return
+    eng.set_binance_baseline(price)
+    eng._last_applied_baseline_round_ts = STATE.round_start_ts
+    log.info(
+        "gate.baseline_applied",
+        asset=asset,
+        baseline=price,
+        source=source,
+        round_start_ts=STATE.round_start_ts,
+        btc_now=STATE.binance_cache.last_price,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +145,6 @@ class ActionRouter:
 
     def __init__(self, state: AppState) -> None:
         self._state = state
-        self._pending_round: int = 0  # round_start_ts for the tier being placed
 
     async def __call__(self, action: Action) -> None:
         eng = self._state.engine
@@ -263,7 +302,14 @@ class ActionRouter:
                     # tick can decide whether to re-arm.
                     log.exception("router.tp_runner_crashed", error=str(exc))
                     if eng._round:
-                        eng._round.position._tp_inflight = False
+                        pos = eng._round.position
+                        pos._tp_inflight = False
+                        # B-V5-2 fix: clear _tp_snapshots so any stale entries
+                        # from a partially-completed TP run cannot leak across
+                        # retries / round boundaries. Without this, the dict
+                        # grows monotonically (one entry per TP attempt) over
+                        # a long session.
+                        pos._tp_snapshots.clear()
                     return
 
                 if not eng._round:
@@ -455,7 +501,13 @@ def _on_market_discovered(asset: str, mkt) -> None:
 async def _on_new_round(round_start_ts: int) -> None:
     """
     Called by WindowManager on every 15-min boundary.
-    Handles end-of-round cleanup; WindowManager.tick() is called separately by WM._run().
+
+    Handles end-of-round cleanup. WindowManager's tick() also calls
+    fetch_at_window_open() which triggers `_on_window_baseline` to seed
+    the GateKeeper — so we no longer wait for a baseline here. Returning
+    promptly is important: this callback is awaited from WM's boundary
+    poller, and the previous 5-min `compute_baseline` wait loop blocked
+    the event loop for up to 5 minutes on every round transition.
     """
     state = STATE
 
@@ -490,24 +542,11 @@ async def _on_new_round(round_start_ts: int) -> None:
         state.current_market = None
         log.warning("round.market_not_found.wm_unavailable", round_start_ts=round_start_ts)
 
-    # Notify engine of new round
+    # Notify engine of new round. Baseline is now seeded by
+    # `_on_window_baseline` (called from WM.tick after fetch_at_window_open)
+    # — see main.py / window_manager.py.
     if state.engine:
         await state.engine.on_new_round(round_start_ts, state.current_market)
-
-    # Seed initial baseline immediately so the gate opens within seconds of
-    # window start. The 5-min sampled baseline below will overwrite this if
-    # the window-start spot proves noisy, but in practice using the live spot
-    # at round transition is good enough — we just want the gate ready before
-    # T1_ENTRY_WINDOW_S (5 min) expires.
-    bc_now = state.binance_cache.last_price if state.binance_cache else 0.0
-    if state.engine and bc_now > 0:
-        state.engine.set_binance_baseline(bc_now)
-        log.info(
-            "round.baseline_seeded",
-            round_start_ts=round_start_ts,
-            baseline=bc_now,
-            source="binance_now",
-        )
 
     # Persist round start
     mkt = state.current_market
@@ -519,34 +558,6 @@ async def _on_new_round(round_start_ts: int) -> None:
         down_token=mkt.down_token if mkt else None,
         tick_size=mkt.tick_size if mkt else 0.01,
     )
-
-    # Wait for baseline window to close
-    bcfg = baseline_cfg()
-    deadline = round_start_ts + bcfg.WINDOW_S + 10
-    log.info(
-        "round.baseline_waiting",
-        round_start_ts=round_start_ts,
-        window_s=bcfg.WINDOW_S,
-        deadline=deadline,
-    )
-
-    while time.time() < deadline and state.binance_feed:
-        await asyncio.sleep(1)
-        try:
-            if state.binance_feed is None:
-                break
-            baseline_val, n_samples = state.binance_feed.compute_baseline(round_start_ts)
-            if state.engine:
-                state.engine.set_binance_baseline(baseline_val)
-            log.info(
-                "round.baseline_ready",
-                round_start_ts=round_start_ts,
-                baseline=baseline_val,
-                samples=n_samples,
-            )
-            break
-        except ValueError:
-            continue
 
 
 
@@ -631,7 +642,20 @@ async def _status_loop() -> None:
         if s.engine and s.engine._gate and bc > 0:
             gs = s.engine._gate.state(bc)
             flag = "PASS" if gs.within_limit else "FAIL"
-            gate_str = f"drift={gs.drift:.4f} [{flag}] |"
+            # H-V6-1 fix: print baseline as well as drift so the log line
+            # is self-contained — operators can sanity-check the gate
+            # without cross-referencing earlier events. The previous
+            # format only printed drift, hiding the case where the
+            # baseline was never set (gate_str="").
+            gate_str = (
+                f"baseline={gs.binance_baseline:,.1f} drift={gs.drift:.4f}[{flag}] |"
+            )
+        elif s.engine and s.engine._round:
+            # H-V6-1 fix: explicitly surface the case where baseline is
+            # still missing so the operator can distinguish "gate PASS"
+            # from "baseline not seeded yet" — both produce an empty
+            # gate_str in the legacy format.
+            gate_str = "baseline=pending |"
 
         wm = s.wm
         mkt = wm.get("BTC").market if wm and wm.get("BTC") else None
@@ -737,6 +761,12 @@ async def main() -> None:
         on_market_discovered=_on_market_discovered,
         binance_spot=s.binance_spot,
         entry_cfg=None,
+        # H-V6-1 fix: forward the K-line backfilled BTC spot at window_open
+        # to the strategy engine's GateKeeper. Replaces the previous lazy
+        # baseline seed (latest WS trade at the moment WM polled the
+        # boundary) which sat 1-15s off from the true window_open price and
+        # made the gate FAIL right after every round transition.
+        on_window_baseline=_on_window_baseline,
     )
 
     # ── Execution layer ─────────────────────────────────────────────────

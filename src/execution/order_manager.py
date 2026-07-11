@@ -471,10 +471,14 @@ class OrderManager:
                 side="BUY",
                 token=token_id[:16],
                 price=price,
+                adjusted_price=adjusted_price,
                 size=size,
                 filled_tokens=result.tokens,
                 fill_price=result.fill_price,
                 tier=tier_name,
+                desired_lifetime_s=lifetime_s,
+                effective_lifetime_s=effective_lifetime,
+                expires_at=expiration_ts,
             )
             return order
 
@@ -589,7 +593,9 @@ class OrderManager:
                 tier=tier_name,
                 desired_lifetime_s=gtd_lifetime,
                 effective_lifetime_s=effective_lifetime,
+                expires_at=expiration_ts,
                 initial_match=result.tokens,
+                initial_fill_rate=(result.tokens / size) if size > 0 else 0.0,
             )
             return order
 
@@ -837,6 +843,7 @@ class OrderManager:
                 log.info(
                     "order_manager.cancel.already_gone",
                     client_id=client_order_id, status=order.status,
+                    side=order.side, tier=order.tier_name,
                 )
                 return False
 
@@ -854,12 +861,37 @@ class OrderManager:
                         "order_manager.cancelled",
                         client_id=client_order_id,
                         server_id=server_id[:16],
+                        side=order.side,
+                        tier=order.tier_name,
                         reason=reason,
+                        matched=order.size_matched,
+                        expected=order.size,
+                        residual=max(0.0, order.size - order.size_matched),
                     )
                     return True
+                # H-V6-2 fix: previously a failed cancel returned False
+                # silently and operators could not tell whether the order
+                # was actually still live. Surface the failure with the
+                # reason (passed by caller — e.g. "gtd_expired", "round_end",
+                # "manual") so logs can be filtered.
+                log.warning(
+                    "order_manager.cancel.failed",
+                    client_id=client_order_id,
+                    server_id=server_id[:16],
+                    side=order.side,
+                    tier=order.tier_name,
+                    reason=reason,
+                )
                 return False
 
             order.status = "cancelled"
+            log.info(
+                "order_manager.cancelled.no_server_id",
+                client_id=client_order_id,
+                side=order.side,
+                tier=order.tier_name,
+                reason=reason,
+            )
             return True
 
     async def cancel_market(self, round_start_ts: int) -> list[str]:
@@ -872,12 +904,38 @@ class OrderManager:
             client_ids = [o.client_order_id for o in to_cancel]
             server_ids = [o.server_order_id for o in to_cancel if o.server_order_id]
 
+            # H-V6-2 fix: log per-order snapshot so operators can see which
+            # GTDs are about to be cancelled and how full each one was at
+            # round-end. The previous single summary log only printed count.
+            for o in to_cancel:
+                log.info(
+                    "order_manager.cancel_market.target",
+                    client_id=o.client_order_id,
+                    server_id=(o.server_order_id or "")[:16],
+                    side=o.side,
+                    tier=o.tier_name,
+                    status=o.status,
+                    matched=o.size_matched,
+                    expected=o.size,
+                    residual=max(0.0, o.size - o.size_matched),
+                )
+
+            cancelled_on_clob: list[str] = []
+            not_cancelled: list[str] = []
             if server_ids:
                 resp = await self._clob.cancel_orders(server_ids)
-                cancelled = resp.get("canceled", [])
+                cancelled_on_clob = list(resp.get("canceled", []) or [])
+                not_cancelled = list(resp.get("not_canceled", []) or [])
                 for o in to_cancel:
-                    if o.server_order_id in cancelled:
+                    if o.server_order_id in cancelled_on_clob:
                         o.status = "cancelled"
+                    elif o.server_order_id in not_cancelled:
+                        log.warning(
+                            "order_manager.cancel_market.not_cancelled",
+                            client_id=o.client_order_id,
+                            server_id=o.server_order_id[:16],
+                            side=o.side, tier=o.tier_name,
+                        )
 
             for o in to_cancel:
                 if o.status != "cancelled":
@@ -894,6 +952,8 @@ class OrderManager:
                 "order_manager.cancel_market",
                 round_start_ts=round_start_ts,
                 count=len(client_ids),
+                cancelled_on_clob=len(cancelled_on_clob),
+                not_cancelled_on_clob=len(not_cancelled),
             )
             return client_ids
 
@@ -974,8 +1034,18 @@ class OrderManager:
         """
         order = self.by_server_id(server_order_id)
         if not order:
+            log.debug(
+                "order_manager.mark_filled.unknown_order",
+                server_id=server_order_id[:16],
+            )
             return False
         if order.status in ("filled", "cancelled", "expired"):
+            log.debug(
+                "order_manager.mark_filled.skip_already_terminal",
+                client_id=order.client_order_id,
+                status=order.status,
+                server_id=server_order_id[:16],
+            )
             return order.status == "filled"
         # Guard against treating partial fills as fully filled.
         # CLOB sends a fill event on EVERY trade that crosses our order, so
@@ -993,8 +1063,14 @@ class OrderManager:
             "order_manager.mark_filled",
             client_id=order.client_order_id,
             server_id=server_order_id[:16],
+            side=order.side,
+            tier=order.tier_name,
+            token=order.token_id[:16],
             matched=order.size_matched,
             expected=order.size,
+            fill_rate=order.size_matched / order.size if order.size > 0 else 0.0,
+            lifetime_s=order.lifetime_s,
+            placed_age_s=max(0.0, time.time() - order.placed_at),
         )
         return True
 
@@ -1021,13 +1097,35 @@ class OrderManager:
                     server_id=server_order_id[:16],
                     size_matched=size_matched,
                 )
+            else:
+                log.warning(
+                    "order_manager.apply_fill.untracked",
+                    server_id=server_order_id[:16],
+                    size_matched=size_matched,
+                    fill_price=fill_price,
+                )
             return
         # size_matched is monotonic — keep the max
         if size_matched > order.size_matched:
+            prev_matched = order.size_matched
             order.size_matched = size_matched
-
-    def mark_size_matched(self, server_order_id: str, size_matched: float) -> None:
-        """Update matched size (called from order UPDATE events)."""
-        order = self.by_server_id(server_order_id)
-        if order:
-            order.size_matched = size_matched
+            # H-V6-2 fix: log every incremental fill so operators can see
+            # GTD lifetime progress (previously this method only updated
+            # `size_matched` silently; the only fill records were
+            # `user_ws.maker_fill` in user_ws.py and `router.maker_fill` in
+            # main.py, both of which use [:16] prefixes). Operators
+            # debugging fill accounting need a per-event row keyed by the
+            # full client_id so they can grep by tier.
+            log.info(
+                "order_manager.fill_record",
+                client_id=order.client_order_id,
+                side=order.side,
+                tier=order.tier_name,
+                token=order.token_id[:16],
+                prev_matched=prev_matched,
+                new_matched=size_matched,
+                delta=size_matched - prev_matched,
+                fill_price=fill_price,
+                expected=order.size,
+                fills_remaining=max(0.0, order.size - size_matched),
+            )

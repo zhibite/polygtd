@@ -100,14 +100,6 @@ class TierSnapshot:
             return self.filled
         return self.size_filled >= self.size_expected * 0.995
 
-    @property
-    def is_expired(self) -> bool:
-        """True if GTD has expired and the tier was never completed."""
-        if self.expires_at <= 0:
-            return False
-        import time as _t
-        return _t.time() >= self.expires_at and not self.is_complete
-
 
 # ---------------------------------------------------------------------------
 # Take-profit snapshot
@@ -210,16 +202,14 @@ class Position:
         return [self.tier1, self.tier2, self.tier3, self.tier4]
 
     @property
-    def filled_tiers(self) -> list[TierSnapshot]:
-        return [t for t in self.tiers if t.is_complete]
+    def has_inflight_tier(self) -> bool:
+        """True if any averaging tier is currently in-flight (placed but not complete).
 
-    @property
-    def next_open_tier(self) -> TierSnapshot | None:
-        """The first tier that is not yet fully filled (placed or pending)."""
-        for t in self.tiers:
-            if not t.is_complete:
-                return t
-        return None
+        H-V5-1: used by engine._check_take_profit to suppress TP while an
+        averaging tier is mid-fill, since tp_target() relies on _avg_cost
+        which is stale until the in-flight tier actually fills.
+        """
+        return any(t.placed and not t.is_complete for t in self.tiers[1:])
 
     @property
     def is_empty(self) -> bool:
@@ -260,10 +250,6 @@ class Position:
         hold even if that invariant ever changes.
         """
         return max(0.0, _s().total_max_notional - self.total_notional_committed)
-
-    def tier_notional_used(self, tier: TierSnapshot) -> float:
-        """USD already filled into this tier (not including in-flight)."""
-        return tier.cost_filled
 
     def tier_is_saturated(self, tier: TierSnapshot) -> bool:
         """True if this tier has already absorbed > tier.notional * max_mult."""
@@ -482,10 +468,6 @@ class Position:
         n = sum(1 for t in self.tiers[1:] if t.is_complete)
         tp_pct = cfg.TP_PROFIT_PCT - n * cfg.TP_DECREMENT_PCT
         return max(cfg.TP_MIN_PCT, tp_pct)
-
-    def max_notional_exposed(self) -> float:
-        """Sum of all tier notionals (worst-case if every tier fires)."""
-        return sum(t.notional for t in self.tiers)
 
 
 # ---------------------------------------------------------------------------

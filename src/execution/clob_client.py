@@ -353,6 +353,12 @@ class CLOBClient:
         poll_interval = 0.5
         total_sz = 0.0
         total_usdc = 0.0
+        # H-V6-2 fix: throttle the per-poll progress log so it doesn't flood
+        # logs at 0.5s intervals, but emit enough rows to see the GTD's
+        # lifetime progress (every ~10s, capped at one per poll cycle).
+        last_progress_log_ts = 0.0
+        progress_log_interval = 10.0
+        order_size = size_q
 
         while time.monotonic() < deadline:
             await asyncio.sleep(poll_interval)
@@ -379,6 +385,20 @@ class CLOBClient:
 
                 if total_sz > 0:
                     avg_px = total_usdc / total_sz
+                    # H-V6-2 fix: log the BUY fill result before returning
+                    # so operators can see fills that came back through the
+                    # polling loop (as opposed to the synchronous post-response
+                    # callback). Pre-fix, only the post-response path logged.
+                    log.info(
+                        "clob.gtd_buy filled",
+                        order_id=order_id[:16],
+                        token=token_id[:16],
+                        filled_tokens=total_sz,
+                        avg_px=avg_px,
+                        total_usdc=total_usdc,
+                        order_size=order_size,
+                        fills_count=len(fills),
+                    )
                     result = FillResult(
                         order_id=order_id,
                         tokens=_round_down(total_sz, Decimal("0.0001")),
@@ -392,7 +412,20 @@ class CLOBClient:
 
             order_status = (status_resp.get("status") or "").lower()
             if order_status in ("cancelled", "expired", "failed"):
-                log.info("clob.gtd_buy expired", status=order_status)
+                # H-V6-2 fix: enrich the existing expiry log with structured
+                # fields (matched so far, lifetime consumed, server status).
+                # Pre-fix log was just `clob.gtd_buy expired status=X`.
+                age_s = time.monotonic() - (deadline - self.GTD_CLIENT_TIMEOUT_SEC)
+                log.warning(
+                    "clob.gtd_buy expired",
+                    order_id=order_id[:16],
+                    token=token_id[:16],
+                    status=order_status,
+                    matched=total_sz,
+                    order_size=order_size,
+                    lifetime_s=gtd_seconds,
+                    lifetime_consumed_s=round(age_s, 1),
+                )
                 return FillResult(
                     order_id=order_id, tokens=0, usdc=0,
                     fill_price=price_q, success=False,
@@ -400,11 +433,49 @@ class CLOBClient:
                     expiration_ts=expiration_ts,
                 )
 
+            # H-V6-2 fix: periodic progress log so operators can see that
+            # the BUY is still live and waiting (the BUYs mostly cross
+            # immediately, but for illiquid markets the BUY can be sitting
+            # on the book waiting — this row lets us distinguish "alive
+            # waiting" from "stuck").
+            now_ts = time.monotonic()
+            if now_ts - last_progress_log_ts >= progress_log_interval:
+                last_progress_log_ts = now_ts
+                age_s = now_ts - (deadline - self.GTD_CLIENT_TIMEOUT_SEC)
+                log.info(
+                    "clob.gtd_buy poll_progress",
+                    order_id=order_id[:16],
+                    token=token_id[:16],
+                    matched=total_sz,
+                    order_size=order_size,
+                    order_status=order_status,
+                    lifetime_consumed_s=round(age_s, 1),
+                    lifetime_remaining_s=round(gtd_seconds - age_s, 1),
+                )
+
         # Timeout — cancel and return failure
+        # H-V6-2 fix: structured timeout log with full context.
+        age_s = time.monotonic() - (deadline - self.GTD_CLIENT_TIMEOUT_SEC)
+        log.warning(
+            "clob.gtd_buy poll_timeout",
+            order_id=order_id[:16],
+            token=token_id[:16],
+            matched=total_sz,
+            order_size=order_size,
+            client_timeout_s=self.GTD_CLIENT_TIMEOUT_SEC,
+            lifetime_consumed_s=round(age_s, 1),
+        )
         try:
             await self._run(self._client.cancel_order, order_id)
-        except Exception:
-            pass
+            log.info(
+                "clob.gtd_buy poll_timeout_cancel_sent",
+                order_id=order_id[:16],
+            )
+        except Exception as exc:
+            log.warning(
+                "clob.gtd_buy poll_timeout_cancel_failed",
+                order_id=order_id[:16], error=str(exc),
+            )
         return FillResult(
             order_id=order_id, tokens=0, usdc=0,
             fill_price=price_q, success=False,
@@ -496,6 +567,12 @@ class CLOBClient:
         poll_interval = 0.5
         total_sz = 0.0
         total_usdc = 0.0
+        order_size = size_q
+        # H-V6-2 fix: throttle the per-poll progress log so we don't flood
+        # at 0.5s intervals, but emit enough rows to see the GTD SELL's
+        # lifetime progress (~10s cadence).
+        last_progress_log_ts = 0.0
+        progress_log_interval = 10.0
 
         while time.monotonic() < deadline:
             await asyncio.sleep(poll_interval)
@@ -538,6 +615,20 @@ class CLOBClient:
             if order_status in ("matched", "filled"):
                 if total_sz > 0:
                     avg_px = total_usdc / total_sz
+                    # H-V6-2 fix: enrich the fully-filled terminal log
+                    # with structured fields. Pre-fix the SELL loop never
+                    # logged on success — only on partial_then_expired
+                    # or poll_timeout. Operators couldn't tell whether
+                    # the GTD SELL completed naturally vs hit a fallback.
+                    log.info(
+                        "clob.gtd_sell fully_filled",
+                        order_id=order_id[:16],
+                        token=token_id[:12],
+                        filled_tokens=total_sz,
+                        avg_px=avg_px,
+                        total_usdc=total_usdc,
+                        order_size=order_size,
+                    )
                     return FillResult(
                         order_id=order_id,
                         tokens=_round_down(total_sz, Decimal("0.0001")),
@@ -546,6 +637,12 @@ class CLOBClient:
                         success=True,
                         expiration_ts=expiration_ts,
                     )
+                log.warning(
+                    "clob.gtd_sell matched_zero",
+                    order_id=order_id[:16],
+                    token=token_id[:12],
+                    order_size=order_size,
+                )
                 return FillResult(
                     order_id=order_id, tokens=0, usdc=0,
                     fill_price=price_q, success=False, error="gtd_matched_zero",
@@ -558,7 +655,11 @@ class CLOBClient:
                     avg_px = total_usdc / total_sz
                     log.info(
                         "clob.gtd_sell partial_then_expired",
+                        order_id=order_id[:16],
+                        token=token_id[:12],
                         status=order_status, filled=total_sz,
+                        order_size=order_size,
+                        avg_px=avg_px,
                     )
                     return FillResult(
                         order_id=order_id,
@@ -575,11 +676,33 @@ class CLOBClient:
                     expiration_ts=expiration_ts,
                 )
 
+            # H-V6-2 fix: periodic progress log so operators can see how
+            # full the GTD SELL is as it lives. This is the only place
+            # where lifetime progress is observable between the post and
+            # the terminal event.
+            now_ts = time.monotonic()
+            if now_ts - last_progress_log_ts >= progress_log_interval:
+                last_progress_log_ts = now_ts
+                age_s = now_ts - (deadline - min(self.GTD_CLIENT_TIMEOUT_SEC, gtd_seconds + 5))
+                log.info(
+                    "clob.gtd_sell poll_progress",
+                    order_id=order_id[:16],
+                    token=token_id[:12],
+                    matched=matched_sz,
+                    order_size=order_size,
+                    order_status=order_status,
+                    lifetime_consumed_s=round(age_s, 1),
+                    lifetime_remaining_s=round(gtd_seconds - age_s, 1),
+                )
+
         # Client poll timeout — but the order may still be live server-side.
         # Surface what we know to the caller, leaving the order book-still-posted.
         log.warning(
             "clob.gtd_sell poll_timeout",
-            order_id=order_id, matched=total_sz,
+            order_id=order_id[:16], token=token_id[:12],
+            matched=total_sz, order_size=order_size,
+            client_timeout_s=self.GTD_CLIENT_TIMEOUT_SEC,
+            gtd_seconds=gtd_seconds,
         )
         return FillResult(
             order_id=order_id,
@@ -701,7 +824,7 @@ class CLOBClient:
             log.info("clob.order_cancelled", order_id=order_id[:16])
             return True
         except Exception as exc:
-            log.warning("clob.cancel_order error", error=str(exc))
+            log.warning("clob.cancel_order error", order_id=order_id[:16], error=str(exc))
             return False
 
     async def cancel_orders(self, order_ids: list[str]) -> dict:
@@ -710,9 +833,30 @@ class CLOBClient:
             return {"canceled": [], "not_canceled": list(order_ids)}
         try:
             resp = await self._run(self._client.cancel_orders, [{"orderID": oid} for oid in order_ids])
-            return resp if isinstance(resp, dict) else {"canceled": order_ids, "not_canceled": []}
+            # H-V6-2 fix: previously `cancel_orders` was silent on success
+            # (only logged on exception). Operators could not tell whether a
+            # round-end cancel attempt actually reached the CLOB and what
+            # the server split between canceled / not_canceled was. Now
+            # log a structured summary so the operator can correlate
+            # against `order_manager.cancel_market.target` / `not_cancelled`
+            # in order_manager.py.
+            if isinstance(resp, dict):
+                log.info(
+                    "clob.cancel_orders",
+                    requested=len(order_ids),
+                    canceled=len(resp.get("canceled", []) or []),
+                    not_canceled=len(resp.get("not_canceled", []) or []),
+                )
+                return resp
+            log.info(
+                "clob.cancel_orders",
+                requested=len(order_ids),
+                canceled=len(order_ids),
+                not_canceled=0,
+            )
+            return {"canceled": order_ids, "not_canceled": []}
         except Exception as exc:
-            log.warning("clob.cancel_orders error", error=str(exc))
+            log.warning("clob.cancel_orders error", requested=len(order_ids), error=str(exc))
             return {"canceled": [], "not_canceled": list(order_ids)}
 
     # ------------------------------------------------------------------

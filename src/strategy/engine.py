@@ -1,7 +1,7 @@
 """Strategy engine — decision loop that watches prices and emits actions.
 
 The engine is purely reactive:
-  - Receives price ticks via on_binance_tick() and on_token_tick()
+  - Driven by DecisionLoop on a fixed tick (250ms by default)
   - Maintains RoundState internally
   - Calls the supplied callbacks for each action
 
@@ -127,18 +127,6 @@ class StrategyEngine:
             )
         self._round = None
         self._gate = None
-
-    # ------------------------------------------------------------------
-    # Price tick handlers
-    # ------------------------------------------------------------------
-
-    async def on_binance_tick(self) -> None:
-        """Re-evaluate all decisions whenever a new Binance trade arrives."""
-        await self._evaluate()
-
-    async def on_token_tick(self, token: str) -> None:
-        """Re-evaluate all decisions whenever a token's price changes."""
-        await self._evaluate()
 
     # ------------------------------------------------------------------
     # Order event handlers — these drive tier state machine
@@ -603,6 +591,18 @@ class StrategyEngine:
             return
 
         if pos._tp_inflight:
+            return
+
+        # H-V5-1 fix: TP must wait for any in-flight averaging tier to settle.
+        # Reason: tp_target() counts only is_complete averaging tiers when
+        # computing the TP pct. If a tier is placed but not yet filled, the
+        # current _avg_cost is artificially high (it doesn't include the
+        # cheaper tier yet), so the TP target is correspondingly optimistic.
+        # Letting TP fire on that stale avg_cost would lock in profit at the
+        # wrong level — the user expects TP to reflect the lower avg_cost
+        # once the in-flight tier actually fills. Symmetric to averaging-down
+        # being suppressed while a TP is in flight.
+        if pos.has_inflight_tier:
             return
 
         mid_price = self._pc.get_midpoint(pos.entry_token)
