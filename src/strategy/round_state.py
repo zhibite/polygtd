@@ -731,6 +731,7 @@ class Position:
         elif outcome == TierOutcome.CROSSED.value:
             # Cancel because mid dropped into the next tier's zone. The
             # next tier watcher will fire from the next _evaluate tick.
+            #
             # H-NEW-2026-07-11 (audit v6-12): symmetric with EXPIRED —
             # partial fills before the cross-cancel must still anchor the
             # realised baseline. Previously this branch was a silent `pass`,
@@ -756,6 +757,36 @@ class Position:
                          "into next-tier zone; rebasing T2+ trigger "
                          "lines to realised avg",
                 )
+
+            # H-NEW-2026-07-11 (audit v6-14): CROSSED must release the
+            # in-flight mutex for downstream strategy decisions.
+            #
+            # Production symptom (2026-07-11 13:32 round): when T3 BUY
+            # crossed into T4's zone and the watcher fell back to the
+            # CROSSED outcome, `tier.placed` stayed True forever. That
+            # made `position.has_inflight_tier` permanently True, so
+            # `_check_take_profit` would never fire even when mid moved
+            # back above `tp_target * (1 - margin)`. The position bled
+            # uPnL with no TP SELL ever posted.
+            #
+            # Without this reset, any averaging tier that crosses
+            # without filling deadlocks the take-profit path for the
+            # rest of the round. We keep `filled=False` to avoid
+            # double-counting with any post-cross on-chain fill that
+            # the WS path might still deliver, but we MUST release
+            # the placed mutex so TP / next-tier decisions can advance.
+            #
+            # Server_order_id is preserved intentionally — it lets
+            # late-arriving user_ws TRADE events still attribute fills
+            # to this tier for the M-2 dedupe / record_fill path.
+            tier.placed = False
+            log.info(
+                "position.tier_cleared_after_cross",
+                tier=tier.tier,
+                server_order_id=tier.server_order_id[:16] if tier.server_order_id else None,
+                note="tier.placed reset to False so downstream checks "
+                     "(has_inflight_tier / TP gating) release this slot",
+            )
         elif outcome in (TierOutcome.CANCELLED.value, TierOutcome.ERROR.value):
             # External / unexpected — keep partial fills, close out.
             # Same partial-fill baseline anchoring as EXPIRED/CROSSED.

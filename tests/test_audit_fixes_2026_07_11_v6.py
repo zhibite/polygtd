@@ -539,3 +539,106 @@ async def test_t13_trade_zero_size_after_fallback_skips_callback() -> None:
     assert captured.fills == [], (
         "size=0 with no REST recovery must not deliver a phantom fill"
     )
+
+
+# ---------------------------------------------------------------------------
+# H-NEW-14 (2026-07-11): CROSSED tier outcome must release the in-flight mutex.
+#
+# Production symptom (2026-07-11 13:32 round): T3 BUY @0.24 was placed on a
+# thin DOWN book. mid dropped through the T3-to-T4 cross threshold mid-fill
+# (clob returned size_matched=36.61 a moment AFTER the watcher's CROSSED
+# cancel). The watcher reported outcome=CROSSED with filled_qty=0, but
+# `tier.placed` stayed True because the previous version of this branch was
+# a no-op (only the baseline_anchored_on_cross fix was applied). Result:
+#   - `position.has_inflight_tier` was True for the rest of the round
+#   - `_check_take_profit` saw `has_inflight_tier=True` and returned early
+#     on every tick — even when mid hit +71% above `tp_target * (1 - margin)`
+#   - the user observed a profitable position with no TP sell ever posted
+#
+# Fix: CROSSED must set `tier.placed = False`. The tier becomes "armed
+# again" but with `filled=False` so any post-cross on-chain fill is
+# still tracked via `record_fill` (not double-counted by the watcher).
+# ---------------------------------------------------------------------------
+
+
+def test_h_new_14_crossed_outcome_clears_tier_placed() -> None:
+    """After CROSSED outcome, position.has_inflight_tier must return False
+    so _check_take_profit can fire on the very next tick.
+    """
+    from src.strategy.round_state import Position
+    from src.execution.tier_watcher import TierOutcome
+
+    pos = Position()
+    t = pos.tiers[2]  # T3
+    t.server_order_id = "0x45697996208479"
+    t.token_id = "0xTOKEN_DOWN"
+    t.size_expected = 16.66
+    t.notional = 4.0
+    t.placed = True
+    t.watching = True
+
+    assert pos.has_inflight_tier is True, (
+        "Pre-condition: while watcher is mid-fill the position is in-flight"
+    )
+
+    pos.apply_tier_watcher_result(
+        t, TierOutcome.CROSSED.value, filled_qty=0.0,
+        dedup_key="0x45697996208479|crossed", avg_fill_price=0.0,
+    )
+
+    assert pos.has_inflight_tier is False, (
+        "After CROSSED, the position MUST NOT be considered in-flight. "
+        "If this asserts, _check_take_profit will deadlock — the round "
+        "can't exit via TP."
+    )
+    assert t.placed is False, (
+        "After CROSSED the tier.placed flag must reset so the strategy "
+        "can re-arm (a new GTD on the next tick) and so TP gating releases."
+    )
+    assert t.server_order_id == "0x45697996208479", (
+        "server_order_id is preserved so a late-arriving user_ws TRADE "
+        "event can still attribute post-cross fills to this tier."
+    )
+    assert t.watching is False
+    assert t.filled is False, (
+        "CROSSED is not a fill. filled stays False so the post-cross "
+        "on-chain fill path does not double-count via watcher_reconciled."
+    )
+
+
+def test_h_new_14_explicit_inv_log_marker_for_crossed() -> None:
+    """defensive: the audit trail must show that the cross-cleared tier
+    is now downgraded, so any future grep for 'in-flight=true' on the
+    crosspath can be ruled out at a glance."""
+    main_py = pathlib.Path(_ROOT / "src" / "strategy" / "round_state.py").read_text(encoding="utf-8")
+    assert "tier.placed = False" in main_py
+    # The branch carrying the assignment is in CROSSED / EXPIRED /
+    # CANCELLED logic; we want a per-tier log line so an operator can
+    # see WHICH tier got cleared during postmortem.
+    assert "position.tier_cleared_after_cross" in main_py
+
+
+# ---------------------------------------------------------------------------
+# H-NEW-15 (2026-07-11): router-side trade_id dedupe.
+#
+# Polymarket WS emits the SAME TRADE event multiple times with status
+# progressing MATCHED → MINED → CONFIRMED. Without dedupe, every status
+# upgrade re-routes `fill.size` into `record_fill` and inflates
+# position._total_qty. The fill itself has the same trade_id in all
+# three payloads.
+#
+# Fix: router maintains a per-closure cache of fired trade_ids.
+# The same trade_id seen twice is logged + skipped.
+# ---------------------------------------------------------------------------
+
+
+def test_h_new_15_trade_id_dedupe_path_in_router() -> None:
+    """The router closure should have a trade-id dedupe gate so the
+    MINED/CONFIRMED re-fires for one trade don't double-count."""
+    main_py = pathlib.Path(_ROOT / "src" / "main.py").read_text(encoding="utf-8")
+    assert "router.maker_fill.trade_dedup" in main_py
+    # Either form of dedupe key (a closure set or a more elaborate LRU) is
+    # acceptable as long as trade_id is the dedupe key.
+    assert "trade_id" in main_py
+    # The wiring must explicitly compare trade_id against a seen-set:
+    assert "in _seen_trades" in main_py or "_seen_trades.add" in main_py

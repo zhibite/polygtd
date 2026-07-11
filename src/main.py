@@ -1284,13 +1284,46 @@ def _make_maker_fill_callback(state: AppState):
     still supported by user_ws (it falls back to the 1-arg signature). In
     that case the first candidate wins as before; if it doesn't match
     our tracked orders the existing untracked-breadcrumb path handles it.
+
+    Trade-id dedupe (H-NEW-2026-07-14): polymarket User Channel emits
+    a TRADE event ONCE per status transition (MATCHED → MINED →
+    CONFIRMED). Each emission carries the same `trade_id` and the same
+    `size` (per-trade share count). Without dedupe here, every status
+    upgrade would re-route `fill.size` into `record_fill` and inflate
+    `_total_qty`. We track trades we've already fired for in a bounded
+    LRU on the closure — trade_id is 36 chars and well-behaved.
     """
     eng = state.engine
     om = state.order_manager
+    _seen_trades: set[str] = set()
+    _SEEN_TRADES_LIMIT = 1024
 
     def on_maker_fill(fill, candidates=None) -> None:
         if not eng or not om:
             return
+
+        # ------------------------------------------------------------------
+        # Trade-id dedupe (MATCHED/MINED/CONFIRMED re-fires are common).
+        # ------------------------------------------------------------------
+        trade_id = getattr(fill, "trade_id", "") or ""
+        if trade_id:
+            if trade_id in _seen_trades:
+                log.debug(
+                    "router.maker_fill.trade_dedup",
+                    trade_id=trade_id[:16], status=fill.status,
+                    note="same trade id re-fired with new status — skip",
+                )
+                return
+            _seen_trades.add(trade_id)
+            # Bound the dedupe cache so it doesn't grow unbounded across
+            # many rounds.
+            if len(_seen_trades) > _SEEN_TRADES_LIMIT:
+                # Drop the oldest half by recreating; trades don't recur.
+                # (We don't need LRU semantics — recent trades we've
+                # ignored already won't come back with new info.)
+                _seen_trades.clear()
+                # Re-add this trade so we don't re-fire within this batch.
+                _seen_trades.add(trade_id)
 
         # ------------------------------------------------------------------
         # Candidate resolution

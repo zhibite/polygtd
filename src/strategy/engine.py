@@ -381,6 +381,55 @@ class StrategyEngine:
             )
             return
 
+        if self._round.position.is_empty:
+            log.debug(
+                "engine.fill_ignored no_position",
+                token=token_id[:16], order_id=server_order_id,
+            )
+            return
+
+        pos = self._round.position
+        for tier in pos.tiers:
+            if tier.server_order_id == server_order_id:
+                # Verify asset_id matches — reject mismatches (cross-token contamination)
+                if token_id and token_id != tier.token_id and tier.token_id:
+                    log.warning(
+                        "engine.fill_asset_mismatch",
+                        token=token_id[:16], expected=tier.token_id[:16], order_id=server_order_id,
+                    )
+                    return
+
+                pos.record_fill(tier, fill_price, fill_size)
+                log.info(
+                    "engine.tier_filled",
+                    tier=tier.tier,
+                    token_id=token_id[:16],
+                    fill_price=fill_price,
+                    fill_size=fill_size,
+                    cumulative_size=tier.size_filled,
+                    expected_size=tier.size_expected,
+                    avg_cost=pos.avg_cost,
+                    total_qty=pos.total_qty,
+                    tp_target=pos.tp_target(),
+                )
+                return
+
+        # Not a BUY tier fill — check if it is a registered TP (SELL) fill.
+        if pos.record_tp_fill(server_order_id, fill_price, fill_size):
+            log.info(
+                "engine.tp_filled",
+                server_order_id=server_order_id[:16],
+                token_id=token_id[:16],
+                fill_price=fill_price,
+                fill_size=fill_size,
+                total_qty=pos.total_qty,
+                avg_cost=pos.avg_cost,
+                tp_target=pos.tp_target(),
+            )
+            return
+
+        log.debug("engine.fill_unknown", order_id=server_order_id)
+
     def notify_tp_post_error(self, reason: str) -> None:
         """Called by router when a TP SELL POST was rejected by the CLOB.
 
