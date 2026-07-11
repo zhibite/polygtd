@@ -78,6 +78,11 @@ class MarketWS:
         self._cache = cache
         self._on_connect = on_connect
         self._on_disconnect = on_disconnect
+        # H-V6-10: dump the first N raw WS messages so we can see what
+        # Polymarket is actually sending. Once we know the real shape, the
+        # diagnostic can be turned off. The 10x log-flood cap is to keep
+        # the firehose manageable in production.
+        self._raw_dump_remaining: int = 5
         self._running = False
         self._task: asyncio.Task[None] | None = None
         self._url = MARKET_WS_URL
@@ -170,6 +175,21 @@ class MarketWS:
         # Skip non-dict messages (some WS messages may be arrays)
         if not isinstance(msg, dict):
             return
+
+        # H-V6-10 diagnostic: dump the first few raw messages so we can
+        # confirm the real Polymarket wire shape. Production symptom
+        # 2026-07-11 01:30 round 01:30 — STATUS shows bids=0.0000 for
+        # every token every tick, no `best_bid_ask` event was ever
+        # parsed; we need the raw JSON to verify what to feed the parser.
+        if self._raw_dump_remaining > 0:
+            self._raw_dump_remaining -= 1
+            log.info(
+                "market_ws.raw_sample",
+                keys=sorted(msg.keys()),
+                asset_id=msg.get("asset_id"),
+                event_type=msg.get("event_type"),
+                payload=str(msg)[:400],
+            )
 
         # ── Polymarket Market Channel payload schema ─────────────────────────
         # Real messages (event_type-driven):
