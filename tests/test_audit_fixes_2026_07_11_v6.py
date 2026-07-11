@@ -298,3 +298,244 @@ def test_m3_status_line_pnl_zero_uses_no_sign() -> None:
     )
     # And the production bug string must be gone.
     assert 'f" uPnL=${unreal_pnl:+.2f}{pnl_pct_str}"' not in main_py
+
+
+# ---------------------------------------------------------------------------
+# H-NEW-13 (2026-07-11): TRADE event uses TOP-LEVEL size + trader_side,
+#                          not maker_orders[].matched_amount.
+#
+# Production symptom (2026-07-11 13:01:36):
+#   T1 BUY (we were TAKER) on UP token. Polymarket WS payload:
+#     taker_order_id = our order id (0x222128...)
+#     size           = 5          (top-level; our share of the trade)
+#     price          = 0.36
+#     side           = BUY
+#     trader_side    = TAKER
+#     maker_orders[] = [{ asset_id: DOWN, matched_amount: 0, price: 0.64 }]
+#
+#   The old code read each maker_orders[] entry's size. That entry's size
+#   was 0 (the OPPOSITE-side maker's volume) → router.maker_fill.skip
+#   → record_fill never fired → engine.pos.total_qty stayed at 0 → T2
+#   averaging was hung in place (qty=0, T1=⏳, T2=⏳, cost=$0.00).
+#
+# The fix: read the TOP-LEVEL size (the trade volume WE own) and pick
+# our order_id from taker_order_id (when TAKER) or the maker row's
+# order_id (when MAKER).
+# ---------------------------------------------------------------------------
+
+
+class _CapturedFill:
+    """Helper that records every MakerFill the router receives.
+
+    Supports both the 2-arg form `cb(fill, candidates=…)` and the 1-arg
+    legacy form `cb(fill)` for backwards compatibility with the staged
+    rollout (user_ws tries the 2-arg form first, falls back on TypeError).
+    """
+    def __init__(self) -> None:
+        self.fills: list[Any] = []
+        self.candidate_lists: list[list[Any]] = []
+
+    def __call__(self, fill: Any, *args: Any, **kwargs: Any) -> None:
+        self.fills.append(fill)
+        if "candidates" in kwargs:
+            self.candidate_lists.append(list(kwargs["candidates"]))
+
+
+class _StubCLOBEmpty:
+    """Always returns 0 / None from the REST fallback."""
+    async def get_order_filled_size(self, _order_id: str) -> float | None:
+        return 0.0
+
+
+@pytest.mark.asyncio
+async def test_t13_trade_taker_path_uses_top_level_size() -> None:
+    """When we are TAKER, the callback must receive our share as
+    MakerFill.size and our taker_order_id as maker_order_id, even
+    though maker_orders[] is full of opposite-side zero-fills."""
+    from src.market.user_ws import UserWS
+
+    captured = _CapturedFill()
+    ws = UserWS(
+        api_key="test-key",
+        api_secret="test-secret",
+        api_passphrase="test-pass",
+        clob=_StubCLOBEmpty(),  # type: ignore[arg-type]
+        on_maker_fill=captured,  # type: ignore[arg-type]
+    )
+
+    # Reproduces the 2026-07-11 13:01:36 production payload.
+    payload = {
+        "id": "trade-abc",
+        "taker_order_id": "0x222128208af908ce3b75",
+        "asset_id": "UP_TOKEN_6489",
+        "side": "BUY",
+        "price": "0.36",
+        "size": "5",
+        "status": "MINED",
+        "trader_side": "TAKER",
+        "maker_orders": [
+            {
+                "order_id": "0x7eff6d8ce7eb539ab73ed",
+                "asset_id": "DOWN_TOKEN_1013",
+                "matched_amount": "0",
+                "price": "0.64",
+                "side": "SELL",
+            }
+        ],
+    }
+    await ws._handle_trade(payload)
+
+    assert len(captured.fills) == 1, (
+        "TAKER path should fire the callback exactly once per TRADE event, "
+        "NOT once per maker_orders[] entry"
+    )
+    fill = captured.fills[0]
+    # Order id must be OUR taker order, not the maker in maker_orders[].
+    assert fill.maker_order_id == "0x222128208af908ce3b75"
+    # Asset id must be the TOP-level asset_id (our token), not the maker's.
+    assert fill.asset_id == "UP_TOKEN_6489"
+    # Size must be the TOP-level size (5), NOT the maker's matched_amount=0.
+    assert fill.size == pytest.approx(5.0)
+    # Price and status must come from the top level.
+    assert fill.price == pytest.approx(0.36)
+    assert fill.status == "MINED"
+
+
+@pytest.mark.asyncio
+async def test_t13_trade_maker_path_uses_maker_row_order_id() -> None:
+    """When we are MAKER (e.g. a TP SELL resting at 0.40 that got hit),
+    our order id is the maker row in maker_orders[]. The top-level size
+    is still OUR share of the trade."""
+    from src.market.user_ws import UserWS
+
+    captured = _CapturedFill()
+    ws = UserWS(
+        api_key="test-key",
+        api_secret="test-secret",
+        api_passphrase="test-pass",
+        clob=_StubCLOBEmpty(),  # type: ignore[arg-type]
+        on_maker_fill=captured,  # type: ignore[arg-type]
+    )
+
+    our_maker_order = "0xourselfforchristmastx99"
+    payload = {
+        "id": "trade-mkr",
+        "taker_order_id": "0xcounterparty_taker",
+        "asset_id": "UP_TOKEN_6489",
+        "side": "SELL",
+        "price": "0.40",
+        "size": "3.0",
+        "status": "CONFIRMED",
+        "trader_side": "MAKER",
+        "maker_orders": [
+            {
+                "order_id": our_maker_order,
+                "asset_id": "UP_TOKEN_6489",
+                "matched_amount": "3.0",
+                "price": "0.40",
+                "side": "SELL",
+            }
+        ],
+    }
+    await ws._handle_trade(payload)
+
+    assert len(captured.fills) == 1
+    fill = captured.fills[0]
+    # Authoritative position: user_ws does NOT decide which candidate is
+    # "ours" — it ships the full candidate list to the router, which uses
+    # OrderManager.by_server_id (full hash) to pick. So we assert on the
+    # candidate list, not on fill.maker_order_id.
+    assert len(captured.candidate_lists) == 1
+    cands = captured.candidate_lists[0]
+    order_ids = [c[0] for c in cands]
+    assert our_maker_order in order_ids, (
+        "MAKER path: the OUR maker order_id MUST be in the candidates list "
+        "sent to the router — otherwise the router cannot attribute the "
+        "fill via OrderManager lookup."
+    )
+    # The counterparty's taker_order_id is ALSO included (defensively,
+    # because polymarket aggregates the trade into one event).
+    assert "0xcounterparty_taker" in order_ids
+    # Per-row asset_id is preserved: the OUR maker row's asset_id is
+    # preserved in the candidate tuple (NOT silently replaced by the
+    # top-level asset_id).
+    aid_by_oid = {c[0]: c[1] for c in cands}
+    assert aid_by_oid[our_maker_order] == "UP_TOKEN_6489"
+    # Top-level fields flow through to the MakerFill (legacy slot).
+    assert fill.price == pytest.approx(0.40)
+    assert fill.size == pytest.approx(3.0)
+    assert fill.asset_id == "UP_TOKEN_6489"
+
+
+@pytest.mark.asyncio
+async def test_t13_trade_callback_fires_once_per_trade_event() -> None:
+    """A single TRADE event must NOT emit one callback per maker_orders[]
+    entry — that was the pre-fix bug that double-counted and routed
+    fills to the wrong token."""
+    from src.market.user_ws import UserWS
+
+    captured = _CapturedFill()
+    ws = UserWS(
+        api_key="test-key",
+        api_secret="test-secret",
+        api_passphrase="test-pass",
+        clob=_StubCLOBEmpty(),  # type: ignore[arg-type]
+        on_maker_fill=captured,  # type: ignore[arg-type]
+    )
+
+    payload = {
+        "id": "trade-multi",
+        "taker_order_id": "0xtaker",
+        "asset_id": "UP_TOKEN_6489",
+        "side": "BUY",
+        "price": "0.36",
+        "size": "5",
+        "status": "CONFIRMED",
+        "trader_side": "TAKER",
+        "maker_orders": [
+            {"order_id": "0xm1", "asset_id": "DOWN", "matched_amount": "2"},
+            {"order_id": "0xm2", "asset_id": "DOWN", "matched_amount": "3"},
+            {"order_id": "0xm3", "asset_id": "DOWN", "matched_amount": "0"},
+        ],
+    }
+    await ws._handle_trade(payload)
+
+    assert len(captured.fills) == 1, (
+        "Even when maker_orders[] has multiple entries, a single TRADE "
+        "event represents ONE fill on OUR side. Emitting per-maker was "
+        "the H-NEW-13 bug."
+    )
+
+
+@pytest.mark.asyncio
+async def test_t13_trade_zero_size_after_fallback_skips_callback() -> None:
+    """If top-level size is 0 AND the REST fallback returns 0/None,
+    the callback must NOT fire. Without this guard a phantom fill
+    would corrupt position state."""
+    from src.market.user_ws import UserWS
+
+    captured = _CapturedFill()
+    ws = UserWS(
+        api_key="test-key",
+        api_secret="test-secret",
+        api_passphrase="test-pass",
+        clob=_StubCLOBEmpty(),  # type: ignore[arg-type]
+        on_maker_fill=captured,  # type: ignore[arg-type]
+    )
+
+    payload = {
+        "id": "trade-zero",
+        "taker_order_id": "0xtaker",
+        "asset_id": "UP_TOKEN_6489",
+        "side": "BUY",
+        "price": "0.36",
+        "size": "0",
+        "status": "MINED",
+        "trader_side": "TAKER",
+        "maker_orders": [],
+    }
+    await ws._handle_trade(payload)
+
+    assert captured.fills == [], (
+        "size=0 with no REST recovery must not deliver a phantom fill"
+    )

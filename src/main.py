@@ -1268,32 +1268,76 @@ async def main() -> None:
 
 def _make_maker_fill_callback(state: AppState):
     """
-    Route each individual maker fill to engine.
+    Route each TRADE event fill to engine.
 
-    This is the primary fill path from the UserWS.  Each call corresponds to one
-    maker_orders[] entry with a full order_id and its own asset_id (UP or DOWN).
-    We pass the full order_id — NO prefix truncation.
+    H-NEW-2026-07-14 audit: prior shape assumed the user_ws callback
+    delivered ONE callback per maker_orders[] entry. Polymarket's actual
+    semantics is one TRADE event = one broadcast that may contain
+    multiple maker_orders[] rows (liquidity from multiple makers can be
+    aggregated into a single fill). We now receive ONE callback per
+    TRADE event carrying `candidates=[(order_id, asset_id, matched_amount)]`
+    — the union of taker_order_id and every maker_orders[].order_id (full
+    hashes, never truncated). The router's job is to find the candidate
+    whose order_id lives in our OrderManager and use IT for attribution.
+
+    Backwards compatibility: older wiring that passes only `fill` is
+    still supported by user_ws (it falls back to the 1-arg signature). In
+    that case the first candidate wins as before; if it doesn't match
+    our tracked orders the existing untracked-breadcrumb path handles it.
     """
     eng = state.engine
     om = state.order_manager
 
-    def on_maker_fill(fill) -> None:
+    def on_maker_fill(fill, candidates=None) -> None:
         if not eng or not om:
             return
 
-        order_id = fill.maker_order_id
-        asset_id = fill.asset_id
+        # ------------------------------------------------------------------
+        # Candidate resolution
+        # ------------------------------------------------------------------
+        # Build the candidate list. If user_ws supplied the keyword arg we
+        # use it; otherwise fall back to the legacy single-order_id flow.
+        if candidates:
+            # Each row: (order_id, asset_id, matched_amount). All FULL hashes.
+            candidate_pairs = [
+                (oid, aid, float(amt or 0))
+                for (oid, aid, amt) in candidates
+                if oid
+            ]
+        else:
+            candidate_pairs = [(fill.maker_order_id, fill.asset_id, fill.size)]
+
+        # Pick the first candidate that lives in our OrderManager.
+        # om.by_server_id does a full-hash dict lookup — no prefix matching.
+        chosen: tuple[str, str, float] | None = None
+        for cand in candidate_pairs:
+            if om.by_server_id(cand[0]):
+                chosen = cand
+                break
+
+        if chosen is None:
+            # None of the order_ids in the trade are ours — it's purely a
+            # counterparty trade (e.g. they traded against themselves) or
+            # the user_ws attribution failed. Either way, no position
+            # delta for us.
+            log.info(
+                "router.maker_fill.no_match",
+                candidates=[oid[:16] for oid, _, _ in candidate_pairs],
+                reason="none of the candidate order_ids match OrderManager",
+            )
+            return
+
+        order_id = chosen[0]
+        asset_id = chosen[1] or fill.asset_id
         fill_price = fill.price
-        # polymarket WS reports per-trade size (incremental). We must
-        # accumulate into the order's matched size before promoting to filled.
         fill_size_inc = fill.size
 
         if not order_id or fill_size_inc <= 0:
-            # H-V6-12 (audit m-2): surface this as info, not debug, so
-            # operators can see when upstream delivered a zero-size fill.
-            # The router itself can't tell whether the upstream was the
-            # WS-only path or WS+REST fallback — user_ws logs the
-            # fallback decision in `user_ws.rest_filled_size` separately.
+            # Same breadcrumb the legacy router had — keep the spelling for
+            # log continuity. The H-NEW-2026-07-14 trade-level candidate
+            # path bypasses this entirely when top-level size is 0 by
+            # refusing to emit a callback. We only fall through to here on
+            # the legacy 1-arg wiring.
             log.info(
                 "router.maker_fill.skip",
                 order_id=order_id, fill_size=fill_size_inc,
@@ -1303,20 +1347,14 @@ def _make_maker_fill_callback(state: AppState):
 
         tracked = om.by_server_id(order_id)
         if not tracked:
-            # H-NEW-2026-07-11 (audit v6-12): was DEBUG. Production symptom
-            # 2026-07-11 11:15:30: UserWS delivered a TRADE event with
-            # asset_id=DOWN token and a maker_order_id that did not match
-            # any tracked BUY GTD. Because the size field was 0 the skip
-            # path was logged at INFO — but if a future WS payload arrives
-            # with size>0 and an untracked order_id, the DEBUG-level skip
-            # below would silently drop the fill with no breadcrumb.
-            # Operators need to see untracked order_ids so they can spot
-            # WS payload mis-routing before it costs a position.
+            # Defensive: chosen matched in the loop above but disappeared
+            # before apply_fill_event runs (e.g. another callback purged
+            # it). Keep the existing INFO breadcrumb.
             log.info(
                 "router.maker_fill.untracked",
                 order_id=order_id, asset_id=asset_id[:16],
                 fill_size=fill_size_inc, fill_price=fill_price,
-                reason="no TrackedOrder matches server_order_id",
+                reason="no TrackedOrder matches server_order_id (race?)",
             )
             return
 
