@@ -138,6 +138,7 @@ class UserWS:
         on_maker_fill: UserMakerFillCallback | None = None,
         on_order: UserOrderCallback | None = None,
         order_cache: UserOrderCache | None = None,
+        clob: object | None = None,
     ) -> None:
         self._api_key = api_key
         self._api_secret = api_secret
@@ -149,6 +150,14 @@ class UserWS:
         self._task: asyncio.Task[None] | None = None
         self._url = USER_WS_URL
         self._pending_markets: set[str] = set()
+        # H-V6-12 fix: optional reference to CLOBClient so that when the WS
+        # delivers a trade event with size=0 (Polymarket WS quirk — see
+        # market_ws raw sample in production 2026-07-11), we can fall
+        # back to `clob.get_order_filled_size(order_id)` to read the
+        # authoritative `size_matched` from REST. This is what
+        # D:\05.project2\1.bquant\polymart3 does in its polling loop
+        # to recover from MATCHED-no-fills events.
+        self._clob = clob
 
     # ------------------------------------------------------------------
     # Public API
@@ -232,6 +241,21 @@ class UserWS:
         event_type = msg.get("event_type", "")
         type_ = msg.get("type", "")
         content = msg.get("content", msg)
+
+        # H-V6-12 debug: dump every trade message at info level so we can see
+        # which fields Polymarket actually sends (size, maker_orders, etc.).
+        # Throttled to first 5 per connection to avoid log spam in steady state.
+        if event_type == "trade" or type_ == "trade":
+            try:
+                self._trade_dump_count += 1
+            except AttributeError:
+                self._trade_dump_count = 0
+            if self._trade_dump_count < 5:
+                log.info(
+                    "user_ws.trade_raw",
+                    keys=list((content or {}).keys()),
+                    content=str(content)[:600],
+                )
 
         if event_type == "order" or type_ == "order":
             await self._handle_order(content)
@@ -345,7 +369,13 @@ class UserWS:
                     mo_id = str(mo.get("orderID", "") or mo.get("order_id", ""))
                     asset_id = str(mo.get("assetID", "") or mo.get("asset_id", ""))
                     mo_price = float(mo.get("price", 0))
-                    mo_size = float(mo.get("size", 0))
+                    # Polymarket WS payload may use any of: size / size_matched /
+                    # matched_size / amount / fill_size. Pull whichever is present
+                    # and non-zero. H-V6-12 (2026-07-11): the live WS test showed
+                    # size=0 across the board while CLOB reports size_matched=5.71
+                    # via REST — so the WS payload key for our account is one of
+                    # the alternates below, not the legacy `size` field.
+                    mo_size = self._extract_size_from_payload(mo)
                 except Exception:
                     log.debug("user_ws.maker_parse_error", mo=str(mo)[:200])
                     continue
@@ -353,6 +383,14 @@ class UserWS:
                 if not mo_id or not asset_id:
                     log.debug("user_ws.maker_missing_fields", mo=str(mo)[:200])
                     continue
+
+                # H-V6-12 fallback: WS payload reported size=0 even though the
+                # status is MATCHED/MINED/CONFIRMED. Ask CLOB REST for the
+                # authoritative size_matched for this order.
+                if mo_size <= 0 and status in ("MATCHED", "MINED", "CONFIRMED"):
+                    filled = await self._rest_filled_size(mo_id)
+                    if filled and filled > 0:
+                        mo_size = filled
 
                 fill = MakerFill(
                     maker_order_id=mo_id,
@@ -386,11 +424,17 @@ class UserWS:
             order_id = str(content.get("orderID", "") or content.get("order_id", ""))
             asset_id = str(content.get("assetID", "") or content.get("asset_id", ""))
             price = float(content.get("price", 0))
-            size = float(content.get("size", 0))
+            size = self._extract_size_from_payload(content)
 
             if not order_id:
                 log.debug("user_ws.trade_no_makers_no_id", content=str(content)[:200])
                 return
+
+            # H-V6-12 fallback (top-level path): same REST recovery.
+            if size <= 0 and status in ("MATCHED", "MINED", "CONFIRMED"):
+                filled = await self._rest_filled_size(order_id)
+                if filled and filled > 0:
+                    size = filled
 
             fill = MakerFill(
                 maker_order_id=order_id,
@@ -419,3 +463,49 @@ class UserWS:
 
         if fills_emitted == 0:
             log.debug("user_ws.trade_no_fills", content=str(content)[:200])
+
+    # ------------------------------------------------------------------
+    # Helpers (H-V6-12: WS size=0 fallback to REST)
+    # ------------------------------------------------------------------
+
+    _SIZE_KEYS = (
+        "size_matched",
+        "matched_size",
+        "matchedSize",
+        "fill_size",
+        "fillSize",
+        "amount",
+        "amount_matched",
+        "size",
+    )
+
+    def _extract_size_from_payload(self, payload: dict) -> float:
+        """Try each known WS size key; return the first non-zero value."""
+        for size_key in self._SIZE_KEYS:
+            v = payload.get(size_key)
+            if v is None:
+                continue
+            try:
+                candidate = float(v)
+            except (TypeError, ValueError):
+                continue
+            if candidate > 0:
+                return candidate
+        return 0.0
+
+    async def _rest_filled_size(self, order_id: str) -> float | None:
+        """
+        Fall back to CLOB REST `get_order` to read the authoritative
+        size_matched. Polymart3 (working sibling project) uses the same
+        pattern in its buy_token MATCHED-no-fills recovery path.
+        Returns None on error, 0.0 if order exists but isn't filled.
+        """
+        if not self._clob or not order_id:
+            return None
+        try:
+            return await self._clob.get_order_filled_size(order_id)
+        except Exception:
+            log.exception(
+                "user_ws._rest_filled_size.error", order_id=order_id[:16],
+            )
+            return None

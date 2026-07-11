@@ -301,6 +301,47 @@ class CLOBClient:
             log.debug("clob.get_token_balance.error", error=str(exc))
             return 0.0
 
+    async def get_order_filled_size(self, order_id: str) -> float | None:
+        """
+        H-V6-12 fix: read the authoritative `size_matched` for an order via
+        REST. Used as a fallback when the User WS delivers a fill event
+        but the WS payload's `size` field is 0 (a known Polymarket WS
+        quirk — the size key is sometimes `size`, sometimes `size_matched`,
+        and for SAFE / PROXY wallets the WS payload omits it entirely
+        from the top-level fields). Polymart3's working sibling project
+        uses the same fallback in its buy_token polling loop.
+        Returns size in shares (human units), or None if the call fails.
+        """
+        if not self._client:
+            return None
+        try:
+            resp = await self._run(self._client.get_order, order_id)
+            if not isinstance(resp, dict):
+                return None
+            for k in (
+                "size_matched",
+                "sizeMatched",
+                "amount_matched",
+                "amountMatched",
+                "filled_size",
+                "filledSize",
+            ):
+                v = resp.get(k)
+                if v is not None:
+                    try:
+                        f = float(v)
+                        if f > 0:
+                            return f
+                    except (TypeError, ValueError):
+                        continue
+            return 0.0
+        except Exception as exc:
+            log.debug(
+                "clob.get_order_filled_size.error",
+                order_id=order_id[:16], error=str(exc),
+            )
+            return None
+
     # ------------------------------------------------------------------
     # Order placement
     # ------------------------------------------------------------------
@@ -494,10 +535,20 @@ class CLOBClient:
             lifetime_consumed_s=round(age_s, 1),
         )
         try:
-            await self._run(self._client.cancel_order, order_id)
+            # H-V6-12 fix: SDK v2 `cancel_order(payload)` takes an OrderPayload
+            # object (with .orderID field), not a raw string.  Earlier code
+            # passed the string directly which crashed with
+            # "'str' object has no attribute 'orderID'".  Use the v2 list
+            # endpoint `cancel_orders` instead — same wire format, fewer
+            # surface area mismatches.
+            cancel_resp = await self._run(
+                self._client.cancel_orders,
+                [{"orderID": order_id}],
+            )
             log.info(
                 "clob.gtd_buy poll_timeout_cancel_sent",
                 order_id=order_id[:16],
+                cancel_resp=str(cancel_resp)[:120],
             )
         except Exception as exc:
             log.warning(

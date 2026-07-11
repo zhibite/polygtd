@@ -676,7 +676,31 @@ async def _status_loop() -> None:
                 f"T{t.tier}={'✓' if t.is_complete else ('⏳' if t.placed else '○')}"
                 for t in pos.tiers
             )
-            pos_str = f" | tiers=[{tiers_str}] qty={pos.total_qty:.2f} cost=${pos.total_cost:.2f}"
+            # H-V6-12 (operator request): STATUS should show live position
+            # cost basis + unrealized PnL%, so operators can see fill impact
+            # at a glance instead of cross-referencing position.fill_recorded
+            # events. Up / Down midpoint is already on the line as up_last /
+            # down_last; pick the one matching position.entry_side.
+            held_mid = 0.0
+            if pos.entry_side == "UP":
+                held_mid = up_last
+            elif pos.entry_side == "DOWN":
+                held_mid = down_last
+            unreal_pnl = 0.0
+            unreal_pnl_pct = 0.0
+            if pos.avg_cost > 0 and pos.total_qty > 0 and held_mid > 0:
+                unreal_pnl = (held_mid - pos.avg_cost) * pos.total_qty
+                unreal_pnl_pct = (held_mid - pos.avg_cost) / pos.avg_cost
+            pnl_pct_str = f"({unreal_pnl_pct * 100:+.1f}%)" if pos.total_qty > 0 else ""
+            side_str = pos.entry_side or "-"
+            pos_str = (
+                f" | side={side_str} tiers=[{tiers_str}]"
+                f" qty={pos.total_qty:.2f}"
+                f" avg={pos.avg_cost:.4f}"
+                f" cost=${pos.total_cost:.2f}"
+                f" mid={held_mid:.4f}"
+                f" uPnL=${unreal_pnl:+.2f}{pnl_pct_str}"
+            )
 
         # H-V6-9: surface the cached best_bid for UP/DOWN so the operator
         # can tell from STATUS whether the WS bba path is actually feeding
@@ -830,6 +854,7 @@ async def main() -> None:
             api_passphrase=cfg_strategy.API_PASSPHRASE,
             on_maker_fill=_make_maker_fill_callback(s),
             on_order=_make_user_ws_order_callback(s),
+            clob=s.clob,  # H-V6-12: REST fallback when WS size=0
         )
     else:
         log.warning(
@@ -937,9 +962,12 @@ def _make_maker_fill_callback(state: AppState):
         fill_size_inc = fill.size
 
         if not order_id or fill_size_inc <= 0:
-            log.debug(
+            # H-V6-12: surface this as info, not debug, so operators can
+            # see when WS delivers a fill event the router silently drops.
+            log.info(
                 "router.maker_fill.skip",
                 order_id=order_id, fill_size=fill_size_inc,
+                reason="WS size=0 + REST fallback returned 0/None",
             )
             return
 
