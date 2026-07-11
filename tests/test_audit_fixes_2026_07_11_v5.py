@@ -16,6 +16,15 @@ Covers:
             forwards messages to LogRecord.getMessage() which expects
             `%`-formatting and crashes on Python format specs
             (production crash: TypeError at engine.py:436 in _check_t1_entry)
+  H-V6-7  — WindowManager._run() is now a deterministic boundary loop
+            (sleep until next 15-min boundary, advance round_start_ts by
+            exactly one period, fetch market, fire _on_new). No inner
+            1-Hz polling loop, no `now_start_in != _last_round_start`
+            detection race; all side effects in a single
+            `_on_round_start()` handler with try/except wrappers. Bug:
+            2026-07-11 00:30 — bot started 1s before a boundary, the
+            boot/inner-loop path silently never reached `_on_new` for
+            the 00:30 round, engine stayed on the boot round forever.
 
 Run via `pytest tests/test_audit_fixes_2026_07_11_v5.py`.
 """
@@ -318,57 +327,36 @@ async def test_h_v5_1_tp_fires_when_no_averaging_inflight() -> None:
 
 
 def test_h_v6_3_boundary_loop_calls_on_new_after_successful_tick() -> None:
-    """Static check on WindowManager._run(): after a successful tick() at
-    a boundary, self._on_new(now_start_in) must be awaited exactly once.
+    """Static check on WindowManager: at every round boundary the manager
+    must (1) advance `_last_round_start` and (2) fire `_on_new` exactly
+    once with the new round_start_ts.
 
     Pre-fix, the call was inside the `except Exception:` branch and only
     fired when tick() raised — meaning the strategy never received a
     boundary notification unless the discovery call failed.
+
+    H-V6-7 refactor: boundary detection is now deterministic arithmetic
+    (`_last_round_start += round_period`), no inner polling loop, no
+    `now_start_in != _last_round_start` check. Verify the new shape.
     """
     import inspect
     from src.market.window_manager import WindowManager
 
     src = inspect.getsource(WindowManager._run)
-    # Must contain the success-path on_new call (outside the except block).
-    assert "await self.tick(self._symbols, force_discovery=True)" in src
-    assert (
-        "await self._on_new(now_start_in)" in src
-    ), "H-V6-3: boundary success path no longer awaits self._on_new."
-
-    # The success-path call must NOT live inside an `except` exception
-    # handler. We verify by parsing the source for the `try: / except: /
-    # if self._on_new:` block ordering — the `if self._on_new:` that
-    # follows the `await self.tick(...)` must sit at the SAME indent as
-    # `try:` (i.e. outside the except handler).
-    lines = src.splitlines()
-    tick_line_idx = next(
-        i for i, ln in enumerate(lines)
-        if "await self.tick(self._symbols, force_discovery=True)" in ln
+    # Must advance the round deterministically (no polling).
+    assert "self._last_round_start = next_boundary" in src, (
+        "H-V6-7 violation: WindowManager._run does not advance "
+        "_last_round_start deterministically. Without this the boundary "
+        "loop can no longer switch rounds."
     )
-    # Find the nearest preceding `try:` line at lower indent.
-    try_indent = None
-    for k in range(tick_line_idx - 1, -1, -1):
-        stripped = lines[k].lstrip()
-        if stripped.startswith("try:"):
-            try_indent = len(lines[k]) - len(stripped)
-            break
-    assert try_indent is not None, "could not find `try:` above tick() call"
-
-    # Find the `if self._on_new:` line that follows tick() and verify it
-    # sits at the same indent as `try:` (i.e. outside the except handler).
-    on_new_idx = next(
-        (i for i in range(tick_line_idx + 1, len(lines))
-         if "if self._on_new:" in lines[i]),
-        None,
+    assert "window_mgr.round_transition" in src, (
+        "H-V6-7 violation: missing round_transition log marker."
     )
-    assert on_new_idx is not None, (
-        "could not find `if self._on_new:` after the tick() call"
-    )
-    on_new_indent = len(lines[on_new_idx]) - len(lines[on_new_idx].lstrip())
-    assert on_new_indent == try_indent, (
-        "H-V6-3 violation: `if self._on_new:` is inside the `except` block "
-        f"(on_new_indent={on_new_indent}, try_indent={try_indent}). "
-        "Move it OUT of the except handler so the success path fires."
+    # No more inner polling loop — boundary switch must be a single
+    # sequential code path so a transient exception can't kill the task.
+    assert "while self._running and not detected" not in src, (
+        "H-V6-7 violation: inner 1-Hz polling loop is back. Reverting "
+        "to the deterministic sleep-until-next-boundary model."
     )
 
 
@@ -377,21 +365,101 @@ async def test_h_v6_3_boot_discovery_fires_on_new() -> None:
     """After boot tick() discovers the current window, _on_new must be
     invoked with the current round_start_ts so the engine transitions to
     the active window even when no boundary has fired yet.
+
+    H-V6-7 refactor: the boot path goes through `_on_round_start()`,
+    which awaits `tick()` then awaits `_on_new(round_start_ts)`. Both
+    steps are wrapped in try/except so a transient Gamma 5xx cannot
+    kill the boundary loop (the exact bug we saw 2026-07-11 00:30).
     """
     import inspect
     from src.market.window_manager import WindowManager
 
-    src = inspect.getsource(WindowManager._run)
-    # The boot block calls `await self.tick(...)` and then must call
-    # `await self._on_new(self._last_round_start)` outside any try/except.
-    boot_on_new = (
-        "boot on_new_round_failed" in src  # marker log from our fix
-        and "await self._on_new(self._last_round_start)" in src
+    src_run = inspect.getsource(WindowManager._run)
+    src_handler = inspect.getsource(WindowManager._on_round_start)
+
+    # `_on_round_start` is the single funnel for both boot + steady-state.
+    assert "_on_round_start" in src_run, (
+        "H-V6-7 violation: WindowManager._run does not call _on_round_start."
     )
-    assert boot_on_new, (
-        "H-V6-3 violation: WindowManager boot path does not fire _on_new "
-        "after tick() — first round of every session has engine._round=None."
+
+    # Both tick() and _on_new must be called inside _on_round_start, each
+    # wrapped so a transient failure is logged, not fatal.
+    assert "await self.tick(self._symbols, force_discovery=True)" in src_handler
+    assert "await self._on_new(round_start_ts)" in src_handler
+    assert "window_mgr.tick failed" in src_handler, (
+        "H-V6-7 violation: _on_round_start does not guard tick() with try/except."
     )
+    assert "window_mgr.on_new_round failed" in src_handler, (
+        "H-V6-7 violation: _on_round_start does not guard _on_new() with try/except."
+    )
+
+
+@pytest.mark.asyncio
+async def test_h_v6_7_run_fires_on_new_at_each_boundary_deterministically() -> None:
+    """Runtime check: `_run()` must (1) fire `_on_new` once on boot with
+    the current round, then (2) fire it again exactly once at the next
+    15-min boundary, advancing by exactly one period.
+
+    The boundary transition must NOT rely on a polling loop. Pre-fix the
+    code had a 1Hz inner `while self._running and not detected:` poll
+    that could silently die on any exception and leave the process stuck
+    on the boot round (production symptom: 2026-07-11 00:30 — bot
+    started 1s before a boundary, never logged `round_transition`,
+    T1 never placed).
+    """
+    import asyncio
+    from src.market.window_manager import WindowManager
+
+    fired: list[int] = []
+
+    async def _on_new(round_start_ts: int) -> None:
+        fired.append(round_start_ts)
+
+    class _FakeSvc:
+        async def discover_market(self, asset: str):  # noqa: ARG002
+            return None
+
+    wm = WindowManager(
+        market_svc=_FakeSvc(),  # type: ignore[arg-type]
+        symbols=["BTC"],
+        on_new_round=_on_new,
+        round_period_s=2,  # tiny period so the test runs fast
+    )
+    # H-V6-7: the loop guards on `wm._running`. Production wires this
+    # through `wm.start()`. Mirror that here so the test exercises the
+    # real boundary path.
+    wm._running = True
+
+    # Boot fires _on_new(boot_round).
+    boot_task = asyncio.create_task(wm._run())
+    # Give the boot step a moment to run.
+    await asyncio.sleep(0.1)
+    assert len(fired) == 1, (
+        f"H-V6-7: boot should fire _on_new exactly once, got {fired}"
+    )
+    boot_round = fired[0]
+    assert boot_round % 2 == 0, "boot round must align to period"
+
+    # Wait for at least one more boundary.
+    for _ in range(50):
+        await asyncio.sleep(0.1)
+        if len(fired) >= 2:
+            break
+
+    assert len(fired) >= 2, (
+        f"H-V6-7: _run never advanced to next boundary; fired={fired}"
+    )
+    assert fired[1] == boot_round + 2, (
+        f"H-V6-7: second _on_new must be boot_round + period "
+        f"({boot_round + 2}), got {fired[1]}"
+    )
+
+    wm._running = False
+    boot_task.cancel()
+    try:
+        await boot_task
+    except asyncio.CancelledError:
+        pass
 
 
 @pytest.mark.asyncio

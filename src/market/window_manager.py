@@ -101,6 +101,23 @@ class WindowManager:
                  period_s=self._round_period,
                  current_round=self._last_round_start)
         self._task = asyncio.create_task(self._run())
+        # H-V6-6: surface any silent exception that kills _run() (the boundary
+        # poll loop has no top-level try/except and asyncio would otherwise
+        # swallow task exceptions quietly). When this fires, the engine never
+        # receives `_on_new()` again and stays stuck on the boot round.
+        self._task.add_done_callback(self._on_run_done)
+
+    def _on_run_done(self, task: asyncio.Task) -> None:
+        if task.cancelled():
+            log.warning("window_mgr._run cancelled")
+            return
+        exc = task.exception()
+        if exc is not None:
+            log.error(
+                "window_mgr._run crashed",
+                error=str(exc),
+                exc_type=type(exc).__name__,
+            )
 
     async def stop(self) -> None:
         self._running = False
@@ -112,10 +129,9 @@ class WindowManager:
                 pass
         log.info("window_mgr.stopped")
 
-    @staticmethod
-    def _round_start_of(ts: float | int) -> int:
-        """Floor ts to nearest 15-min boundary."""
-        return int(ts // 900) * 900
+    def _round_start_of(self, ts: float | int) -> int:
+        """Floor ts to nearest `round_period_s` boundary."""
+        return int(ts // self._round_period) * self._round_period
 
     def next_round_start(self) -> int:
         return self._round_start_of(time.time()) + self._round_period
@@ -125,99 +141,80 @@ class WindowManager:
 
     async def _run(self) -> None:
         """
-        Drive window discovery with precise boundary detection.
+        Drive window round boundaries.
 
-        Boot step: discover current window immediately (needed for token IDs).
-        Steady state: sleep until 3 s before each 15-min boundary, then poll every
-        second until the new window is detected.
+        15-min round starts are deterministic arithmetic:
+            round_start_ts = floor(unix_time / 900) * 900
+
+        So we don't need to *detect* the boundary — we just sleep until the
+        next one and switch.
+
+        Boot step: resolve the current round, fetch its market (for token
+        IDs), and fire `_on_new` so engine / strategy state is seeded.
+
+        Steady state: sleep until 0.5 s after the next boundary, advance
+        round_start_ts by one period, repeat.
+
+        Every step is wrapped in try/except so a transient Gamma / network
+        blip cannot kill the boundary loop (otherwise one bad fetch would
+        leave us stuck on the boot round forever, exactly the bug from
+        2026-07-11 00:30 where `window_mgr.round_transition` never logged).
         """
-        # ── Boot: discover the window that's already running ──────────────────
-        # On startup we already know _last_round_start = current 15-min floor,
-        # so the existing window's market needs to be fetched once for token IDs.
+        # ── Boot: resolve current round, fetch its market, fire _on_new ────────
+        self._last_round_start = self._round_start_of(time.time())
+        log.info(
+            "window_mgr.boot",
+            current_round=self._last_round_start,
+            period_s=self._round_period,
+        )
+        await self._on_round_start(self._last_round_start)
+
+        # ── Steady state: deterministic boundary switching ─────────────────────
+        while self._running:
+            next_boundary = self._last_round_start + self._round_period
+            secs_to_boundary = next_boundary - time.time()
+            # Sleep until 0.5 s after the boundary so we're past any race
+            # with the 15-min clock on the server.
+            sleep_for = max(0.0, secs_to_boundary + 0.5)
+            try:
+                await asyncio.sleep(sleep_for)
+            except asyncio.CancelledError:
+                raise
+            if not self._running:
+                return
+
+            prev = self._last_round_start
+            self._last_round_start = next_boundary
+            log.info(
+                "window_mgr.round_transition",
+                prev_start=prev,
+                new_start=self._last_round_start,
+            )
+            await self._on_round_start(self._last_round_start)
+
+    async def _on_round_start(self, round_start_ts: int) -> None:
+        """
+        Single round-start handler: refresh market for the new round and
+        fire `_on_new` exactly once. Exceptions are logged and swallowed so
+        a transient failure (Gamma 5xx, network timeout) cannot kill the
+        boundary loop. The next boundary will retry.
+        """
         try:
             await self.tick(self._symbols, force_discovery=True)
         except Exception:
-            log.exception("window_mgr.boot tick raised")
+            log.exception(
+                "window_mgr.tick failed",
+                round_start_ts=round_start_ts,
+            )
 
-        # H-V6-3 fix: also fire `_on_new` after boot discovery so the engine
-        # transitions to the current (already-running) window. Without this
-        # the first round of every session has `engine._round = None` because
-        # the boundary loop's `_on_new` only fires after the boundary fires
-        # AGAIN — i.e. 15+ minutes after boot.
         if self._on_new:
             try:
-                await self._on_new(self._last_round_start)
+                await self._on_new(round_start_ts)
             except Exception:
                 log.exception(
-                    "window_mgr.boot on_new_round_failed",
-                    round_start_ts=self._last_round_start,
+                    "window_mgr.on_new_round failed",
+                    round_start_ts=round_start_ts,
                 )
-
-        while self._running:
-            now = time.time()
-            now_start = self._round_start_of(now)
-            next_boundary = now_start + self._round_period
-            secs_to_boundary = next_boundary - now
-
-            # Idle: sleep until 3 s before the next boundary
-            if secs_to_boundary > 3:
-                await asyncio.sleep(secs_to_boundary - 3)
-                continue
-
-            # Boundary window: poll every second until new window is found
-            detected = False
-            while self._running and not detected:
-                now_in = time.time()
-                now_start_in = self._round_start_of(now_in)
-
-                round_changed = (now_start_in != self._last_round_start)
-
-                if round_changed:
-                    detected = True
-                    prev = self._last_round_start
-                    self._last_round_start = now_start_in
-
-                    known = []
-                    for asset in self._symbols:
-                        ctx = self._ctxs[asset]
-                        if ctx.market and ctx.condition_id:
-                            known.append(
-                                f"{asset}[up={ctx.market.token_up_id[:8]},"
-                                f"down={ctx.market.token_down_id[:8]},"
-                                f"end={ctx.market.window_end}]"
-                            )
-                    log.info("window_mgr.round_transition",
-                             prev_start=prev,
-                             new_start=now_start_in,
-                             next_start=next_boundary,
-                             markets=", ".join(known) if known else "(no active market yet)")
-
-                    try:
-                        await self.tick(self._symbols, force_discovery=True)
-                    except Exception:
-                        log.exception("window_mgr.tick raised")
-                    # H-V6-3 fix: `_on_new` (which fires `main._on_new_round`
-                    # → `engine.on_new_round`) MUST be invoked on every
-                    # successful boundary transition, not only on the
-                    # fallback path. Without this, `engine._round` stays
-                    # `None` across the lifetime of the process (set to None
-                    # by `engine.__init__` and only re-populated by
-                    # `on_new_round`). The downstream `_evaluate()` short-
-                    # circuits at `if not self._round: return` and the
-                    # strategy never places T1, even though the STATUS log
-                    # shows `baseline=... drift=PASS` (because the gate is
-                    # seeded separately via `_on_baseline`). Symptom: 30s+ of
-                    # STATUS showing PASS with no `engine.trigger_t1`.
-                    if self._on_new:
-                        try:
-                            await self._on_new(now_start_in)
-                        except Exception:
-                            log.exception(
-                                "window_mgr.on_new_round_failed",
-                                round_start_ts=now_start_in,
-                            )
-
-                await asyncio.sleep(1.0)
 
     # ── Public API ──────────────────────────────────────────────────────────────
 
