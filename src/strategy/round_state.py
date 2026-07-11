@@ -325,6 +325,73 @@ class Position:
             target_qty=target_qty,
         )
 
+    def realize_position_closed(self, *, source: str, note: str = "") -> None:
+        """Authoritatively clear ALL position state — used when external
+        evidence proves the inventory is gone (CLOB balance reconciliation,
+        user sold manually via UI, etc.).
+
+        H-NEW-2026-07-11 (audit v6-12 production revisit): the engine's
+        in-memory Position was the *only* source of truth for inventory.
+        When the user's manual UI-side SELL drained the wallet but the
+        UserWS still fed `size=0` fill events to the engine, every tier
+        was kept at `qty=5.00` even though no token existed on-chain. The
+        next TP trigger then deadlocked into a 400-not-enough-balance
+        retry loop — production saw 11 retries in <3 seconds.
+
+        This method is the explicit "I have authoritative evidence that
+        the position is gone; forget what we thought we knew" hook:
+
+          - clears _tp_inflight, _tp_snapshots
+          - resets each tier's placed/watching/filled/server_order_id
+            but PRESERVES the *fill* state on T1 (so the round does not
+            ghost-re-fire trigger_t1 the next tick).
+          - sets _total_qty / _total_cost / _avg_cost to zero so the
+            STATUS line stops reporting a phantom position.
+          - leaves the round itself alive (so the engine can still
+            process averaging tiers if they were in flight) but the
+            position is_empty property will return True.
+
+        Called by router.tp_runner when balance/allowance POST 400s and a
+        subsequent REST `get_token_balance` returns 0.
+        """
+        prev_qty = self._total_qty
+        prev_cost = self._total_cost
+
+        # Reset aggregator state.
+        self._total_qty = 0.0
+        self._total_cost = 0.0
+        self._avg_cost = 0.0
+        self._tp_inflight = False
+        self._last_qty_signature = 0.0
+        self._tp_snapshots.clear()
+        self._applied_watcher_dedup.clear()
+
+        # Reset tier mutex state but PRESERVE buy fills so the engine
+        # does not re-fire trigger_t1 next tick.
+        for tier in self.tiers:
+            tier.placed = False
+            tier.watching = False
+            tier.placed_qty = 0.0
+            tier.server_order_id = None
+            tier.expires_at = 0.0
+            tier.watcher_task = None
+            tier.token_id = None
+            # NOTE: tier.filled, tier.size_filled, tier.cost_filled,
+            # tier.avg_fill_price preserved intentionally.
+
+        log.warning(
+            "position.realize_closed",
+            source=source,
+            note=note,
+            prev_qty=prev_qty,
+            prev_cost=prev_cost,
+            tiers_preserved=[t.tier for t in self.tiers if t.filled],
+            note_2=(
+                "all in-memory position state cleared; tier BUY fills "
+                "preserved so engine does not ghost-fire trigger_t1"
+            ),
+        )
+
     def record_tp_fill(
         self,
         server_order_id: str,

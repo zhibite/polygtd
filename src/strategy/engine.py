@@ -117,6 +117,15 @@ class StrategyEngine:
         # averaging-down `_check_average_down` skip events. Mirrors
         # `_t1_skip_last_log_ts` on the entry side.
         self._tN_skip_last_log_ts: dict[str, float] = {}
+        # H-NEW-2026-07-11 (audit v6-12 production revisit): backoff state
+        # for the TP path. `_tp_last_post_error_ts` is set whenever
+        # `router.tp_failed` is emitted (POST was rejected); subsequent
+        # `_evaluate` ticks must NOT re-fire trigger_tp until
+        # `_tp_backoff_s` has elapsed. This breaks the
+        # `engine.trigger_tp → POST 400 → router.tp_failed → mutex
+        # cleared → next tick fires again` infinite loop.
+        self._tp_last_post_error_ts: float = 0.0
+        self._tp_backoff_s: float = 60.0
 
     # H-NEW-2026-07-11: helper that reads PRICE_PRE_MARGIN safely even for
     # tests that construct engine via __new__ (bypassing __init__).
@@ -371,6 +380,45 @@ class StrategyEngine:
                 token=token_id[:16], order_id=server_order_id,
             )
             return
+
+    def notify_tp_post_error(self, reason: str) -> None:
+        """Called by router when a TP SELL POST was rejected by the CLOB.
+
+        Sets the backoff gate so `_check_take_profit` will not re-fire
+        trigger_tp for `_tp_backoff_s` seconds. Also clears `_tp_inflight`
+        since the previous attempt definitively failed.
+
+        H-NEW-2026-07-11 (audit v6-12 production revisit): without this,
+        the engine deadlocks into a hot retry loop on every tick when the
+        CLOB rejects the SELL with `not enough balance / allowance`. The
+        position remains `total_qty > 0` in-memory because no SELL fill
+        ever landed, but the bot cannot sell — and without a backoff it
+        would re-attempt the impossible POST ~4 times per second.
+
+        The retry-blocking is best-effort: when the user (or a manual
+        cleanup) re-supplies balance, a successful place call (which
+        clears `_tp_inflight` via `apply_sell_fill` path or via the
+        `tp_runner` returned-order branch) is enough to start firing
+        again — or if 60s elapses without a successful POST we re-arm,
+        because the user's manual side-sell may have freed up the
+        allowance by then.
+        """
+        self._tp_last_post_error_ts = time.time()
+        if self._round is not None:
+            self._round.position._tp_inflight = False
+        log.warning(
+            "engine.tp_backoff_engaged",
+            reason=reason,
+            backoff_s=self._tp_backoff_s,
+            note="trigger_tp suppressed until backoff elapses",
+        )
+
+    def notify_tp_recovered(self) -> None:
+        """Called by router when a TP SELL POST succeeded (or was
+        invalidated by external sync). Clears the backoff gate so the
+        next `_check_take_profit` tick can re-arm TP if still eligible.
+        """
+        self._tp_last_post_error_ts = 0.0
 
         if self._round.position.is_empty:
             log.debug(
@@ -741,6 +789,32 @@ class StrategyEngine:
         if not pos.baseline_set or pos.entry_token is None:
             return
 
+        # ── DIAG-2026-07-11: trace why T2 averaging never fires ────────────
+        # Placed BEFORE the silent early-returns so we always see the live
+        # state. Remove once the bug is located.
+        try:
+            _trace_mid = self._pc.get_midpoint(pos.entry_token) if pos.entry_token else 0.0
+            _cache_keys = list(self._pc.midpoint.keys())
+            log.info(
+                "engine.t2_diag",
+                entry_token=pos.entry_token[:32] if pos.entry_token else None,
+                cache_key_match=pos.entry_token in self._pc.midpoint if pos.entry_token else False,
+                cache_keys_count=len(_cache_keys),
+                cache_first_key=_cache_keys[0][:32] if _cache_keys else None,
+                cache_first_mid=self._pc.midpoint[_cache_keys[0]] if _cache_keys else None,
+                mid=_trace_mid,
+                tp_inflight=pos._tp_inflight,
+                baseline_realized=pos.baseline_realized_price,
+                baseline_set_realized=pos.baseline_set_realized,
+                baseline_target=pos.baseline_target_price,
+                tier2_placed=pos.tiers[1].placed,
+                tier2_watching=pos.tiers[1].watching,
+                tier2_is_complete=pos.tiers[1].is_complete,
+                tier2_server_id=pos.tiers[1].server_order_id,
+            )
+        except Exception as _diag_exc:
+            log.warning("engine.t2_diag.error", error=str(_diag_exc))
+
         if pos._tp_inflight:
             return
 
@@ -921,6 +995,20 @@ class StrategyEngine:
 
         pos = self._round.position
         if not pos.entry_token or pos.total_qty <= 0:
+            return
+
+        # H-NEW-2026-07-11 (audit v6-12 production revisit): backoff after
+        # a TP attempt that POSTed but was rejected by the CLOB (typically
+        # `not enough balance / allowance`). Without this, every
+        # `_evaluate` tick re-fires trigger_tp, POSTs another SELL,
+        # receives the same 400, and the cycle never terminates —
+        # production saw 11 retries in <3 seconds.
+        # Tolerate tests that construct engine via __new__ without
+        # running __init__.
+        last_err = getattr(self, "_tp_last_post_error_ts", 0.0) or 0.0
+        backoff = getattr(self, "_tp_backoff_s", 60.0) or 60.0
+        now = time.time()
+        if last_err > 0.0 and now - last_err < backoff:
             return
 
         if pos._tp_inflight:

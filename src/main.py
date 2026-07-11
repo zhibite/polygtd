@@ -156,6 +156,65 @@ STATE = AppState()
 # Action router — bridges StrategyEngine -> OrderManager + Position state
 # ---------------------------------------------------------------------------
 
+
+async def _maybe_realize_closed(token_id: str, eng, pos) -> None:
+    """If the CLOB reports zero token balance for `token_id`, instruct
+    `Position.realize_position_closed()` to drop the phantom inventory.
+
+    H-NEW-2026-07-11 (audit v6-12 production revisit): the bot used to
+    re-fire trigger_tp into a hot retry loop when the user's wallet had
+    been drained by a manual UI-side SELL, because (a) the UserWS still
+    delivered `size=0` fill events and (b) `_check_take_profit` had no
+    backoff. This helper is the authoritative reconciliation path: it
+    asks the CLOB "how many of this token do I actually hold?" and, if
+    the answer is zero, resets the position state so the next STATUS
+    line is honest and trigger_tp stops firing.
+
+    Best-effort: a transient REST failure does NOT clear state — we
+    only act on a definitive balance==0.
+    """
+    try:
+        bal = await eng._state.clob.get_token_balance(token_id)
+    except Exception as exc:
+        log.debug(
+            "router.realize_check.failed",
+            token=token_id[:16], error=str(exc),
+            note="REST balance check errored; keeping in-memory position as-is",
+        )
+        return
+
+    # balance is in shares; epsilon-comparison with the in-memory qty.
+    if bal <= 0.5 and pos.total_qty > 0.5:
+        log.warning(
+            "router.realize_check.drained",
+            token=token_id[:16],
+            clob_balance_shares=bal,
+            in_memory_qty=pos.total_qty,
+            note="CLOB balance is 0 but engine still thinks we hold tokens; "
+                 "calling realize_position_closed()",
+        )
+        pos.realize_position_closed(
+            source="router.realize_check",
+            note=(
+                "REST get_token_balance returned 0 during TP-rejection "
+                "reconciliation; user-side UI sell (or upstream bot crash "
+                "consuming the inventory) is the most likely cause"
+            ),
+        )
+    elif bal + 0.5 < pos.total_qty:
+        # Partial drain — log it but DON'T auto-clear, since we may still
+        # be able to sell the residual via TP. The bot will retry at the
+        # next backoff elapse.
+        log.warning(
+            "router.realize_check.partial_drain",
+            token=token_id[:16],
+            clob_balance_shares=bal,
+            in_memory_qty=pos.total_qty,
+            note="CLOB balance < in-memory qty but > 0; leaving position "
+                 "intact, backoff will retry sell",
+        )
+
+
 class ActionRouter:
     """Converts StrategyEngine Actions into OrderManager calls and wires fill events.
 
@@ -493,6 +552,15 @@ class ActionRouter:
             # un-filled, the watcher reports EXPIRED and we clear the
             # mutex so the next tick can re-arm if mid is still above
             # the pre-arm fire line.
+            #
+            # H-NEW-2026-07-11 (audit v6-12 production revisit): on
+            # POST-failure we MUST tell the engine to backoff, otherwise
+            # the next 0.25s `_evaluate` tick re-fires trigger_tp and we
+            # re-POST the same unfulfillable order. Production saw 11
+            # retries in <3s. We also REST-check the token balance: if
+            # the on-chain inventory is actually 0 (e.g. user sold via
+            # UI while we still believed in 5 tokens), we tell the
+            # Position to forget the phantom inventory.
             async def _tp_runner() -> None:
                 try:
                     if not eng._round:
@@ -515,7 +583,23 @@ class ActionRouter:
                             qty=action.qty,
                             reason="om.place_gtd_sell_at_price returned None",
                         )
+                        # Engage engine backoff + reconcile inventory.
+                        if hasattr(eng, "notify_tp_post_error"):
+                            try:
+                                eng.notify_tp_post_error(
+                                    reason="place_gtd_sell_at_price returned None"
+                                )
+                            except Exception:
+                                pass
+                        if hasattr(eng, "_state"):
+                            try:
+                                await _maybe_realize_closed(
+                                    action.token, eng, pos
+                                )
+                            except Exception:
+                                pass
                         return
+                    eng.notify_tp_recovered()
                     pos.register_tp(
                         server_order_id=order.server_order_id or "",
                         token_id=action.token,
@@ -539,8 +623,42 @@ class ActionRouter:
                     )
                 except Exception as exc:
                     log.exception("router.tp_runner_crashed", error=str(exc))
+                    # Defensive release of _tp_inflight. Even if
+                    # notify_tp_post_error / realize check paths below
+                    # fail (e.g. test stubs that don't implement
+                    # notify_tp_post_error), the mutex MUST come down so
+                    # subsequent ticks don't re-fire trigger_tp on a
+                    # permanently-failed attempt.
                     if eng._round:
                         eng._round.position._tp_inflight = False
+                    # H-NEW-2026-07-11 (audit v6-12 production revisit):
+                    # engage the backoff gate so trigger_tp is suppressed
+                    # for `_tp_backoff_s` seconds (default 60s). Skip
+                    # silently on stubs (real production engines always
+                    # have this method).
+                    if hasattr(eng, "notify_tp_post_error"):
+                        try:
+                            eng.notify_tp_post_error(
+                                reason=f"tp_runner exception: {exc!r}"
+                            )
+                        except Exception:
+                            log.debug(
+                                "router.tp_runner.notify_failed",
+                                note="notify_tp_post_error raised; "
+                                     "continuing with mutex already cleared",
+                            )
+                    if eng._round and hasattr(eng, "_state"):
+                        try:
+                            await _maybe_realize_closed(
+                                action.token, eng, eng._round.position
+                            )
+                        except Exception:
+                            log.debug(
+                                "router.tp_runner.realize_failed",
+                                note="_maybe_realize_closed raised; "
+                                     "in-memory state may be stale until "
+                                     "next reconcile",
+                            )
 
             task = asyncio.create_task(_tp_runner())
             self._state._bg_tasks.add(task)
