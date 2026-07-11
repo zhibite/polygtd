@@ -686,12 +686,15 @@ async def _status_loop() -> None:
                 held_mid = up_last
             elif pos.entry_side == "DOWN":
                 held_mid = down_last
-            unreal_pnl = 0.0
-            unreal_pnl_pct = 0.0
-            if pos.avg_cost > 0 and pos.total_qty > 0 and held_mid > 0:
+            has_pos = pos.avg_cost > 0 and pos.total_qty > 0 and held_mid > 0
+            if has_pos:
                 unreal_pnl = (held_mid - pos.avg_cost) * pos.total_qty
                 unreal_pnl_pct = (held_mid - pos.avg_cost) / pos.avg_cost
-            pnl_pct_str = f"({unreal_pnl_pct * 100:+.1f}%)" if pos.total_qty > 0 else ""
+                pnl_pct_str = f"({unreal_pnl_pct * 100:+.1f}%)"
+                sign = "+" if unreal_pnl > 0 else ("-" if unreal_pnl < 0 else "")
+                upnl_str = f"${sign}{abs(unreal_pnl):.2f}{pnl_pct_str}"
+            else:
+                upnl_str = "$0.00"
             side_str = pos.entry_side or "-"
             pos_str = (
                 f" | side={side_str} tiers=[{tiers_str}]"
@@ -699,7 +702,7 @@ async def _status_loop() -> None:
                 f" avg={pos.avg_cost:.4f}"
                 f" cost=${pos.total_cost:.2f}"
                 f" mid={held_mid:.4f}"
-                f" uPnL=${unreal_pnl:+.2f}{pnl_pct_str}"
+                f" uPnL={upnl_str}"
             )
 
         # H-V6-9: surface the cached best_bid for UP/DOWN so the operator
@@ -962,12 +965,15 @@ def _make_maker_fill_callback(state: AppState):
         fill_size_inc = fill.size
 
         if not order_id or fill_size_inc <= 0:
-            # H-V6-12: surface this as info, not debug, so operators can
-            # see when WS delivers a fill event the router silently drops.
+            # H-V6-12 (audit m-2): surface this as info, not debug, so
+            # operators can see when upstream delivered a zero-size fill.
+            # The router itself can't tell whether the upstream was the
+            # WS-only path or WS+REST fallback — user_ws logs the
+            # fallback decision in `user_ws.rest_filled_size` separately.
             log.info(
                 "router.maker_fill.skip",
                 order_id=order_id, fill_size=fill_size_inc,
-                reason="WS size=0 + REST fallback returned 0/None",
+                reason="upstream delivered size=0 fill event",
             )
             return
 

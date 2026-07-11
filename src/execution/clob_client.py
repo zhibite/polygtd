@@ -301,6 +301,14 @@ class CLOBClient:
             log.debug("clob.get_token_balance.error", error=str(exc))
             return 0.0
 
+    # Polymarket CLOB uses 6-decimal fixed-math for all numeric order fields
+    # (size, size_matched, amount, amount_matched, etc.). 1 share = 1_000_000
+    # base units; $1 USDC = 1_000_000 micro-USDC. The same convention is used
+    # in `get_pusd_balance` (see line ~287). Without this divide, a 5.71
+    # share fill would be reported as 5_710_000 — which then corrupts the
+    # engine's position state by 1_000_000x. (Audit H-V6-12 finding C-1.)
+    _CLOB_BASE_UNITS = 1_000_000
+
     async def get_order_filled_size(self, order_id: str) -> float | None:
         """
         H-V6-12 fix: read the authoritative `size_matched` for an order via
@@ -310,7 +318,8 @@ class CLOBClient:
         and for SAFE / PROXY wallets the WS payload omits it entirely
         from the top-level fields). Polymart3's working sibling project
         uses the same fallback in its buy_token polling loop.
-        Returns size in shares (human units), or None if the call fails.
+        Returns size in SHARES (human units, base-units ÷ 1_000_000),
+        or None if the call fails.
         """
         if not self._client:
             return None
@@ -331,7 +340,7 @@ class CLOBClient:
                     try:
                         f = float(v)
                         if f > 0:
-                            return f
+                            return f / self._CLOB_BASE_UNITS
                     except (TypeError, ValueError):
                         continue
             return 0.0
@@ -445,7 +454,15 @@ class CLOBClient:
             if fills:
                 for f in fills:
                     try:
-                        sz = float(f.get("size", 0))
+                        # H-V6-12 fix (audit C-2): fills[].size is in
+                        # 6-decimal base units, same as size_matched. Divide
+                        # by 1_000_000 before summing. Pre-fix, the polling
+                        # loop's total_sz was inflated by 1e6 while
+                        # total_usdc was also inflated by 1e6, so
+                        # avg_px = total_usdc / total_sz accidentally
+                        # cancelled out — but tokens was wildly wrong.
+                        sz_raw = float(f.get("size", 0))
+                        sz = sz_raw / self._CLOB_BASE_UNITS if sz_raw > 0 else 0.0
                         px = float(f.get("price", price_q))
                         total_sz += sz
                         total_usdc += sz * px
@@ -669,7 +686,15 @@ class CLOBClient:
             if fills:
                 for f in fills:
                     try:
-                        sz = float(f.get("size", 0))
+                        # H-V6-12 fix (audit C-2): fills[].size is in
+                        # 6-decimal base units, same as size_matched. Divide
+                        # by 1_000_000 before summing. Pre-fix, the polling
+                        # loop's total_sz was inflated by 1e6 while
+                        # total_usdc was also inflated by 1e6, so
+                        # avg_px = total_usdc / total_sz accidentally
+                        # cancelled out — but tokens was wildly wrong.
+                        sz_raw = float(f.get("size", 0))
+                        sz = sz_raw / self._CLOB_BASE_UNITS if sz_raw > 0 else 0.0
                         px = float(f.get("price", price_q))
                         total_sz += sz
                         total_usdc += sz * px
@@ -677,7 +702,14 @@ class CLOBClient:
                         continue
 
             order_status = (status_resp.get("status") or "").lower()
-            matched_sz = float(status_resp.get("size_matched") or total_sz)
+            # H-V6-12 fix (audit C-2): size_matched is 6-decimal base units.
+            # Divide before using. If absent, fall back to total_sz which
+            # was already divided inside the fills[] loop above.
+            matched_sz_raw = status_resp.get("size_matched")
+            if matched_sz_raw is not None and float(matched_sz_raw) > 0:
+                matched_sz = float(matched_sz_raw) / self._CLOB_BASE_UNITS
+            else:
+                matched_sz = total_sz
 
             # Fire cumulative matched size. The CLOBClient-level FillDeduper
             # translates cumulative -> delta so partial fills remain monotonic

@@ -150,6 +150,21 @@ class UserWS:
         self._task: asyncio.Task[None] | None = None
         self._url = USER_WS_URL
         self._pending_markets: set[str] = set()
+        # H-V6-12 fix (audit M-1): init here instead of relying on the
+        # AttributeError-as-init pattern in _process. Allows us to also
+        # reset the counter explicitly on each successful WS reconnect.
+        self._trade_dump_count = 0
+        # H-V6-12 fix (audit M-2): track the cumulative fill size we last saw
+        # via REST for each order_id. Used to convert REST's cumulative
+        # `size_matched` into a true delta before forwarding to the
+        # router. Without this, a second WS MATCHED event for the same
+        # order would have the router compute
+        # new_cumulative = prev + fill_size_inc, where fill_size_inc is
+        # actually the CUMULATIVE value (REST returns cumulative, not
+        # delta). The deduper math `new_cumulative - prev_cumulative
+        # <= 1e-9` would then compare cumulative vs 2*cumulative and
+        # wrongly pass — engine double-counts. Cleared on reconnect.
+        self._last_rest_cumulative: dict[str, float] = {}
         # H-V6-12 fix: optional reference to CLOBClient so that when the WS
         # delivers a trade event with size=0 (Polymarket WS quirk — see
         # market_ws raw sample in production 2026-07-11), we can fall
@@ -195,6 +210,13 @@ class UserWS:
                 async with websockets.connect(self._url, ping_interval=10) as ws:
                     delay = 1.0
                     log.debug("user_ws.connected")
+
+                    # H-V6-12 fix (audit M-1 + M-2): on each fresh WS
+                    # connection, reset the raw-dump counter and the
+                    # cumulative tracker. Without this, after one
+                    # reconnect neither dump nor dedup state re-arms.
+                    self._trade_dump_count = 0
+                    self._last_rest_cumulative = {}
 
                     await self._authenticate(ws)
                     if self._pending_markets:
@@ -244,13 +266,13 @@ class UserWS:
 
         # H-V6-12 debug: dump every trade message at info level so we can see
         # which fields Polymarket actually sends (size, maker_orders, etc.).
-        # Throttled to first 5 per connection to avoid log spam in steady state.
+        # Throttled to first 5 per connection to avoid log spam in steady
+        # state. Counter is reset on each successful WS reconnect (see
+        # _run). Pre-fix the counter was only AttributeError-init on first
+        # use, so reconnect never re-armed the dump (audit M-1).
         if event_type == "trade" or type_ == "trade":
-            try:
-                self._trade_dump_count += 1
-            except AttributeError:
-                self._trade_dump_count = 0
             if self._trade_dump_count < 5:
+                self._trade_dump_count += 1
                 log.info(
                     "user_ws.trade_raw",
                     keys=list((content or {}).keys()),
@@ -386,11 +408,30 @@ class UserWS:
 
                 # H-V6-12 fallback: WS payload reported size=0 even though the
                 # status is MATCHED/MINED/CONFIRMED. Ask CLOB REST for the
-                # authoritative size_matched for this order.
+                # authoritative size_matched (already converted from base
+                # units to shares by clob.get_order_filled_size).
                 if mo_size <= 0 and status in ("MATCHED", "MINED", "CONFIRMED"):
                     filled = await self._rest_filled_size(mo_id)
                     if filled and filled > 0:
-                        mo_size = filled
+                        # Audit M-2 fix: REST returns CUMULATIVE, not delta.
+                        # Compute true delta vs last seen cumulative for
+                        # this order_id; if this is the first time we
+                        # REST-resolve, the delta == cumulative.
+                        prev_cum = self._last_rest_cumulative.get(mo_id, 0.0)
+                        delta = filled - prev_cum
+                        if delta > 0:
+                            mo_size = delta
+                            self._last_rest_cumulative[mo_id] = filled
+                            log.info(
+                                "user_ws.rest_filled_size",
+                                order_id=mo_id[:16],
+                                cumulative=filled,
+                                delta=delta,
+                                prev_cumulative=prev_cum,
+                            )
+                        # If delta == 0, this is a re-fired MATCHED event
+                        # for an already-fully-accounted order. Leave
+                        # mo_size = 0 and the router will skip it.
 
                 fill = MakerFill(
                     maker_order_id=mo_id,
@@ -430,11 +471,23 @@ class UserWS:
                 log.debug("user_ws.trade_no_makers_no_id", content=str(content)[:200])
                 return
 
-            # H-V6-12 fallback (top-level path): same REST recovery.
+            # H-V6-12 fallback (top-level path): same REST recovery,
+            # with M-2 cumulative-to-delta conversion.
             if size <= 0 and status in ("MATCHED", "MINED", "CONFIRMED"):
                 filled = await self._rest_filled_size(order_id)
                 if filled and filled > 0:
-                    size = filled
+                    prev_cum = self._last_rest_cumulative.get(order_id, 0.0)
+                    delta = filled - prev_cum
+                    if delta > 0:
+                        size = delta
+                        self._last_rest_cumulative[order_id] = filled
+                        log.info(
+                            "user_ws.rest_filled_size",
+                            order_id=order_id[:16],
+                            cumulative=filled,
+                            delta=delta,
+                            prev_cumulative=prev_cum,
+                        )
 
             fill = MakerFill(
                 maker_order_id=order_id,
