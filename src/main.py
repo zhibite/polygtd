@@ -749,6 +749,7 @@ async def main() -> None:
         api_secret=api_secret,
         api_passphrase=api_passphrase,
         signature_type=cfg_strategy.SIGNATURE_TYPE,
+        funder_address=cfg_strategy.FUNDER_ADDRESS,
     )
 
     # ── Market / Window management ────────────────────────────────────────────

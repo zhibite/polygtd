@@ -178,6 +178,7 @@ class CLOBClient:
         api_secret: str = "",
         api_passphrase: str = "",
         signature_type: int = 0,
+        funder_address: str = "",
     ) -> None:
         self._host = host
         self._private_key = private_key
@@ -185,6 +186,18 @@ class CLOBClient:
         self._api_secret = api_secret
         self._api_passphrase = api_passphrase
         self._signature_type = signature_type
+        # H-V6-11 fix: the maker field on every /order post must point at the
+        # wallet that actually HOLDS the funds. For SIG_TYPE=0 (EOA) this is
+        # the signer itself; for SIG_TYPE=1/2/3 it's the Proxy / Safe /
+        # deposit wallet configured in FUNDER_ADDRESS. Without it the CLOB
+        # rejects with "maker address not allowed, please use the deposit
+        # wallet flow" (Polymarket v2 enforcement since 2025-04-28). The
+        # working sibling project polymart3 uses the same pattern:
+        #   funder=self._funder or self._account_addr
+        # so if the operator has configured FUNDER_ADDRESS we forward it
+        # verbatim, otherwise we fall back to the EOA at first init and
+        # patch it in once the address is derived (see _init_client).
+        self._funder_address = funder_address
         self._client: Optional[ClobClient] = None
 
         # fill_callback signature (B-3 fix):
@@ -229,16 +242,31 @@ class CLOBClient:
                 api_secret=self._api_secret,
                 api_passphrase=self._api_passphrase,
             )
+            # H-V6-11 fix: derive the EOA address from the private key so we
+            # can fall back to it as `funder` when the operator has not
+            # supplied FUNDER_ADDRESS in .env. Polymarket's order payload
+            # requires `maker` to be the wallet that actually holds the
+            # funds; leaving the SDK to default that to signer.address()
+            # is fine for SIG_TYPE=0 EOA but breaks SIG_TYPE=1/2/3 when
+            # the operator forgets to set FUNDER_ADDRESS.
+            try:
+                from eth_account import Account
+                eoa_addr = Account.from_key(self._private_key).address if self._private_key else ""
+            except Exception:
+                eoa_addr = ""
+            funder = self._funder_address or eoa_addr
             self._client = ClobClient(
                 host=self._host,
                 chain_id=self.POLYGON_CHAIN_ID,
                 key=self._private_key,
                 creds=api_creds,
                 signature_type=self._signature_type,
+                funder=funder,
             )
             log.info(
                 "CLOBClient ready",
                 host=self._host, sig_type=self._signature_type,
+                funder=funder or "(empty)",
             )
         except Exception as exc:
             log.error("CLOBClient init failed", error=str(exc))
