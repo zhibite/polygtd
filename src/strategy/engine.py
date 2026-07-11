@@ -434,8 +434,9 @@ class StrategyEngine:
                 if now - last > 60:
                     self._t1_gate_closed_log_ts = now
                     log.info(
-                        "engine.t1_gate_closed elapsed={:.0f}s > limit={:.0f}s",
-                        elapsed_in_window, s.T1_ENTRY_WINDOW_S,
+                        "engine.t1_gate_closed",
+                        elapsed_s=int(elapsed_in_window),
+                        limit_s=int(s.T1_ENTRY_WINDOW_S),
                     )
                 continue
 

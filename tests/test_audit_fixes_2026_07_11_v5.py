@@ -11,6 +11,11 @@ Covers:
             market.btc_spot_at_window_open so the gate is ready immediately
             (production symptom: STATUS shows `baseline=pending` for the
             entire 15-min window after a round transition)
+  H-V6-5  — loguru calls use keyword args, not positional args with
+            `{:.0f}`-style format-spec in the message string. loguru
+            forwards messages to LogRecord.getMessage() which expects
+            `%`-formatting and crashes on Python format specs
+            (production crash: TypeError at engine.py:436 in _check_t1_entry)
 
 Run via `pytest tests/test_audit_fixes_2026_07_11_v5.py`.
 """
@@ -18,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import pathlib
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -556,3 +562,89 @@ def test_h_v6_4_on_round_end_keeps_gate() -> None:
                 "H-V6-4 violation: engine.on_round_end still clears _gate. "
                 f"Found line: {ln!r}"
             )
+
+
+# ---------------------------------------------------------------------------
+# H-V6-5: loguru calls must use keyword args, not positional args with
+# printf-style format specs in the message. Otherwise structlog/loguru
+# fall back to `%`-formatting the message and crash on `{:.0f}` /
+# `{:.2f}` style placeholders. Reproduced live at 2026-07-11 00:25:43:
+#     TypeError: not all arguments converted during string formatting
+#     File "src/strategy/engine.py", line 436, in _check_t1_entry
+#     log.info("engine.t1_gate_closed elapsed={:.0f}s > limit={:.0f}s",
+#              elapsed_in_window, s.T1_ENTRY_WINDOW_S)
+# ---------------------------------------------------------------------------
+
+
+def test_h_v6_5_no_positional_loguru_calls_with_format_spec() -> None:
+    """Grep the entire `src/` tree for `log.<level>("...", EXPR, EXPR)`
+    where the message string contains a format-spec like `{:.0f}` /
+    `{:>10}` / `{:.2f}`. Such calls crash at runtime because loguru
+    forwards the message string to the stdlib `LogRecord.getMessage()`
+    path which expects `%`-style placeholders, not `format`-spec.
+
+    Allowed forms:
+      - log.info("event", k=v, k=v)            ← keyword args
+      - log.info("event")                      ← no args
+      - log.info("event {}".format(x))         ← pre-formatted f-string / .format
+      - log.info(f"event {x}")                 ← pre-formatted f-string
+
+    Forbidden forms:
+      - log.info("event {:...}", x, y)         ← positional + format spec
+    """
+    import pathlib
+    import re
+
+    src_root = pathlib.Path("src")
+    bad: list[tuple[pathlib.Path, int, str]] = []
+    py_re = re.compile(r"\.py$")
+    msg_re = re.compile(r'"([^"]+)"')
+    # log.X("MSG", ARG, ARG) — non-keyword positional args
+    call_re = re.compile(
+        r"log\.(?:info|warning|error|debug|exception)\s*\(\s*"
+        r'("([^"]+)"|\'([^\']+)\')'
+        r"\s*,\s*"
+        r"([A-Za-z_][A-Za-z0-9_.\(\)\[\]:\s]*)"  # first positional arg
+    )
+
+    # Pre-format-spec inside a quoted message string. Skip f-strings (those
+    # are pre-formatted, no loguru-level risk).
+    fmt_spec_re = re.compile(r"\{:[^}]+\}")
+
+    for path in src_root.rglob("*"):
+        if not py_re.search(path.name):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            # Skip f-strings: they start with `f"..."` or `f'...'`
+            stripped = line.lstrip()
+            if stripped.startswith(("f\"", "f'")):
+                continue
+            # Look for log.<level>("MSG", EXPR ...) where EXPR is not `key=`
+            if "log." not in line:
+                continue
+            m = call_re.search(line)
+            if not m:
+                continue
+            msg = m.group(2) or m.group(3) or ""
+            first_arg = m.group(4)
+            if first_arg.lstrip().startswith(("\"", "'")):
+                # second positional arg (rare; we'd have already matched it)
+                continue
+            if "=" in first_arg.split(",")[0].split(")")[0]:
+                # keyword arg form, OK
+                continue
+            if fmt_spec_re.search(msg):
+                bad.append((path, lineno, line.strip()))
+
+    if bad:
+        formatted = "\n".join(f"  {p}:{ln}: {l}" for p, ln, l in bad)
+        raise AssertionError(
+            "H-V6-5: loguru calls with positional args and format-spec in "
+            f"the message string crash at runtime:\n{formatted}\n\n"
+            "Fix: convert to keyword args, e.g.\n"
+            '  log.info("event", elapsed=int(x), limit=int(y))\n'
+        )
