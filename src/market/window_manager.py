@@ -139,6 +139,20 @@ class WindowManager:
         except Exception:
             log.exception("window_mgr.boot tick raised")
 
+        # H-V6-3 fix: also fire `_on_new` after boot discovery so the engine
+        # transitions to the current (already-running) window. Without this
+        # the first round of every session has `engine._round = None` because
+        # the boundary loop's `_on_new` only fires after the boundary fires
+        # AGAIN — i.e. 15+ minutes after boot.
+        if self._on_new:
+            try:
+                await self._on_new(self._last_round_start)
+            except Exception:
+                log.exception(
+                    "window_mgr.boot on_new_round_failed",
+                    round_start_ts=self._last_round_start,
+                )
+
         while self._running:
             now = time.time()
             now_start = self._round_start_of(now)
@@ -182,8 +196,26 @@ class WindowManager:
                         await self.tick(self._symbols, force_discovery=True)
                     except Exception:
                         log.exception("window_mgr.tick raised")
-                        if self._on_new:
+                    # H-V6-3 fix: `_on_new` (which fires `main._on_new_round`
+                    # → `engine.on_new_round`) MUST be invoked on every
+                    # successful boundary transition, not only on the
+                    # fallback path. Without this, `engine._round` stays
+                    # `None` across the lifetime of the process (set to None
+                    # by `engine.__init__` and only re-populated by
+                    # `on_new_round`). The downstream `_evaluate()` short-
+                    # circuits at `if not self._round: return` and the
+                    # strategy never places T1, even though the STATUS log
+                    # shows `baseline=... drift=PASS` (because the gate is
+                    # seeded separately via `_on_baseline`). Symptom: 30s+ of
+                    # STATUS showing PASS with no `engine.trigger_t1`.
+                    if self._on_new:
+                        try:
                             await self._on_new(now_start_in)
+                        except Exception:
+                            log.exception(
+                                "window_mgr.on_new_round_failed",
+                                round_start_ts=now_start_in,
+                            )
 
                 await asyncio.sleep(1.0)
 
