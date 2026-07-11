@@ -22,3 +22,11 @@ MIN_SAMPLES=30
 [LOG]
 LEVEL=INFO
 HEARTBEAT_S=5
+
+[POLL]
+# H-V6-12 fix: REST /book fallback so a missing WS best_bid/ask event does
+# not stall T1 entry for an entire round. The poller only writes into
+# PriceCache.best_bid / best_ask when WS has not yet seeded those fields
+# (i.e. WS still wins once a `best_bid_ask` event finally lands). Set
+# REST_BOOK_POLL_S=0 to disable.
+REST_BOOK_POLL_S=2.0

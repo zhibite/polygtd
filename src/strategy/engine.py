@@ -113,11 +113,18 @@ class StrategyEngine:
         fires. Without these logs the operator cannot tell which condition
         is the blocker (price cap, drift, no best_bid, etc.) — they are all
         silent `continue` branches upstream.
+
+        H-V6-12: throttle bumped from 5s to 30s for `t1_skip_no_bid`.
+        Reason: the REST /book fallback takes ~2-4s to fill the cache on a
+        fresh round; a 5s throttle would still fire 12 times in that
+        window with no diagnostic value. Other skip reasons stay at 5s
+        because their price/drift values change meaningfully every tick.
         """
         key = f"{reason}|{side}"
         now = time.time()
+        throttle = 30.0 if reason == "engine.t1_skip_no_bid" else 5.0
         last = self._t1_skip_last_log_ts.get(key, 0.0)
-        if now - last < 5.0:
+        if now - last < throttle:
             return
         self._t1_skip_last_log_ts[key] = now
         log.info(reason, side=side, **fields)
@@ -483,10 +490,17 @@ class StrategyEngine:
 
             bid_price = self._pc.bid(token)
             if bid_price <= 0:
+                # H-V6-12: with the new REST /book fallback in main.py this
+                # is expected to clear within REST_BOOK_POLL_S (default 2s)
+                # without any restart. Use a longer throttle so we don't
+                # flood logs while REST catches up — this branch will not
+                # typically fire more than once per round once the fallback
+                # is healthy. Set throttle to 30s (was 5s).
                 self._t1_skip_log(
                     "engine.t1_skip_no_bid", side=side, token=token[:16],
                     detail="best_bid cache empty — MarketWS has not received "
-                           "a best_bid_ask event for this token yet",
+                           "a best_bid_ask event for this token yet; REST "
+                           "/book poller should fill within REST_BOOK_POLL_S",
                 )
                 continue
 

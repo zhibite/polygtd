@@ -27,7 +27,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from src.config import general, binance, log_config, strategy
+from src.config import general, binance, log_config, poll_config, strategy
 from src.clob_l1_auth import create_or_derive_clob_api_creds, ClobL1Error
 from src.execution.clob_client import CLOBClient
 from src.execution.gtd_expiry_watcher import GtdExpiryWatcher
@@ -621,6 +621,112 @@ async def _midpoint_poll_loop() -> None:
 
 
 # ---------------------------------------------------------------------------
+# REST /book poller (best_bid / best_ask fallback when WS is missing events)
+# ---------------------------------------------------------------------------
+
+async def _book_poll_loop() -> None:
+    """H-V6-12: REST /book fallback for best_bid / best_ask.
+
+    Production symptom this exists for:
+      2026-07-11 round 13:45 — MarketWS was alive but never delivered a
+      `best_bid_ask` event for the UP token (asset_id=9214325536339527),
+      so `PriceCache.best_bid[UP]` stayed at 0 for the full round and T1
+      gated on `engine.t1_skip_no_bid` for the entire 15-min window — even
+      though DOWN was being pushed normally and `midpoint` REST had a value.
+
+    Strategy:
+      - Poll CLOB `/book?token_id=...` every REST_BOOK_POLL_S seconds.
+      - Only write `best_bid[token]` / `best_ask[token]` when the cache
+        field is currently 0 — MarketWS is the source of truth and we
+        never want a slower REST snapshot to clobber a live WS update.
+      - WS reconnect or a late `best_bid_ask` event will overwrite our
+        fallback value on the next tick; the union of (WS ∪ REST) gives
+        us a `best_bid` that's at worst 2s stale, which is well within
+        the strategy's tolerance (T1 only acts inside a 5-min window).
+    """
+    cfg = poll_config()
+    interval = float(cfg.REST_BOOK_POLL_S or 0.0)
+    if interval <= 0:
+        log.info("book_poll_loop.disabled", msg="REST_BOOK_POLL_S=0")
+        return
+    log.info("book_poll_loop.started", interval_s=interval)
+
+    last_condition_id = ""
+
+    while True:
+        await asyncio.sleep(interval)
+        s = STATE
+        if not s.pm_client or not s.price_cache:
+            continue
+
+        wm = s.wm
+        if not wm:
+            continue
+        ctx = wm.get("BTC")
+        mkt = ctx.market if ctx else None
+        if not mkt or not mkt.token_up_id or not mkt.token_down_id:
+            continue
+
+        # Reset trackers when the window rolls over so we log the
+        # transition exactly once per round.
+        if mkt.condition_id and mkt.condition_id != last_condition_id:
+            if last_condition_id:
+                log.info(
+                    "book_poll.window_changed",
+                    prev_condition_id=last_condition_id[:16],
+                    new_condition_id=mkt.condition_id[:16],
+                )
+            last_condition_id = mkt.condition_id
+
+        # We want shortest path to price cache — use the per-token
+        # helper exposed by PriceCache so future refactors only need to
+        # touch one file.
+        cache = s.price_cache
+        fills = {"up": False, "down": False}
+
+        for label, token in (("up", mkt.token_up_id), ("down", mkt.token_down_id)):
+            try:
+                book = await s.pm_client.get_order_book(token)
+            except Exception as exc:
+                log.debug(
+                    "book_poll.fetch_error",
+                    side=label, token=token[:16], error=str(exc),
+                )
+                continue
+            if not isinstance(book, dict):
+                continue
+
+            bids = book.get("bids") or []
+            asks = book.get("asks") or []
+
+            # Each entry from /book is {"price": "0.405", "size": "100"} — defensive decode.
+            try:
+                bid = float(bids[0]["price"]) if bids and isinstance(bids[0], dict) else 0.0
+            except (KeyError, TypeError, ValueError, IndexError):
+                bid = 0.0
+            try:
+                ask = float(asks[0]["price"]) if asks and isinstance(asks[0], dict) else 0.0
+            except (KeyError, TypeError, ValueError, IndexError):
+                ask = 0.0
+
+            # WS remains authoritative — only fill where cache is empty.
+            if bid > 0 and cache.best_bid.get(token, 0.0) == 0.0:
+                cache.best_bid[token] = bid
+                cache.bid_source[token] = "rest"
+                fills[label] = True
+            if ask > 0 and cache.best_ask.get(token, 0.0) == 0.0:
+                cache.best_ask[token] = ask
+                cache.ask_source[token] = "rest"
+
+        if any(fills.values()):
+            log.info(
+                "book_poll.filled",
+                up=mkt.token_up_id[:16], down=mkt.token_down_id[:16],
+                up_filled=fills["up"], down_filled=fills["down"],
+            )
+
+
+# ---------------------------------------------------------------------------
 # Status printer
 # ---------------------------------------------------------------------------
 
@@ -714,7 +820,11 @@ async def _status_loop() -> None:
         if up_token and down_token:
             up_bid = s.price_cache.best_bid.get(up_token, 0.0)
             down_bid = s.price_cache.best_bid.get(down_token, 0.0)
-            bid_str = f" | bids=UP={up_bid:.4f}/DOWN={down_bid:.4f}"
+            up_src = s.price_cache.bid_src(up_token) or "empty"
+            down_src = s.price_cache.bid_src(down_token) or "empty"
+            bid_str = (
+                f" | bids=UP={up_bid:.4f}({up_src})/DOWN={down_bid:.4f}({down_src})"
+            )
         else:
             bid_str = ""
 
@@ -886,9 +996,10 @@ async def main() -> None:
                 "Set API_KEY / API_SECRET / API_PASSPHRASE in .env",
         )
 
-    # Status printer + midpoint poller
+    # Status printer + REST pollers (midpoint + book fallback)
     status_task = asyncio.create_task(_status_loop())
     midpoint_task = asyncio.create_task(_midpoint_poll_loop())
+    book_task = asyncio.create_task(_book_poll_loop())
 
     # ── Graceful shutdown ───────────────────────────────────────────────
     def _signal_handler() -> None:
@@ -908,6 +1019,7 @@ async def main() -> None:
     log.info("bot.shutdown_initiated")
     status_task.cancel()
     midpoint_task.cancel()
+    book_task.cancel()
 
     # B-3 v2 fix: await any in-flight TP runners so they finish cleanly
     # before tearing down dependencies (clob / order_manager). Otherwise a

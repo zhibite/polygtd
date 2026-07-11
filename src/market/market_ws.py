@@ -32,6 +32,11 @@ class PriceCache:
     best_ask: dict[str, float] = field(default_factory=dict)
     tick_size: dict[str, float] = field(default_factory=dict)
     midpoint: dict[str, float] = field(default_factory=dict)  # Updated via REST /midpoint
+    # H-V6-12: provenance map. Values are "ws", "rest", or absent.
+    # set_token_source() is called whenever best_bid / best_ask is mutated
+    # so STATUS can show `bid_src=ws` vs `bid_src=rest` to the operator.
+    bid_source: dict[str, str] = field(default_factory=dict)
+    ask_source: dict[str, str] = field(default_factory=dict)
 
     def last(self, token: str) -> float:
         return self.last_trade_price.get(token, 0.0)
@@ -53,6 +58,14 @@ class PriceCache:
         """REST midpoint price — more stable than last_trade_price for strategy decisions."""
         return self.midpoint.get(token, 0.0)
 
+    def bid_src(self, token: str) -> str:
+        """'ws' if MarketWS seeded the bid, 'rest' if REST /book poller did,
+        '' if cache is empty. Read-only — call set_token_source() to write."""
+        return self.bid_source.get(token, "")
+
+    def ask_src(self, token: str) -> str:
+        return self.ask_source.get(token, "")
+
     def clear_token(self, token: str) -> None:
         """Clear cached data for a specific token (e.g., on window change)."""
         self.last_trade_price.pop(token, None)
@@ -60,6 +73,8 @@ class PriceCache:
         self.best_ask.pop(token, None)
         self.tick_size.pop(token, None)
         self.midpoint.pop(token, None)
+        self.bid_source.pop(token, None)
+        self.ask_source.pop(token, None)
 
 
 MarketWSConnected = Callable[[], None]
@@ -227,11 +242,13 @@ class MarketWS:
             try:
                 if bb_raw is not None and bb_raw != "":
                     self._cache.best_bid[token] = float(bb_raw)
+                    self._cache.bid_source[token] = "ws"
             except (TypeError, ValueError):
                 pass
             try:
                 if ba_raw is not None and ba_raw != "":
                     self._cache.best_ask[token] = float(ba_raw)
+                    self._cache.ask_source[token] = "ws"
             except (TypeError, ValueError):
                 pass
 
@@ -254,13 +271,16 @@ class MarketWS:
                         pass
                 # Many price_changes carry best_bid / best_ask (older docs).
                 # When present, prefer them over a stale cache value.
-                for key, cache_attr in (("best_bid", "best_bid"),
-                                        ("best_ask", "best_ask")):
+                for key, cache_attr, src_attr in (
+                    ("best_bid", "best_bid", "bid_source"),
+                    ("best_ask", "best_ask", "ask_source"),
+                ):
                     raw = pc.get(key)
                     if raw is None or raw == "":
                         continue
                     try:
                         self._cache.__dict__[cache_attr][pc_token] = float(raw)
+                        self._cache.__dict__[src_attr][pc_token] = "ws"
                     except (TypeError, ValueError):
                         pass
 
@@ -271,11 +291,13 @@ class MarketWS:
             if token and isinstance(bids, list) and bids:
                 try:
                     self._cache.best_bid[token] = float(bids[0].get("price"))
+                    self._cache.bid_source[token] = "ws"
                 except (AttributeError, TypeError, ValueError):
                     pass
             if token and isinstance(asks, list) and asks:
                 try:
                     self._cache.best_ask[token] = float(asks[0].get("price"))
+                    self._cache.ask_source[token] = "ws"
                 except (AttributeError, TypeError, ValueError):
                     pass
 
@@ -291,11 +313,13 @@ class MarketWS:
             if bids and isinstance(bids, list) and len(bids) > 0:
                 try:
                     self._cache.best_bid.setdefault(bba_token, float(bids[0]))
+                    self._cache.bid_source.setdefault(bba_token, "ws")
                 except (TypeError, ValueError):
                     pass
             if asks and isinstance(asks, list) and len(asks) > 0:
                 try:
                     self._cache.best_ask.setdefault(bba_token, float(asks[0]))
+                    self._cache.ask_source.setdefault(bba_token, "ws")
                 except (TypeError, ValueError):
                     pass
 
