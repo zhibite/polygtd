@@ -113,6 +113,10 @@ class StrategyEngine:
         # `on_round_end` swaps in a new round_start_ts.
         self._t1_cap_reject_first_seen: dict[tuple[int, str], float] = {}
         self._t1_cap_reject_summary_logged: dict[tuple[int, str], bool] = {}
+        # H-NEW-2026-07-11 (audit v6-12): per-(reason, tier) throttle for the
+        # averaging-down `_check_average_down` skip events. Mirrors
+        # `_t1_skip_last_log_ts` on the entry side.
+        self._tN_skip_last_log_ts: dict[str, float] = {}
 
     # H-NEW-2026-07-11: helper that reads PRICE_PRE_MARGIN safely even for
     # tests that construct engine via __new__ (bypassing __init__).
@@ -165,6 +169,34 @@ class StrategyEngine:
                 self._t1_cap_reject_first_seen.setdefault(rk, now)
             return
         log.info(reason, side=side, **fields)
+
+    # H-NEW-2026-07-11 (audit v6-12): throttle logger for the averaging-down
+    # (`_check_average_down`) skip paths. The previous implementation had
+    # seven distinct `continue` branches with NO logging — operators could
+    # only see the consequence (`tiers=[T2=○]` never advancing) without any
+    # breadcrumb indicating which condition was blocking. Production symptom
+    # 2026-07-11 11:15: T1 filled at 0.39, mid dropped to 0.155 (a 60% drop
+    # from 0.40), but NO `engine.trigger_tN` ever fired. Without this method
+    # we had no way to determine whether the blocker was:
+    #   - mid_price cache empty / mid > fire_line / gate.can_double_down=False
+    #   - tier.watching stuck True / saturation / stake_cap
+    # Mirrors the T1-side `_t1_skip_log` design. Keyed by (reason, tier) so
+    # each tier gets its own throttle slot, and we collapse to ~1 line per
+    # 5s per blocker to keep the firehose manageable.
+    def _tN_skip_log(self, reason: str, *, tier: int, **fields) -> None:
+        key = f"{reason}|T{tier}"
+        now = time.time()
+        # Tolerate tests that construct engine via __new__ without
+        # running __init__ (which would have created _tN_skip_last_log_ts).
+        bucket = getattr(self, "_tN_skip_last_log_ts", None)
+        if bucket is None:
+            self._tN_skip_last_log_ts = {}
+            bucket = self._tN_skip_last_log_ts
+        last = bucket.get(key, 0.0)
+        if now - last < 5.0:
+            return
+        bucket[key] = now
+        log.info(reason, tier=tier, **fields)
 
     def _t1_cap_reject_summary(self) -> None:
         """Emit one INFO summary line per (round, side) after T1 enters or
@@ -741,10 +773,30 @@ class StrategyEngine:
 
         for tier in pos.tiers[1:]:  # T2, T3, T4
             if tier.is_complete:
+                # H-NEW-2026-07-11 (audit v6-12): was silent. Without this
+                # breadcrumb an operator cannot distinguish "tier already
+                # filled, skip" from "tier watching in-flight, skip" in a
+                # single log line.
+                self._tN_skip_log(
+                    "engine.tN_skip_complete",
+                    tier=tier.tier, filled=tier.filled,
+                    placed_qty=tier.placed_qty, size_filled=tier.size_filled,
+                    size_expected=tier.size_expected,
+                )
                 continue
             # H-NEW-2026-07-11: `watching` is the new in-flight mutex.
             # Skip if a watcher is still actively polling this tier.
             if tier.watching:
+                # H-NEW-2026-07-11 (audit v6-12): was silent. This is a
+                # particularly important breadcrumb because a stuck
+                # `watching=True` (e.g. after an unhandled exception in the
+                # watcher task) blocks ALL subsequent attempts at this tier
+                # for the rest of the round.
+                self._tN_skip_log(
+                    "engine.tN_skip_watching",
+                    tier=tier.tier, server_id=(tier.server_order_id or "")[:16],
+                    expires_at=tier.expires_at, size_filled=tier.size_filled,
+                )
                 continue
             # M-V4-2 fallback: stale placed=True without watcher (e.g.
             # bind failed and watcher never spawned). Reset and re-fire.
@@ -770,16 +822,46 @@ class StrategyEngine:
 
             strategy_price = tier.trigger_price(baseline)
             if strategy_price is None:
+                # H-NEW-2026-07-11 (audit v6-12): was silent. Should never
+                # happen for T2..T4 because tier_drop_pcts has entries for
+                # those tiers, but surface it if it does.
+                self._tN_skip_log(
+                    "engine.tN_skip_no_trigger_price",
+                    tier=tier.tier, baseline=baseline,
+                    drop_pcts=s.tier_drop_pcts,
+                )
                 continue
 
             # Pre-arm fire line: mid <= strategy_price * (1 + margin).
             fire_line = strategy_price * (1.0 + margin)
             if mid_price > fire_line:
+                # H-NEW-2026-07-11 (audit v6-12): was silent. This is the
+                # single most common reason averaging does not fire — the
+                # mid has not yet dropped enough to cross the pre-arm
+                # fire line. With the breadcrumb operators can see "we are
+                # waiting for mid ≤ X, currently at Y".
+                self._tN_skip_log(
+                    "engine.tN_skip_price_above_fire",
+                    tier=tier.tier, mid=mid_price, fire_line=fire_line,
+                    strategy_price=strategy_price, baseline=baseline,
+                    margin=margin,
+                )
                 continue
 
             # BTC drift gate for averaging.
             next_drop = TierSnapshot._next_tier_drop(tier.tier)
             if not self._gate.can_double_down(bc_now, mid_price, tier.tier, next_drop, baseline):
+                # H-NEW-2026-07-11 (audit v6-12): was silent. Drift
+                # blocking averaging is rare (the gate has a bypass once
+                # price has dropped past the next-tier zone) but when it
+                # happens the operator needs to see why.
+                gs = self._gate.state(bc_now)
+                self._tN_skip_log(
+                    "engine.tN_skip_drift_gate",
+                    tier=tier.tier, mid=mid_price, baseline=baseline,
+                    drift=gs.drift, within_limit=gs.within_limit,
+                    bc_now=bc_now, next_drop=next_drop,
+                )
                 continue
 
             # Per-tier remaining cap (defense-in-depth)

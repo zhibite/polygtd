@@ -902,11 +902,24 @@ class CLOBClient:
     # ------------------------------------------------------------------
 
     async def cancel_order(self, order_id: str) -> bool:
-        """Cancel a single order. Returns True on success."""
+        """Cancel a single order. Returns True on success.
+
+        H-NEW-2026-07-11 (audit v6-12): the py-clob-client-v2 SDK's
+        `cancel_order` method expects a dict payload of shape
+        ``{"orderID": <id>}`` — NOT a bare string. Production symptom
+        2026-07-11 11:15:29.856 — fast_fill on TierWatcher spawn tried to
+        cancel the T1 GTD and got
+            "'str' object has no attribute 'orderID'"
+        because we passed `order_id` directly. The error was swallowed by
+        `tier_watcher._safe_cancel`'s try/except and the GTD was left
+        dangling on the CLOB until its 180-second GTD expiry. Bulk cancel
+        (`cancel_orders`) already wraps each id in `{"orderID": oid}` —
+        this method now does the same.
+        """
         if not self._client:
             return False
         try:
-            await self._run(self._client.cancel_order, order_id)
+            await self._run(self._client.cancel_order, {"orderID": order_id})
             log.info("clob.order_cancelled", order_id=order_id[:16])
             return True
         except Exception as exc:

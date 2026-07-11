@@ -636,14 +636,77 @@ class Position:
         elif outcome == TierOutcome.EXPIRED.value:
             # Cancel-after-expiry — do not mark filled (it didn't fill).
             # keep partial fills in size_filled/cost_filled; just close out.
-            pass
+            # H-NEW-2026-07-11 (audit v6-12): if the GTD partially filled
+            # before expiring, the realised T1 fill avg MUST still anchor
+            # the T2+ trigger lines. Without this, a T1 that partially
+            # filled and then expired would leave `baseline_set_realized`
+            # stuck at False, forcing T2+ to use the design
+            # `baseline_target_price` (= ENTRY_PRICE_CAP) instead of the
+            # real cost basis. The martingale trigger lines would then be
+            # permanently miscalibrated against the actual fill average.
+            if (
+                tier.tier == 1
+                and tier.size_filled > 1e-9
+                and not self.baseline_set_realized
+            ):
+                new_realized = tier.cost_filled / tier.size_filled
+                self.baseline_realized_price = new_realized
+                self.baseline_set_realized = True
+                log.info(
+                    "position.baseline_anchored_on_expire",
+                    tier=tier.tier,
+                    missed=tier.size_filled,
+                    fill_px=avg_fill_price,
+                    new_realized=new_realized,
+                    note="T1 GTD partially filled before expiry; "
+                         "rebasing T2+ trigger lines to realised avg",
+                )
         elif outcome == TierOutcome.CROSSED.value:
-            # Cancel because mid dropped past the next tier's zone. The
+            # Cancel because mid dropped into the next tier's zone. The
             # next tier watcher will fire from the next _evaluate tick.
-            pass
+            # H-NEW-2026-07-11 (audit v6-12): symmetric with EXPIRED —
+            # partial fills before the cross-cancel must still anchor the
+            # realised baseline. Previously this branch was a silent `pass`,
+            # which is exactly the path that fired for the 2026-07-11
+            # 11:15 incident (mid dropped past the T2 fire line while T1
+            # GTD was still live, watcher cancel-with-CROSSED outcome, no
+            # baseline anchor written).
+            if (
+                tier.tier == 1
+                and tier.size_filled > 1e-9
+                and not self.baseline_set_realized
+            ):
+                new_realized = tier.cost_filled / tier.size_filled
+                self.baseline_realized_price = new_realized
+                self.baseline_set_realized = True
+                log.info(
+                    "position.baseline_anchored_on_cross",
+                    tier=tier.tier,
+                    missed=tier.size_filled,
+                    fill_px=avg_fill_price,
+                    new_realized=new_realized,
+                    note="T1 GTD had partial fills before mid crossed "
+                         "into next-tier zone; rebasing T2+ trigger "
+                         "lines to realised avg",
+                )
         elif outcome in (TierOutcome.CANCELLED.value, TierOutcome.ERROR.value):
             # External / unexpected — keep partial fills, close out.
-            pass
+            # Same partial-fill baseline anchoring as EXPIRED/CROSSED.
+            if (
+                tier.tier == 1
+                and tier.size_filled > 1e-9
+                and not self.baseline_set_realized
+            ):
+                new_realized = tier.cost_filled / tier.size_filled
+                self.baseline_realized_price = new_realized
+                self.baseline_set_realized = True
+                log.info(
+                    "position.baseline_anchored_on_cancel",
+                    tier=tier.tier,
+                    missed=tier.size_filled,
+                    fill_px=avg_fill_price,
+                    new_realized=new_realized,
+                )
 
         tier.watching = False
 

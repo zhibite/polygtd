@@ -1170,9 +1170,20 @@ def _make_maker_fill_callback(state: AppState):
 
         tracked = om.by_server_id(order_id)
         if not tracked:
-            log.debug(
+            # H-NEW-2026-07-11 (audit v6-12): was DEBUG. Production symptom
+            # 2026-07-11 11:15:30: UserWS delivered a TRADE event with
+            # asset_id=DOWN token and a maker_order_id that did not match
+            # any tracked BUY GTD. Because the size field was 0 the skip
+            # path was logged at INFO — but if a future WS payload arrives
+            # with size>0 and an untracked order_id, the DEBUG-level skip
+            # below would silently drop the fill with no breadcrumb.
+            # Operators need to see untracked order_ids so they can spot
+            # WS payload mis-routing before it costs a position.
+            log.info(
                 "router.maker_fill.untracked",
-                order_id=order_id,
+                order_id=order_id, asset_id=asset_id[:16],
+                fill_size=fill_size_inc, fill_price=fill_price,
+                reason="no TrackedOrder matches server_order_id",
             )
             return
 
