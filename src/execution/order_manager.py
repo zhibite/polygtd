@@ -94,6 +94,17 @@ class OrderManager:
         # fired the fill callback synchronously from inside place_gtd_buy).
         # Drained by resolve_pending_server_id() when the real entry lands.
         self._pending_fills: dict[str, list[tuple[float, float]]] = {}
+        # H-NEW-2026-07-11 (audit v6-12 production revisit): the bot
+        # crashes/restarts can leave `order_status=invalid` GTDs hanging
+        # on the CLOB, occupying balance/allowance. Once one is dangling
+        # the next SELL is rejected with
+        #   "not enough balance / allowance: ... balance: 5000000,
+        #    sum of matched orders: 5000000, order amount: 5000000"
+        # until the hold expires. Fix: on startup, fetch open orders and
+        # cancel anything that is not already terminal (`order_status`
+        # in {LIVE, INVALID, UNKNOWN}). Idempotent and safe to call
+        # repeatedly; logging-only on cancellation failure.
+        self._startup_reconciled: bool = False
 
 
     # ------------------------------------------------------------------
@@ -1010,6 +1021,105 @@ class OrderManager:
 
             except Exception as exc:
                 log.warning("order_manager.reconcile.error", error=str(exc))
+
+    async def startup_reconcile(self) -> None:
+        """Force-cancel any leftover CLOB orders that survived a bot restart.
+
+        H-NEW-2026-07-11 (audit v6-12 production revisit): without this,
+        a bot crash or a previous round whose `cancel_market` failed
+        (e.g. `_safe_cancel` SDK signature bug) leaves the CLOB holding
+        `order_status=invalid` GTDs that *still consume the maker
+        allowance*. The next `place_gtd_sell` is then permanently
+        rejected with
+          "not enough balance / allowance: ... balance: 5000000,
+           sum of matched orders: 5000000, order amount: 5000000"
+
+        Idempotent: if nothing is open it does nothing. If the cancel
+        itself fails (signature bug, network, etc.) we log and continue
+        so a partial reconciliation does not block startup.
+
+        Production symptom 2026-07-11T12:04:46: stale GTD
+        `0x3ede40a1f6c744` (status=invalid) blocked every subsequent
+        SELL while bot still believed it held 5 DOWN tokens; the real
+        sell executed on the UI side without ever being reflected in
+        OrderManager.
+        """
+        if self._startup_reconciled:
+            return
+        try:
+            open_orders = await self._clob.get_open_orders()
+        except Exception as exc:
+            log.warning(
+                "order_manager.startup_reconcile.list_failed",
+                error=str(exc),
+                note="cannot enumerate stale CLOB orders; "
+                     "balance lock may persist — manual intervention needed",
+            )
+            return
+
+        if not open_orders:
+            self._startup_reconciled = True
+            log.info("order_manager.startup_reconcile", cancelled=0, note="no open orders on CLOB")
+            return
+
+        server_ids = [str(o.get("orderID", "")) for o in open_orders if o.get("orderID")]
+        log.warning(
+            "order_manager.startup_reconcile.stale_orders",
+            count=len(server_ids),
+            server_ids=[sid[:16] for sid in server_ids],
+            note="bot restart detected dangling CLOB orders; "
+                 "force-cancelling to free maker allowance",
+        )
+
+        cancelled: list[str] = []
+        not_cancelled: list[str] = []
+        try:
+            resp = await self._clob.cancel_orders(server_ids)
+            cancelled = list(resp.get("canceled", []) or [])
+            not_cancelled = list(resp.get("not_canceled", []) or [])
+        except Exception as exc:
+            log.warning(
+                "order_manager.startup_reconcile.batch_cancel_failed",
+                error=str(exc),
+                note="best-effort single-order cancel may still recover",
+            )
+            # Fallback: try cancel_order per id (uses OrderPayload path)
+            for sid in server_ids:
+                try:
+                    ok = await self._clob.cancel_order(sid)
+                    if ok:
+                        cancelled.append(sid)
+                    else:
+                        not_cancelled.append(sid)
+                except Exception as exc2:
+                    log.warning(
+                        "order_manager.startup_reconcile.single_cancel_failed",
+                        server_id=sid[:16], error=str(exc2),
+                    )
+                    not_cancelled.append(sid)
+
+        log.info(
+            "order_manager.startup_reconcile",
+            requested=len(server_ids),
+            cancelled_on_clob=len(cancelled),
+            not_cancelled=len(not_cancelled),
+        )
+
+        # Mark in-memory orders cancelled so subsequent fill callbacks
+        # for these ids are dropped.
+        async with self._lock:
+            for sid in cancelled:
+                cid = self._by_server.get(sid)
+                if not cid:
+                    continue
+                co = self._orders.get(cid)
+                if co and co.status in ("placed", "live"):
+                    co.status = "cancelled"
+                    self.drain_pending_fills(sid)
+
+        # Resolve in-memory vs CLOB drift.
+        await self.reconcile()
+        self._startup_reconciled = True
 
     async def purge_round(self, round_start_ts: int) -> int:
         """Drop in-memory state for orders belonging to a finished round.

@@ -1003,6 +1003,21 @@ async def main() -> None:
 
     # ── Execution layer ─────────────────────────────────────────────────
     s.order_manager = OrderManager(s.clob, price_cache=s.price_cache, pm_client=s.pm_client)
+    # H-NEW-2026-07-11 (audit v6-12 production revisit): if a previous
+    # bot process crashed (or `_safe_cancel` lost its race against SDK
+    # signature bugs), dangling GTDs on the CLOB still occupy the maker
+    # allowance and block any subsequent SELL with `not enough
+    # balance/allowance`. Force-cancel them BEFORE the first round
+    # starts so an old stuck `0x3ede40a1f6c744`-style order cannot
+    # wedge the account into "I still hold 5 tokens but cannot sell".
+    try:
+        await s.order_manager.startup_reconcile()
+    except Exception as exc:
+        log.warning(
+            "main.startup_reconcile.failed",
+            error=str(exc),
+            note="continuing — partial reconciliation may leave a stale order on CLOB",
+        )
     # H-NEW-1 fix: tell CLOBClient how to pre-register a server_order_id
     # the moment the post-response arrives. This closes the race where a
     # fill callback fires from inside place_gtd_buy / place_gtd_sell /
