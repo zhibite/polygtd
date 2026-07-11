@@ -786,34 +786,19 @@ class StrategyEngine:
             return
 
         pos = self._round.position
-        if not pos.baseline_set or pos.entry_token is None:
+        if pos.entry_token is None:
             return
-
-        # ── DIAG-2026-07-11: trace why T2 averaging never fires ────────────
-        # Placed BEFORE the silent early-returns so we always see the live
-        # state. Remove once the bug is located.
-        try:
-            _trace_mid = self._pc.get_midpoint(pos.entry_token) if pos.entry_token else 0.0
-            _cache_keys = list(self._pc.midpoint.keys())
-            log.info(
-                "engine.t2_diag",
-                entry_token=pos.entry_token[:32] if pos.entry_token else None,
-                cache_key_match=pos.entry_token in self._pc.midpoint if pos.entry_token else False,
-                cache_keys_count=len(_cache_keys),
-                cache_first_key=_cache_keys[0][:32] if _cache_keys else None,
-                cache_first_mid=self._pc.midpoint[_cache_keys[0]] if _cache_keys else None,
-                mid=_trace_mid,
-                tp_inflight=pos._tp_inflight,
-                baseline_realized=pos.baseline_realized_price,
-                baseline_set_realized=pos.baseline_set_realized,
-                baseline_target=pos.baseline_target_price,
-                tier2_placed=pos.tiers[1].placed,
-                tier2_watching=pos.tiers[1].watching,
-                tier2_is_complete=pos.tiers[1].is_complete,
-                tier2_server_id=pos.tiers[1].server_order_id,
-            )
-        except Exception as _diag_exc:
-            log.warning("engine.t2_diag.error", error=str(_diag_exc))
+        # NOTE: legacy `pos.baseline_set` gate removed (H-NEW-2026-07-11 audit v6-13).
+        # The flag was only flipped in `record_fill` (the WS fill path), but the
+        # TierWatcher fast-fill path bypasses `record_fill` and goes straight
+        # into `apply_tier_watcher_result`, which sets `baseline_set_realized`
+        # but NOT `baseline_set`. Result: averaging-down was stuck in the
+        # first-branch early-return for every round whose T1 filled via the
+        # fast-fill path (production saw uPnL -46% with no T2 trigger).
+        # The baseline fallback chain at lines below already prefers
+        # `baseline_realized_price` and falls back to `baseline_target_price`,
+        # so there is no longer any need for this flag. Tick-level drift
+        # gating is the caller's responsibility (see _evaluate line ~595).
 
         if pos._tp_inflight:
             return
@@ -840,7 +825,29 @@ class StrategyEngine:
                 pos._baseline_rebased_logged = True
             baseline = new_baseline
         else:
-            baseline = pos.baseline_target_price or pos.baseline_price
+            baseline = (
+                pos.baseline_target_price
+                if pos.baseline_target_price is not None
+                else pos.baseline_price
+            )
+        # Defensive: if the fallback chain produced None (e.g. test stubs
+        # that bypass the production bind path, or a future refactor that
+        # breaks baseline anchoring), bail out cleanly and surface the state
+        # so operators see the round is alive but unanchorable. We log at
+        # INFO rather than via _tN_skip_log because this is a positional /
+        # state matter, not a tier-level decision.
+        if baseline is None:
+            log.info(
+                "engine.tN_skip_no_baseline",
+                side=pos.entry_side,
+                baseline_realized=pos.baseline_realized_price,
+                baseline_target=pos.baseline_target_price,
+                baseline_legacy=pos.baseline_price,
+                baseline_set_realized=pos.baseline_set_realized,
+                note="averaging-down called with no resolvable baseline; "
+                     "skipping all T2..T4 trigger evaluations this tick",
+            )
+            return
         pos._last_used_baseline_value = baseline
         s = self._s
         margin = self._get_price_pre_margin()
