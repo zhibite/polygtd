@@ -385,6 +385,61 @@ class CLOBClient:
             )
             return None
 
+    async def get_order_fill_state(self, order_id: str) -> dict | None:
+        """Single REST fetch of `{size_matched, avg_price, status}` in shares.
+
+        H-NEW-2026-07-11: the watcher needs both the matched size AND the
+        real average fill price so it can hand a defensible price to
+        `apply_tier_watcher_result` when the WS path missed a fill. Doing
+        this in one round-trip keeps the fast-path latency low.
+        Returns a dict like {"size_matched": 5.0, "avg_price": 0.40, "status": "..."}
+        or None on transient error.
+        """
+        if not self._client:
+            return None
+        try:
+            resp = await self._run(self._client.get_order, order_id)
+            if not isinstance(resp, dict):
+                return None
+            size = 0.0
+            for k in (
+                "size_matched", "sizeMatched",
+                "amount_matched", "amountMatched",
+                "filled_size", "filledSize",
+            ):
+                v = resp.get(k)
+                if v is not None:
+                    try:
+                        f = float(v)
+                        if f > 0:
+                            size = f
+                            break
+                    except (TypeError, ValueError):
+                        continue
+            avg_px = 0.0
+            for k in (
+                "avg_price", "avgPrice",
+                "average_price", "averagePrice",
+            ):
+                v = resp.get(k)
+                if v is not None:
+                    try:
+                        avg_px = float(v)
+                        break
+                    except (TypeError, ValueError):
+                        continue
+            return {
+                "size_matched": size,
+                "avg_price": avg_px,
+                "status": (resp.get("status") or "").lower(),
+            }
+        except Exception as exc:
+            log.debug(
+                "clob.get_order_fill_state.error",
+                order_id=order_id[:16], error=str(exc),
+            )
+            return None
+
     # ------------------------------------------------------------------
     # Order placement
     # ------------------------------------------------------------------
@@ -397,11 +452,27 @@ class CLOBClient:
         lifetime_s: int,
         tick_size: float,
     ) -> FillResult:
-        """
-        Post a GTD limit BUY order and poll until filled or expired.
+        """Post a GTD limit BUY order and return immediately.
 
-        Returns FillResult with the fill details once filled.
-        On GTD expiry or error returns FillResult(success=False).
+        H-NEW-2026-07-11 (fill-channel refactor): the previous
+        implementation polled `get_order` here for up to 60 s and tried to
+        cancel on timeout. That dual-path was the source of the 2026-07-11
+        10:03 incident: the order filled on the CLOB but
+        (a) the WS payload reported `size=0`,
+        (b) this poll loop watched `fills[]` and missed the fill because
+            SDK v2 returns size_matched only at the top level,
+        (c) the timeout-fired cancel hit a 400 ("Invalid order payload"),
+        (d) `place_buy` returned None → engine saw the BUY as failed.
+
+        Now TierWatcher is the single source of truth for fill progress —
+        it already polls `get_token_balance` every `TIER_FILL_POLL_S`. So
+        this method is responsible only for:
+          1. POST /order,
+          2. pre-register the server_id with the OrderManager,
+          3. return a `FillResult(success=True, order_id=...)` so the
+             caller can spawn the watcher.
+        The actual fill events flow through `_fire_fill_callback` (driven
+        by TierWatcher and User WS), not through this function.
         """
         if not self._client:
             return FillResult("", 0, 0, price, False, "ClobClient not initialised")
@@ -450,166 +521,32 @@ class CLOBClient:
             err = resp.get("errorMsg") or resp.get("error") or "no orderID"
             return FillResult("", 0, 0, price_q, False, err, expiration_ts)
 
-        # H-NEW-1 fix: pre-register the server_id with the OrderManager
-        # (best-effort) so the very first fill — potentially fired from the
-        # poll loop below before the caller returns — can be routed via
-        # by_server_id() even before the real TrackedOrder is inserted.
+        # Pre-register the server_id so a fill that fires synchronously
+        # from inside the POST (rare but observed) can be routed to the
+        # right TrackedOrder before place_buy finishes inserting it.
         if self.register_pending:
             try:
                 self.register_pending(order_id)
             except Exception as exc:
                 log.debug("clob.register_pending.error", error=str(exc))
 
-        # Poll until filled or timed out
-        deadline = time.monotonic() + self.GTD_CLIENT_TIMEOUT_SEC
-        poll_interval = 0.5
-        total_sz = 0.0
-        total_usdc = 0.0
-        # H-V6-2 fix: throttle the per-poll progress log so it doesn't flood
-        # logs at 0.5s intervals, but emit enough rows to see the GTD's
-        # lifetime progress (every ~10s, capped at one per poll cycle).
-        last_progress_log_ts = 0.0
-        progress_log_interval = 10.0
-        order_size = size_q
-
-        while time.monotonic() < deadline:
-            await asyncio.sleep(poll_interval)
-
-            try:
-                status_resp = await self._run(self._client.get_order, order_id)
-            except Exception as exc:
-                log.debug("clob.gtd_buy.get_order error", error=str(exc))
-                continue
-
-            if not status_resp:
-                continue
-
-            fills = status_resp.get("fills") or []
-            if fills:
-                for f in fills:
-                    try:
-                        # H-V6-12 fix (audit C-2): fills[].size is in
-                        # 6-decimal base units, same as size_matched. Divide
-                        # by 1_000_000 before summing. Pre-fix, the polling
-                        # loop's total_sz was inflated by 1e6 while
-                        # total_usdc was also inflated by 1e6, so
-                        # avg_px = total_usdc / total_sz accidentally
-                        # cancelled out — but tokens was wildly wrong.
-                        sz_raw = float(f.get("size", 0))
-                        sz = sz_raw / self._CLOB_BASE_UNITS if sz_raw > 0 else 0.0
-                        px = float(f.get("price", price_q))
-                        total_sz += sz
-                        total_usdc += sz * px
-                    except (TypeError, ValueError):
-                        continue
-
-                if total_sz > 0:
-                    avg_px = total_usdc / total_sz
-                    # H-V6-2 fix: log the BUY fill result before returning
-                    # so operators can see fills that came back through the
-                    # polling loop (as opposed to the synchronous post-response
-                    # callback). Pre-fix, only the post-response path logged.
-                    log.info(
-                        "clob.gtd_buy filled",
-                        order_id=order_id[:16],
-                        token=token_id[:16],
-                        filled_tokens=total_sz,
-                        avg_px=avg_px,
-                        total_usdc=total_usdc,
-                        order_size=order_size,
-                        fills_count=len(fills),
-                    )
-                    result = FillResult(
-                        order_id=order_id,
-                        tokens=_round_down(total_sz, Decimal("0.0001")),
-                        usdc=_round_down(total_usdc, Decimal("0.01")),
-                        fill_price=_round_down(avg_px, tick_d),
-                        success=True,
-                        expiration_ts=expiration_ts,
-                    )
-                    await self._fire_fill_callback(token_id, order_id, avg_px, total_sz)
-                    return result
-
-            order_status = (status_resp.get("status") or "").lower()
-            if order_status in ("cancelled", "expired", "failed"):
-                # H-V6-2 fix: enrich the existing expiry log with structured
-                # fields (matched so far, lifetime consumed, server status).
-                # Pre-fix log was just `clob.gtd_buy expired status=X`.
-                age_s = time.monotonic() - (deadline - self.GTD_CLIENT_TIMEOUT_SEC)
-                log.warning(
-                    "clob.gtd_buy expired",
-                    order_id=order_id[:16],
-                    token=token_id[:16],
-                    status=order_status,
-                    matched=total_sz,
-                    order_size=order_size,
-                    lifetime_s=gtd_seconds,
-                    lifetime_consumed_s=round(age_s, 1),
-                )
-                return FillResult(
-                    order_id=order_id, tokens=0, usdc=0,
-                    fill_price=price_q, success=False,
-                    error=f"gtd_{order_status}",
-                    expiration_ts=expiration_ts,
-                )
-
-            # H-V6-2 fix: periodic progress log so operators can see that
-            # the BUY is still live and waiting (the BUYs mostly cross
-            # immediately, but for illiquid markets the BUY can be sitting
-            # on the book waiting — this row lets us distinguish "alive
-            # waiting" from "stuck").
-            now_ts = time.monotonic()
-            if now_ts - last_progress_log_ts >= progress_log_interval:
-                last_progress_log_ts = now_ts
-                age_s = now_ts - (deadline - self.GTD_CLIENT_TIMEOUT_SEC)
-                log.info(
-                    "clob.gtd_buy poll_progress",
-                    order_id=order_id[:16],
-                    token=token_id[:16],
-                    matched=total_sz,
-                    order_size=order_size,
-                    order_status=order_status,
-                    lifetime_consumed_s=round(age_s, 1),
-                    lifetime_remaining_s=round(gtd_seconds - age_s, 1),
-                )
-
-        # Timeout — cancel and return failure
-        # H-V6-2 fix: structured timeout log with full context.
-        age_s = time.monotonic() - (deadline - self.GTD_CLIENT_TIMEOUT_SEC)
-        log.warning(
-            "clob.gtd_buy poll_timeout",
+        log.info(
+            "clob.gtd_buy.posted",
             order_id=order_id[:16],
             token=token_id[:16],
-            matched=total_sz,
-            order_size=order_size,
-            client_timeout_s=self.GTD_CLIENT_TIMEOUT_SEC,
-            lifetime_consumed_s=round(age_s, 1),
+            size=size_q,
+            price=price_q,
+            tick=tick_size,
+            expiration_ts=expiration_ts,
         )
-        try:
-            # H-V6-12 fix: SDK v2 `cancel_order(payload)` takes an OrderPayload
-            # object (with .orderID field), not a raw string.  Earlier code
-            # passed the string directly which crashed with
-            # "'str' object has no attribute 'orderID'".  Use the v2 list
-            # endpoint `cancel_orders` instead — same wire format, fewer
-            # surface area mismatches.
-            cancel_resp = await self._run(
-                self._client.cancel_orders,
-                [{"orderID": order_id}],
-            )
-            log.info(
-                "clob.gtd_buy poll_timeout_cancel_sent",
-                order_id=order_id[:16],
-                cancel_resp=str(cancel_resp)[:120],
-            )
-        except Exception as exc:
-            log.warning(
-                "clob.gtd_buy poll_timeout_cancel_failed",
-                order_id=order_id[:16], error=str(exc),
-            )
+        # Return success with order_id. Fill progress is owned by
+        # TierWatcher + User WS — this method no longer polls.
         return FillResult(
-            order_id=order_id, tokens=0, usdc=0,
-            fill_price=price_q, success=False,
-            error="gtd_poll_timeout",
+            order_id=order_id,
+            tokens=0,
+            usdc=0,
+            fill_price=price_q,
+            success=True,
             expiration_ts=expiration_ts,
         )
 

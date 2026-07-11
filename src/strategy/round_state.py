@@ -515,17 +515,44 @@ class Position:
             reason=reason,
         )
 
+    # H-NEW-2026-07-11: dedup registry for apply_tier_watcher_result.
+    # TierWatcher's _fire_complete is already idempotent at the watcher
+    # layer, but as defence in depth we keep a per-(server_order_id, dedup_key)
+    # set here so two different watcher objects observing the same order
+    # (e.g. BUY + TP overlap during a single round) cannot both advance
+    # position totals twice.
+    _applied_watcher_dedup: set[tuple[str, str]] = field(default_factory=set)
+
+    @property
+    def tiers(self) -> list[TierSnapshot]:
+        return [self.tier1, self.tier2, self.tier3, self.tier4]
+
+
     def apply_tier_watcher_result(
         self,
         tier: TierSnapshot,
         outcome: str,
         filled_qty: float,
+        dedup_key: str = "",
+        avg_fill_price: float = 0.0,
     ) -> None:
         """Commit TierWatcher terminal state into the tier / position.
 
         Called by the ActionRouter's watcher callback when a tier's GTD
         has reached a final state (filled / expired / crossed / cancelled
         / over_filled / error).
+
+        Args:
+            tier:           TierSnapshot to update.
+            outcome:        one of TierOutcome string values.
+            filled_qty:     shares the watcher observed at termination.
+            dedup_key:      ``<server_id>|<outcome>`` from WatcherResult;
+                            if it has already been applied for this
+                            position, this call is a no-op.
+            avg_fill_price: real average fill price reported by the CLOB.
+                            If > 0 and the WS path missed fills, this is
+                            the price used for cost accumulation instead
+                            of falling back to ``notional/size_expected``.
 
         The watcher is the ground-truth source for "how many shares do I
         actually hold"; this method reconciles that into:
@@ -538,6 +565,22 @@ class Position:
         """
         from src.execution.tier_watcher import TierOutcome
 
+        # Defence-in-depth dedup. Even if a watcher somehow fires its
+        # on_complete twice (or two watchers observe the same order_id),
+        # only the first application of a given dedup_key touches
+        # position totals.
+        if dedup_key:
+            if dedup_key in self._applied_watcher_dedup:
+                log.debug(
+                    "position.watcher_result_dedup_skip",
+                    dedup_key=dedup_key[:32],
+                    tier=tier.tier,
+                    filled=tier.filled,
+                )
+                tier.watching = False
+                return
+            self._applied_watcher_dedup.add(dedup_key)
+
         # Monotonic — fill events may have already incremented size_filled.
         if filled_qty > tier.placed_qty:
             tier.placed_qty = filled_qty
@@ -547,19 +590,19 @@ class Position:
             # If the watcher caught fills that the WS path missed, advance
             # position-level totals so STATUS / TP math see them.
             if filled_qty > tier.size_filled + 1e-9:
-                # We don't know the exact per-fill price here, so use
-                # tier.avg_fill_price (set by record_fill) or the strategy
-                # price as a fallback. This is a best-effort fix-up for
-                # missed fill events; the size_filled path remains
-                # authoritative when it works.
-                fill_px = tier.avg_fill_price or 0.0
-                if fill_px <= 0 and tier.size_expected > 0 and tier.notional > 0:
-                    # Strategy price back-derivation = notional / size_expected.
+                # Price precedence for the missed-fill reconciliation:
+                #   1. Real avg_fill_price from the watcher (preferred).
+                #   2. tier.avg_fill_price previously set by record_fill.
+                #   3. Strategy price = notional / size_expected.
+                fill_px = 0.0
+                if avg_fill_price > 0:
+                    fill_px = float(avg_fill_price)
+                elif tier.avg_fill_price and tier.avg_fill_price > 0:
+                    fill_px = float(tier.avg_fill_price)
+                elif tier.size_expected > 0 and tier.notional > 0:
                     fill_px = tier.notional / tier.size_expected
-                if fill_px <= 0:
-                    fill_px = 0.0
+
                 missed = filled_qty - tier.size_filled
-                # Only add positive missed qty; never inflate.
                 if missed > 1e-9 and fill_px > 0:
                     self._total_qty += missed
                     self._total_cost += missed * fill_px
@@ -572,6 +615,10 @@ class Position:
                         tier=tier.tier,
                         missed=missed,
                         fill_px=fill_px,
+                        fill_px_source="avg_fill_price" if avg_fill_price > 0 else (
+                            "tier.avg_fill_price" if (tier.avg_fill_price and tier.avg_fill_price > 0)
+                            else "notional/size_expected"
+                        ),
                         total_qty=self._total_qty,
                     )
 
@@ -605,6 +652,7 @@ class Position:
             tier=tier.tier,
             outcome=outcome,
             filled_qty=filled_qty,
+            avg_fill_price=avg_fill_price,
             placed_qty=tier.placed_qty,
             size_filled=tier.size_filled,
             size_expected=tier.size_expected,

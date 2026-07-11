@@ -65,21 +65,6 @@ class LogConfig(BaseSettings):
         super().__init__(**{**_toml_section("LOG"), **kwargs})
 
 
-class PollConfig(BaseSettings):
-    """REST polling intervals (book fallback, etc).
-
-    H-V6-12: REST /book poller fills in best_bid / best_ask when the
-    MarketWS fails to deliver a `best_bid_ask` event for a given token.
-    WS remains the source of truth — REST only writes when the cache
-    field is still 0, so a late WS event will always win.
-    """
-
-    REST_BOOK_POLL_S: float = 2.0
-
-    def __init__(self, **kwargs):
-        super().__init__(**{**_toml_section("POLL"), **kwargs})
-
-
 # ---------------------------------------------------------------------------
 # Env-driven strategy settings
 # ---------------------------------------------------------------------------
@@ -213,7 +198,6 @@ _general: GeneralConfig | None = None
 _binance: BinanceConfig | None = None
 _baseline: BaselineConfig | None = None
 _log: LogConfig | None = None
-_poll: PollConfig | None = None
 _strategy: StrategySettings | None = None
 
 
@@ -245,12 +229,6 @@ def log_config() -> LogConfig:
     return _log
 
 
-def poll_config() -> PollConfig:
-    """H-V6-12: REST /book polling interval. 0 disables the fallback."""
-    global _poll
-    if _poll is None:
-        _poll = PollConfig()
-    return _poll
 
 
 def strategy() -> StrategySettings:

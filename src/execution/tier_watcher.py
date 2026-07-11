@@ -63,11 +63,22 @@ class WatcherResult:
     server_order_id: str
     token_id: str
     side: str                       # "BUY" or "SELL"
-    strategy_price: float           # the price we tried to GTD at
+    strategy_price: float           # the limit price we posted
     expected_size: float            # the notional / strategy_price
-    filled_qty: float               # final balance at termination
+    filled_qty: float               # final balance at termination (shares)
     cancel_sent: bool               # True if we issued cancel_order
     error: str = ""
+    # H-NEW-2026-07-11: real average fill price as observed by the CLOB.
+    # Used by `apply_tier_watcher_result` as the AUTHORITATIVE price when
+    # the watcher is the first to report a fill — instead of falling back
+    # to `notional / size_expected` (which is the strategy price, not the
+    # actual fill price and can diverge by a few bp under thin books /
+    # crossing flows).
+    avg_fill_price: float = 0.0
+    # H-NEW-2026-07-11: explicit dedup key. Downstream subscribers use it
+    # to ensure the same terminal state is not applied twice to position
+    # totals.
+    dedup_key: str = ""
 
 
 # Callback signatures the ActionRouter / engine wire up.
@@ -133,6 +144,11 @@ class TierWatcher:
         self._task: Optional[asyncio.Task[None]] = None
         self._result: Optional[WatcherResult] = None
         self._stopped = False
+        # Idempotency guard: `_fire_complete` may be invoked more than once
+        # if the outer `_run` re-enters after an exception, or if a future
+        # change wires additional callbacks. Without this guard the
+        # downstream `apply_tier_watcher_result` would double-count (B-NEW-3).
+        self._fire_complete_called = False
 
     def start(self) -> asyncio.Task[None]:
         """Spawn the background task. Idempotent."""
@@ -184,10 +200,48 @@ class TierWatcher:
             await self._fire_complete(self._result)
 
     async def _watch(self) -> None:
-        """Poll until a terminal state is reached."""
+        """Poll until a terminal state is reached.
+
+        H-NEW-2026-07-11 (fill-channel refactor): this watcher is now the
+        single source of truth for a GTD BUY's fill progress. We first try
+        a one-shot REST read of `size_matched` + `avg_price` so any fill
+        that already landed during place_gtd_buy is detected within ~100 ms
+        of spawn. Only if that returns size_matched=0 do we fall through to
+        the balance-poll loop.
+        """
         next_log_ts = 0.0
-        # Initial state — no balance yet, just observe.
         prev_balance = 0.0
+
+        # Fast path: detect fills that completed BEFORE the watcher
+        # spawned (very common — fills that crossed during place_gtd_buy).
+        fast_state = await self._read_fill_state()
+        fast_size = fast_state.get("size_matched", 0.0) if fast_state else 0.0
+        fast_avg = fast_state.get("avg_price", 0.0) if fast_state else 0.0
+        if fast_size and fast_size > 0:
+            cancel_sent = await self._safe_cancel()
+            self._result = WatcherResult(
+                outcome=TierOutcome.FILLED,
+                server_order_id=self._server_order_id,
+                token_id=self._token_id,
+                side=self._side,
+                strategy_price=self._strategy_price,
+                expected_size=self._expected_size,
+                filled_qty=fast_size,
+                cancel_sent=cancel_sent,
+                avg_fill_price=fast_avg if fast_avg > 0 else self._strategy_price,
+                dedup_key=self._dedup_key(TierOutcome.FILLED),
+            )
+            log.info(
+                "tier_watcher.fast_fill_on_spawn",
+                server_id=self._server_order_id[:16],
+                side=self._side,
+                size_matched=fast_size,
+                avg_price=fast_avg,
+                expected=self._expected_size,
+                cancel_sent=cancel_sent,
+            )
+            await self._fire_complete(self._result)
+            return
 
         while True:
             if self._stopped or not self._is_active():
@@ -226,6 +280,8 @@ class TierWatcher:
                     expected_size=self._expected_size,
                     filled_qty=balance,
                     cancel_sent=cancel_sent,
+                    avg_fill_price=self._strategy_price,
+                    dedup_key=self._dedup_key(TierOutcome.OVER_FILLED),
                 )
                 await self._fire_complete(self._result)
                 return
@@ -242,6 +298,8 @@ class TierWatcher:
                     expected_size=self._expected_size,
                     filled_qty=balance,
                     cancel_sent=cancel_sent,
+                    avg_fill_price=self._strategy_price,
+                    dedup_key=self._dedup_key(TierOutcome.FILLED),
                 )
                 log.info(
                     "tier_watcher.filled",
@@ -272,6 +330,8 @@ class TierWatcher:
                         expected_size=self._expected_size,
                         filled_qty=balance,
                         cancel_sent=cancel_sent,
+                        avg_fill_price=self._strategy_price,
+                        dedup_key=self._dedup_key(TierOutcome.CROSSED),
                     )
                     log.info(
                         "tier_watcher.crossed_into_next_tier",
@@ -300,6 +360,8 @@ class TierWatcher:
                     expected_size=self._expected_size,
                     filled_qty=balance,
                     cancel_sent=cancel_sent,
+                    avg_fill_price=self._strategy_price,
+                    dedup_key=self._dedup_key(TierOutcome.EXPIRED),
                 )
                 log.info(
                     "tier_watcher.expired",
@@ -329,12 +391,56 @@ class TierWatcher:
             prev_balance = balance
             await asyncio.sleep(self._poll_s)
 
+    def _dedup_key(self, outcome: TierOutcome) -> str:
+        """Stable key for downstream subscribers to dedup terminal states.
+
+        ``<server_order_id>|<outcome>`` — same key regardless of which
+        fast-path / balance-path branch fires first.
+        """
+        return f"{self._server_order_id}|{outcome.value}"
+
     async def _read_balance(self) -> Optional[float]:
         try:
             return await self._clob.get_token_balance(self._token_id)
         except Exception as exc:
             log.debug(
                 "tier_watcher.balance_error",
+                server_id=self._server_order_id[:16],
+                error=str(exc),
+            )
+            return None
+
+    async def _read_size_matched(self) -> Optional[float]:
+        """Fast path: ask CLOB for this order's authoritative size_matched.
+
+        This is the post that landed during place_gtd_buy — checking it
+        first means a fill that crossed during the post gets reported
+        within ~100 ms of the watcher spawning, instead of waiting for the
+        first balance poll to tick.
+
+        Kept for callers that only care about the size; the watcher itself
+        uses `_read_fill_state` so it can also capture avg_price.
+        """
+        if not self._server_order_id:
+            return None
+        try:
+            return await self._clob.get_order_filled_size(self._server_order_id)
+        except Exception as exc:
+            log.debug(
+                "tier_watcher.size_matched_error",
+                server_id=self._server_order_id[:16],
+                error=str(exc),
+            )
+            return None
+
+    async def _read_fill_state(self) -> Optional[dict]:
+        if not self._server_order_id:
+            return None
+        try:
+            return await self._clob.get_order_fill_state(self._server_order_id)
+        except Exception as exc:
+            log.debug(
+                "tier_watcher.fill_state_error",
                 server_id=self._server_order_id[:16],
                 error=str(exc),
             )
@@ -367,6 +473,14 @@ class TierWatcher:
             return False
 
     async def _fire_complete(self, result: WatcherResult) -> None:
+        # H-NEW-2026-07-11: idempotent. A watcher can reach its terminal
+        # state via multiple code paths (the fast fill path on spawn, the
+        # normal balance path, an exception in _run → _fire_complete(error)).
+        # Without this guard, calling on_complete twice would feed
+        # `apply_tier_watcher_result` the same filled_qty twice.
+        if self._fire_complete_called:
+            return
+        self._fire_complete_called = True
         if self._on_complete is None:
             return
         try:

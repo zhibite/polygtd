@@ -1,11 +1,14 @@
 """Polymarket CLOB Market WebSocket feed.
 
 Subscribes to:  wss://ws-subscriptions-clob.polymarket.com/ws/market
-(Requires custom_feature_enabled: true to receive best_bid_ask and last_trade_price.)
 
 Provides:
-  - PriceCache: last_trade_price / best_bid / best_ask per token_id
+  - PriceCache: last_trade_price / midpoint per token_id
   - Tick size change notifications
+
+H-NEW-2026-07-11: orderbook parsing (best_bid / best_ask / book events) has
+been removed. The strategy now trades off REST midpoint + WS last_trade_price
+only — see StrategyEngine / ActionRouter docs.
 """
 from __future__ import annotations
 
@@ -28,53 +31,24 @@ class PriceCache:
     """Per-token price snapshot, updated by MarketWS and REST polling."""
 
     last_trade_price: dict[str, float] = field(default_factory=dict)
-    best_bid: dict[str, float] = field(default_factory=dict)
-    best_ask: dict[str, float] = field(default_factory=dict)
     tick_size: dict[str, float] = field(default_factory=dict)
-    midpoint: dict[str, float] = field(default_factory=dict)  # Updated via REST /midpoint
-    # H-V6-12: provenance map. Values are "ws", "rest", or absent.
-    # set_token_source() is called whenever best_bid / best_ask is mutated
-    # so STATUS can show `bid_src=ws` vs `bid_src=rest` to the operator.
-    bid_source: dict[str, str] = field(default_factory=dict)
-    ask_source: dict[str, str] = field(default_factory=dict)
+    midpoint: dict[str, float] = field(default_factory=dict)  # REST /midpoint poller
 
     def last(self, token: str) -> float:
         return self.last_trade_price.get(token, 0.0)
 
-    def bid(self, token: str) -> float:
-        return self.best_bid.get(token, 0.0)
-
-    def ask(self, token: str) -> float:
-        return self.best_ask.get(token, 0.0)
-
     def mid(self, token: str) -> float:
-        b = self.best_bid.get(token)
-        a = self.best_ask.get(token)
-        if b and a:
-            return (b + a) / 2.0
-        return 0.0
+        return self.midpoint.get(token, 0.0)
 
     def get_midpoint(self, token: str) -> float:
         """REST midpoint price — more stable than last_trade_price for strategy decisions."""
         return self.midpoint.get(token, 0.0)
 
-    def bid_src(self, token: str) -> str:
-        """'ws' if MarketWS seeded the bid, 'rest' if REST /book poller did,
-        '' if cache is empty. Read-only — call set_token_source() to write."""
-        return self.bid_source.get(token, "")
-
-    def ask_src(self, token: str) -> str:
-        return self.ask_source.get(token, "")
-
     def clear_token(self, token: str) -> None:
         """Clear cached data for a specific token (e.g., on window change)."""
         self.last_trade_price.pop(token, None)
-        self.best_bid.pop(token, None)
-        self.best_ask.pop(token, None)
         self.tick_size.pop(token, None)
         self.midpoint.pop(token, None)
-        self.bid_source.pop(token, None)
-        self.ask_source.pop(token, None)
 
 
 MarketWSConnected = Callable[[], None]
@@ -206,23 +180,19 @@ class MarketWS:
                 payload=str(msg)[:400],
             )
 
-        # ── Polymarket Market Channel payload schema ─────────────────────────
-        # Real messages (event_type-driven):
-        #   best_bid_ask:  { event_type, market, asset_id, best_bid, best_ask,
-        #                    spread, timestamp }
-        #   price_change:  { event_type, market, price_changes: [{ asset_id,
-        #                    price, size, side, hash, best_bid, best_ask }],
-        #                    timestamp }
-        #   book:          { event_type, asset_id, market, bids:[{price,size}],
-        #                    asks:[{price,size}], timestamp, hash }
-        #   last_trade_price: { event_type, asset_id, price, side, size,
-        #                       fee_rate_bps, timestamp }
-        # Legacy / defensive reads kept below for older shapes (price-only or
-        # nested best_bid_ask dict).
+        # ── Polymarket Market Channel payload schema (relevant subset) ────────
+        #   price_change:          { event_type, market,
+        #                            price_changes: [{ asset_id, price, side,
+        #                            size, ... }], timestamp }
+        #   last_trade_price:      { event_type, asset_id, price, side, size,
+        #                            fee_rate_bps, timestamp }
+        #
+        # orderbook events (best_bid_ask / book / bba dict) are NOT parsed —
+        # the strategy trades off REST midpoint + WS last_trade_price only.
         event_type = msg.get("event_type") or msg.get("type") or ""
 
-        # Extract token id — best_bid_ask / book / last_trade_price use top-
-        # level `asset_id`; price_change puts it inside each price_changes[].
+        # Extract token id — last_trade_price uses top-level `asset_id`;
+        # price_change puts it inside each price_changes[].
         token = (
             msg.get("asset_id")
             or msg.get("token")
@@ -233,24 +203,9 @@ class MarketWS:
             token = market_field.get("asset_id") or market_field.get("assetID") or ""
 
         # ── best_bid / best_ask ──────────────────────────────────────────────
-        # Polymarket sends these as TOP-LEVEL scalars in best_bid_ask events
-        # and inside each price_changes[] item. We seed the cache from
-        # whichever shape is present.
-        if event_type == "best_bid_ask":
-            bb_raw = msg.get("best_bid")
-            ba_raw = msg.get("best_ask")
-            try:
-                if bb_raw is not None and bb_raw != "":
-                    self._cache.best_bid[token] = float(bb_raw)
-                    self._cache.bid_source[token] = "ws"
-            except (TypeError, ValueError):
-                pass
-            try:
-                if ba_raw is not None and ba_raw != "":
-                    self._cache.best_ask[token] = float(ba_raw)
-                    self._cache.ask_source[token] = "ws"
-            except (TypeError, ValueError):
-                pass
+        # Orderbook (best_bid / best_ask / book) events are intentionally
+        # NOT parsed here. The strategy trades off REST midpoint +
+        # WS last_trade_price only — see StrategyEngine / ActionRouter.
 
         # price_change → per-asset updates (each carries its own best_bid/ask)
         pcs = msg.get("price_changes", [])
@@ -269,59 +224,7 @@ class MarketWS:
                         self._cache.last_trade_price[pc_token] = float(pc_price)
                     except (TypeError, ValueError):
                         pass
-                # Many price_changes carry best_bid / best_ask (older docs).
-                # When present, prefer them over a stale cache value.
-                for key, cache_attr, src_attr in (
-                    ("best_bid", "best_bid", "bid_source"),
-                    ("best_ask", "best_ask", "ask_source"),
-                ):
-                    raw = pc.get(key)
-                    if raw is None or raw == "":
-                        continue
-                    try:
-                        self._cache.__dict__[cache_attr][pc_token] = float(raw)
-                        self._cache.__dict__[src_attr][pc_token] = "ws"
-                    except (TypeError, ValueError):
-                        pass
 
-        # book event — top-level bids/asks arrays (full snapshot)
-        if event_type == "book":
-            bids = msg.get("bids") or []
-            asks = msg.get("asks") or []
-            if token and isinstance(bids, list) and bids:
-                try:
-                    self._cache.best_bid[token] = float(bids[0].get("price"))
-                    self._cache.bid_source[token] = "ws"
-                except (AttributeError, TypeError, ValueError):
-                    pass
-            if token and isinstance(asks, list) and asks:
-                try:
-                    self._cache.best_ask[token] = float(asks[0].get("price"))
-                    self._cache.ask_source[token] = "ws"
-                except (AttributeError, TypeError, ValueError):
-                    pass
-
-        # ── Legacy / defensive paths (kept for forward-compat) ──────────────
-        # Some messages (older servers, debug echoes) carry a nested
-        # `best_bid_ask` dict. Read it as a last resort; do NOT clobber a
-        # better value we just wrote above.
-        bba = msg.get("best_bid_ask")
-        if isinstance(bba, dict):
-            bba_token = bba.get("asset_id") or bba.get("assetID") or token
-            bids = bba.get("bids", [])
-            asks = bba.get("asks", [])
-            if bids and isinstance(bids, list) and len(bids) > 0:
-                try:
-                    self._cache.best_bid.setdefault(bba_token, float(bids[0]))
-                    self._cache.bid_source.setdefault(bba_token, "ws")
-                except (TypeError, ValueError):
-                    pass
-            if asks and isinstance(asks, list) and len(asks) > 0:
-                try:
-                    self._cache.best_ask.setdefault(bba_token, float(asks[0]))
-                    self._cache.ask_source.setdefault(bba_token, "ws")
-                except (TypeError, ValueError):
-                    pass
 
         # last_trade_price (top-level field on dedicated event_type)
         ltp = msg.get("last_trade_price")

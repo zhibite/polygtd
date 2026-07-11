@@ -3,7 +3,7 @@
 Entry point. Coordinates:
   1. WindowManager — tracks 15-min window boundaries
   2. BinanceFeed   — BTC spot WS + ring buffer
-  3. MarketWS      — CLOB market data WS (best_bid / last_trade_price)
+  3. MarketWS      — CLOB market data WS (last_trade_price)
   4. MarketDiscovery — Gamma REST to find market metadata
   5. StrategyEngine — decision loop (emits typed Actions)
   6. OrderManager   — serialised order executor
@@ -37,7 +37,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from src.config import general, binance, log_config, poll_config, strategy
+from src.config import general, binance, log_config, strategy
 from src.clob_l1_auth import create_or_derive_clob_api_creds, ClobL1Error
 from src.execution.clob_client import CLOBClient
 from src.execution.gtd_expiry_watcher import GtdExpiryWatcher
@@ -200,7 +200,25 @@ class ActionRouter:
         `cross_threshold` = the next tier's pre-arm fire line. When the
         watched token's mid drops at or below this line, the watcher
         cancels the GTD early so the next tier can fire cleanly.
+
+        H-NEW-2026-07-11 (B-NEW-4): guard against accidental double-spawn
+        by short-circuiting if a watcher for the same (round, tier) is
+        already running. Otherwise (e.g. an `_evaluate` tick fires while
+        the previous spawn's place_buy await is still in flight) we would
+        post a second GTD on the book and double-spend the tier's budget.
         """
+        existing = self._watchers.get((round_start_ts, tier))
+        if existing is not None and not existing.result:
+            # Watcher is still running (or pending). Refuse the duplicate.
+            log.warning(
+                "router.duplicate_tier_watcher_rejected",
+                round=round_start_ts,
+                tier=tier,
+                server_id=server_order_id[:16],
+                active_server_id=(existing._server_order_id or "")[:16],
+            )
+            return existing
+
         cfg = strategy()
         eng = self._state.engine
 
@@ -209,8 +227,16 @@ class ActionRouter:
             if not eng or not eng._round:
                 return
             tier_snap = eng._round.position.tiers[tier - 1]
+            # H-NEW-2026-07-11: forward dedup_key + real avg_fill_price so
+            # apply_tier_watcher_result can dedup terminal states across
+            # multiple fan-in paths and price its missed-fill fix-up
+            # against the CLOB-reported average (not the strategy price).
             eng._round.position.apply_tier_watcher_result(
-                tier_snap, result.outcome.value, result.filled_qty,
+                tier_snap,
+                result.outcome.value,
+                result.filled_qty,
+                dedup_key=result.dedup_key,
+                avg_fill_price=result.avg_fill_price,
             )
 
         async def mid_provider() -> float:
@@ -766,112 +792,6 @@ async def _midpoint_poll_loop() -> None:
 
 
 # ---------------------------------------------------------------------------
-# REST /book poller (best_bid / best_ask fallback when WS is missing events)
-# ---------------------------------------------------------------------------
-
-async def _book_poll_loop() -> None:
-    """H-V6-12: REST /book fallback for best_bid / best_ask.
-
-    Production symptom this exists for:
-      2026-07-11 round 13:45 — MarketWS was alive but never delivered a
-      `best_bid_ask` event for the UP token (asset_id=9214325536339527),
-      so `PriceCache.best_bid[UP]` stayed at 0 for the full round and T1
-      gated on `engine.t1_skip_no_bid` for the entire 15-min window — even
-      though DOWN was being pushed normally and `midpoint` REST had a value.
-
-    Strategy:
-      - Poll CLOB `/book?token_id=...` every REST_BOOK_POLL_S seconds.
-      - Only write `best_bid[token]` / `best_ask[token]` when the cache
-        field is currently 0 — MarketWS is the source of truth and we
-        never want a slower REST snapshot to clobber a live WS update.
-      - WS reconnect or a late `best_bid_ask` event will overwrite our
-        fallback value on the next tick; the union of (WS ∪ REST) gives
-        us a `best_bid` that's at worst 2s stale, which is well within
-        the strategy's tolerance (T1 only acts inside a 5-min window).
-    """
-    cfg = poll_config()
-    interval = float(cfg.REST_BOOK_POLL_S or 0.0)
-    if interval <= 0:
-        log.info("book_poll_loop.disabled", msg="REST_BOOK_POLL_S=0")
-        return
-    log.info("book_poll_loop.started", interval_s=interval)
-
-    last_condition_id = ""
-
-    while True:
-        await asyncio.sleep(interval)
-        s = STATE
-        if not s.pm_client or not s.price_cache:
-            continue
-
-        wm = s.wm
-        if not wm:
-            continue
-        ctx = wm.get("BTC")
-        mkt = ctx.market if ctx else None
-        if not mkt or not mkt.token_up_id or not mkt.token_down_id:
-            continue
-
-        # Reset trackers when the window rolls over so we log the
-        # transition exactly once per round.
-        if mkt.condition_id and mkt.condition_id != last_condition_id:
-            if last_condition_id:
-                log.info(
-                    "book_poll.window_changed",
-                    prev_condition_id=last_condition_id[:16],
-                    new_condition_id=mkt.condition_id[:16],
-                )
-            last_condition_id = mkt.condition_id
-
-        # We want shortest path to price cache — use the per-token
-        # helper exposed by PriceCache so future refactors only need to
-        # touch one file.
-        cache = s.price_cache
-        fills = {"up": False, "down": False}
-
-        for label, token in (("up", mkt.token_up_id), ("down", mkt.token_down_id)):
-            try:
-                book = await s.pm_client.get_order_book(token)
-            except Exception as exc:
-                log.debug(
-                    "book_poll.fetch_error",
-                    side=label, token=token[:16], error=str(exc),
-                )
-                continue
-            if not isinstance(book, dict):
-                continue
-
-            bids = book.get("bids") or []
-            asks = book.get("asks") or []
-
-            # Each entry from /book is {"price": "0.405", "size": "100"} — defensive decode.
-            try:
-                bid = float(bids[0]["price"]) if bids and isinstance(bids[0], dict) else 0.0
-            except (KeyError, TypeError, ValueError, IndexError):
-                bid = 0.0
-            try:
-                ask = float(asks[0]["price"]) if asks and isinstance(asks[0], dict) else 0.0
-            except (KeyError, TypeError, ValueError, IndexError):
-                ask = 0.0
-
-            # WS remains authoritative — only fill where cache is empty.
-            if bid > 0 and cache.best_bid.get(token, 0.0) == 0.0:
-                cache.best_bid[token] = bid
-                cache.bid_source[token] = "rest"
-                fills[label] = True
-            if ask > 0 and cache.best_ask.get(token, 0.0) == 0.0:
-                cache.best_ask[token] = ask
-                cache.ask_source[token] = "rest"
-
-        if any(fills.values()):
-            log.info(
-                "book_poll.filled",
-                up=mkt.token_up_id[:16], down=mkt.token_down_id[:16],
-                up_filled=fills["up"], down_filled=fills["down"],
-            )
-
-
-# ---------------------------------------------------------------------------
 # Status printer
 # ---------------------------------------------------------------------------
 
@@ -973,6 +893,11 @@ async def _status_loop() -> None:
                 upnl_str = f"${sign}{abs(unreal_pnl):.2f}{pnl_pct_str}"
             else:
                 upnl_str = "$0.00"
+            # H-NEW-2026-07-11: also show the live take-profit target so
+            # operators see "how far away from TP" without cross-referencing
+            # position.fill_recorded events. Returns None when avg_cost<=0.
+            tp_target = pos.tp_target()
+            tp_str = f" tpTarget={tp_target:.4f}" if tp_target is not None else ""
             side_str = pos.entry_side or "-"
             pos_str = (
                 f" | side={side_str} tiers=[{tiers_str}]"
@@ -981,29 +906,13 @@ async def _status_loop() -> None:
                 f" cost=${pos.total_cost:.2f}"
                 f" mid={held_mid:.4f}"
                 f" uPnL={upnl_str}"
+                f"{tp_str}"
             )
-
-        # H-V6-9: surface the cached best_bid for UP/DOWN so the operator
-        # can tell from STATUS whether the WS bba path is actually feeding
-        # the strategy. Before this, REST midpoint was visible but best_bid
-        # was hidden — leaving us blind to the fact that `cache.best_bid`
-        # was 0 while the WS was pumping `best_bid_ask` events we never
-        # parsed (production symptom: 2026-07-11 01:17 round 01:15).
-        if up_token and down_token:
-            up_bid = s.price_cache.best_bid.get(up_token, 0.0)
-            down_bid = s.price_cache.best_bid.get(down_token, 0.0)
-            up_src = s.price_cache.bid_src(up_token) or "empty"
-            down_src = s.price_cache.bid_src(down_token) or "empty"
-            bid_str = (
-                f" | bids=UP={up_bid:.4f}({up_src})/DOWN={down_bid:.4f}({down_src})"
-            )
-        else:
-            bid_str = ""
 
         log.info(
             f"STATUS  binance={bc:,.1f}  {gate_str}"
             f"  {window_str}  "
-            f"UP={up_last:.4f}  DOWN={down_last:.4f}{bid_str}{pos_str}"
+            f"UP={up_last:.4f}  DOWN={down_last:.4f}{pos_str}"
         )
 
 
@@ -1168,10 +1077,9 @@ async def main() -> None:
                 "Set API_KEY / API_SECRET / API_PASSPHRASE in .env",
         )
 
-    # Status printer + REST pollers (midpoint + book fallback)
+    # Status printer + REST midpoint poller
     status_task = asyncio.create_task(_status_loop())
     midpoint_task = asyncio.create_task(_midpoint_poll_loop())
-    book_task = asyncio.create_task(_book_poll_loop())
 
     # ── Graceful shutdown ───────────────────────────────────────────────
     def _signal_handler() -> None:
@@ -1191,7 +1099,6 @@ async def main() -> None:
     log.info("bot.shutdown_initiated")
     status_task.cancel()
     midpoint_task.cancel()
-    book_task.cancel()
 
     # B-3 v2 fix: await any in-flight TP runners so they finish cleanly
     # before tearing down dependencies (clob / order_manager). Otherwise a

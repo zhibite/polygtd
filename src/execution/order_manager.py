@@ -75,27 +75,6 @@ class OrderManager:
     #
     # The legacy 0.001 values are kept as fallbacks for any market with
     # tick_size <= 0.001 (no such market exists today but keeps the math safe).
-    BUY_STEP: float = 0.001
-    SELL_STEP: float = 0.001
-
-    @staticmethod
-    def _buy_step_for(tick_size: float) -> float:
-        """Step size for BUY snap, scaled to the market's tick granularity.
-
-        tick_size=0.01 → step=0.005 (half a tick above bid, round-up).
-        tick_size=0.001 → step=0.0005.
-        tick_size=0.0001 → step=0.0001 (smaller than half a tick — clamp).
-        """
-        if tick_size <= 0:
-            return OrderManager.BUY_STEP
-        return max(tick_size / 2.0, min(tick_size, 0.0001))
-
-    @staticmethod
-    def _sell_step_for(tick_size: float) -> float:
-        """Step size for SELL snap, mirror of _buy_step_for."""
-        if tick_size <= 0:
-            return OrderManager.SELL_STEP
-        return max(tick_size / 2.0, min(tick_size, 0.0001))
 
     def __init__(
         self,
@@ -116,60 +95,6 @@ class OrderManager:
         # Drained by resolve_pending_server_id() when the real entry lands.
         self._pending_fills: dict[str, list[tuple[float, float]]] = {}
 
-    # ------------------------------------------------------------------
-    # Price helpers
-    # ------------------------------------------------------------------
-
-    async def _get_best_bid_ask(self, token_id: str) -> tuple[float, float]:
-        """
-        Fetch live best bid/ask from REST API (orderbook endpoint).
-        Returns (best_bid, best_ask), defaults to (0, 0) on error.
-        """
-        if not self._pm:
-            return 0.0, 0.0
-        try:
-            ob = await self._pm.get_order_book(token_id)
-            if not ob:
-                return 0.0, 0.0
-            bids = ob.get("bids", [])
-            asks = ob.get("asks", [])
-            bid = float(bids[0].get("price", 0)) if bids else 0.0
-            ask = float(asks[0].get("price", 0)) if asks else 0.0
-            return bid, ask
-        except Exception:
-            return 0.0, 0.0
-
-    async def _adjust_buy_price(self, token_id: str, desired_price: float, tick_size: float = 0.01) -> float:
-        """
-        Snap GTD buy price just above the current best bid so a taker is
-        more likely to cross the spread and fill us immediately.
-
-        M-NEW-4 fix: uses `_buy_step_for(tick_size)` instead of the legacy
-        hard-coded BUY_STEP=0.001, which round-down to nothing on
-        tick_size=0.01 markets. Now the snap moves us strictly above bid
-        by at least half a tick.
-
-        Falls back to desired_price if the book is unavailable.
-        """
-        bid, _ = await self._get_best_bid_ask(token_id)
-        if bid > 0:
-            step = self._buy_step_for(tick_size)
-            return round(bid + step, 4)
-        return desired_price
-
-    async def _adjust_sell_price(self, token_id: str, desired_price: float, tick_size: float = 0.01) -> float:
-        """
-        Snap GTD sell price just below the current best ask so a taker is
-        more likely to cross the spread and fill us immediately.
-
-        M-NEW-4 fix: uses `_sell_step_for(tick_size)`. Symmetric with the
-        BUY adjustment.
-        """
-        _, ask = await self._get_best_bid_ask(token_id)
-        if ask > 0:
-            step = self._sell_step_for(tick_size)
-            return round(ask - step, 4)
-        return desired_price
 
     # ------------------------------------------------------------------
     # Public read access
@@ -363,6 +288,21 @@ class OrderManager:
             return None
 
         size = notional / price
+        # H-NEW-2026-07-11 (B-NEW-4): refuse if there's already an open BUY
+        # for the same (round, tier_name). Without this, two concurrent
+        # ActionRouter invocations could each call place_buy and post two
+        # GTDs on the book, double-spending the tier's notional budget.
+        # Cost is mechanical: an `open_orders_for_round` scan + early return.
+        for o in self.open_orders_for_round(round_start_ts):
+            if o.tier_name == tier_name and o.status in ("placed", "live"):
+                log.warning(
+                    "order_manager.buy_by_strategy_price.duplicate_tier",
+                    token=token_id[:16],
+                    tier=tier_name,
+                    round=round_start_ts,
+                    existing_client_id=o.client_order_id,
+                )
+                return None
         return await self.place_buy(
             token_id=token_id,
             price=price,
@@ -419,41 +359,19 @@ class OrderManager:
     ) -> TrackedOrder | None:
         """[DEPRECATED] Use `place_buy_by_strategy_price` instead.
 
-        Kept for tests / callers that pre-compute the limit price from the
-        orderbook. The refactor removed this from the production BUY path
-        — see H-NEW-2026-07-11. Behaves identically to the previous
-        implementation so legacy tests continue to pass.
+        Kept for legacy tests that pre-compute the limit price externally.
+        The orderbook-snap logic has been removed — see H-NEW-2026-07-11.
         """
-        """Place a GTD BUY sized by USD notional rather than share count.
-
-        H-V4-1 fix (audit v4): router used to compute
-            size = notional / bid_price
-        with `bid_price` = engine decision-time WS-cached bid. But the
-        CLOB accepts the BUY at `adjusted_price = bid + BUY_STEP`, so
-        the actual cost CLOB charges is `size * adjusted_price`, which
-        can be 1-3% higher than `notional` per tier (cumulative 5% over
-        4 tiers). This wrapper computes `size` AFTER `_adjust_buy_price`
-        so the per-tier hard cap (`TIER_NOTIONAL_MAX_MULT`) and the
-        eventual `_avg_cost` reflect what the CLOB actually accepted.
-
-        `ref_price` is only used as a fallback when the orderbook is
-        unavailable (same semantics as `place_buy(desired_price=...)`).
-        """
-        # Step 1: ask the orderbook for the snap price (REST, OUTSIDE lock).
-        adjusted_price = await self._adjust_buy_price(token_id, ref_price, tick_size)
-        if adjusted_price <= 0:
-            adjusted_price = ref_price
-        if adjusted_price <= 0:
+        if ref_price <= 0:
             log.warning(
                 "order_manager.buy_by_notional.no_price",
                 token=token_id[:16], notional=notional,
             )
             return None
-        # Step 2: compute size so cost == notional at the actual CLOB price.
-        size = notional / adjusted_price
+        size = notional / ref_price
         return await self.place_buy(
             token_id=token_id,
-            price=adjusted_price,
+            price=ref_price,
             size=size,
             round_start_ts=round_start_ts,
             tier_name=tier_name,
@@ -506,13 +424,11 @@ class OrderManager:
         # the CLOB twice and charged the user 2x the intended notional.
         # The second block was a leftover copy-paste; the dedup is enforced
         # by `tests/test_audit_fixes_2026_07_11.py::test_b1_v2_buy_single_call`.
-        # H-NEW-2026-07-11: when `price_lock=True` (the new production path
-        # via `place_buy_by_strategy_price`), we skip the orderbook fetch
-        # entirely and post at the engine's exact strategy price.
-        if price_lock:
-            adjusted_price = float(price)
-        else:
-            adjusted_price = await self._adjust_buy_price(token_id, price, tick_size)
+        # H-NEW-2026-07-11: production callers always pass
+        # `price_lock=True` via `place_buy_by_strategy_price`, so we post
+        # at the engine's exact strategy price. The legacy
+        # `_adjust_buy_price` orderbook fetch has been removed entirely.
+        adjusted_price = float(price) if price_lock else float(price)
 
         async with self._lock:
             result: FillResult = await self._clob.place_gtd_buy(
@@ -630,13 +546,11 @@ class OrderManager:
             effective_lifetime = max(gtd_lifetime, _CC.GTD_MIN_SEC + 1)
             cid = f"{round_start_ts}-{tier_name}-{uuid.uuid4().hex[:8]}"
 
-            # B-4 fix: TP path uses engine's exact bid as the limit price
-            # so the actual fill aligns with the trigger-condition bid.
-            # BUY tiers still snap to ask-SELL_STEP for fill probability.
-            adjusted_price = (
-                price if price_lock
-                else await self._adjust_sell_price(token_id, price, tick_size)
-            )
+            # H-NEW-2026-07-11: production callers always pass
+            # `price_lock=True` via `place_gtd_sell_at_price`, so we post
+            # at the engine's exact tp/target price. The legacy
+            # `_adjust_sell_price` orderbook fetch has been removed.
+            adjusted_price = float(price) if price_lock else float(price)
             result: FillResult = await self._clob.place_gtd_sell(
                 token_id=token_id,
                 price=adjusted_price,
@@ -879,8 +793,9 @@ class OrderManager:
         async with self._lock:
             cid = f"{round_start_ts}-{tier_name}-{uuid.uuid4().hex[:8]}"
 
-            # Snap to just below the current ask for better fill probability
-            sell_price = await self._adjust_sell_price(token_id, price, tick_size)
+            # H-NEW-2026-07-11: TP SELL uses the engine's exact tp target price
+            # (passed in via `price`); no orderbook snap.
+            sell_price = float(price)
             result: FillResult = await self._clob.place_fak_sell(
                 token_id=token_id,
                 size=size,
