@@ -93,6 +93,15 @@ class StrategySettings(BaseSettings):
     #   1 = POLY_PROXY (Magic Link / email login)
     #   2 = GNOSIS_SAFE (manual Safe Transaction required for pUSD approval)
     SIGNATURE_TYPE: int = 0
+    # H-V7-1 fix: deposit / funder address. Required by SIGNATURE_TYPE=1 / 2
+    # so the order's `maker` field points at the smart-contract wallet that
+    # actually holds the funds (not the EOA signer). Without this, every
+    # CLOB /order post is rejected with
+    #   "maker address not allowed, please use the deposit wallet flow".
+    # EOA flow (SIGNATURE_TYPE=0) also benefits — setting this explicitly
+    # makes the maker field deterministic regardless of which signer
+    # derived the API key.
+    FUNDER_ADDRESS: str = ""
 
     # ── CLOB Endpoints (usually no need to change) ───────────────────────
     GAMMA_API: str = "https://gamma-api.polymarket.com"
