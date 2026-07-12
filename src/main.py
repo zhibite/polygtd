@@ -1542,7 +1542,7 @@ def _make_maker_fill_callback(state: AppState):
         #                  be on the wrong token side)
         fill_price = chosen[3] or tracked.price or fill.price
 
-        if not order_id or fill_size_inc <= 0:
+        if not order_id or (fill_size_inc <= 0 and chosen[4] <= 0):
             log.info(
                 "router.maker_fill.skip",
                 order_id=order_id, fill_size=fill_size_inc,
@@ -1607,8 +1607,10 @@ def _make_maker_fill_callback(state: AppState):
 
         # Route to engine with authoritative asset_id. Engine treats
         # `fill_size` as the per-event delta after the B-3 deduper / Lock
-        # refactor (see engine.on_order_filled docstring).
-        eng.on_order_filled(asset_id, order_id, fill_price, delta)
+        # refactor (see engine.on_order_filled docstring). `fill_size_inc`
+        # was derived above from either the REST delta or the WS
+        # maker-row amount (minus the previous cumulative).
+        eng.on_order_filled(asset_id, order_id, fill_price, fill_size_inc)
 
         log.info(
             "router.maker_fill",
@@ -1617,7 +1619,7 @@ def _make_maker_fill_callback(state: AppState):
             chosen_maker_amount=chosen[2],
             chosen_maker_price=chosen[3],
             fill_price=fill_price,
-            fill_size=delta,
+            fill_size=fill_size_inc,
             fill_total_size=new_cumulative,
             status=fill.status,
         )
