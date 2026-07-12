@@ -125,7 +125,20 @@ class StrategyEngine:
         # `engine.trigger_tp → POST 400 → router.tp_failed → mutex
         # cleared → next tick fires again` infinite loop.
         self._tp_last_post_error_ts: float = 0.0
-        self._tp_backoff_s: float = 60.0
+        self._tp_backoff_s: float = 5.0
+        # H-NEW-2026-07-12 (P0-1 fix per prod window 1783818900): track how
+        # many consecutive TP POSTs have failed so we can apply a progressive
+        # backoff instead of a flat 60s gate. Production saw T1 fill at +1s
+        # but mid cross into the TP fire-line only ~2-3s later; a flat 60s
+        # backoff ate the entire TP window. With progressive backoff:
+        #   - 1st failure: 5s   (allow CLOB settlement of buy tokens)
+        #   - 2nd:        10s
+        #   - 3rd:        20s
+        #   - 4th+:       60s cap (still prevents tight retry loops)
+        # The counter resets on notify_tp_recovered (router confirms POST ok)
+        # or on a mid-retreated early-exit (don't keep retrying when the
+        # opportunity has slipped away anyway).
+        self._tp_post_failure_count: int = 0
         # H-NEW-2026-07-12: throttle state for the per-tick `engine.t2_diag`
         # breadcrumb. The previous version logged every 250ms tick (~3600
         # lines per 15m round), drowning the operator signal in identical
@@ -467,6 +480,22 @@ class StrategyEngine:
         because the user's manual side-sell may have freed up the
         allowance by then.
         """
+        # H-NEW-2026-07-12 (P0-1 fix per prod window 1783818900): progressive
+        # backoff. The first attempt typically fails because the CLOB has
+        # not yet settled the just-bought tokens into the maker's
+        # conditional-token balance (settlement lags the WS TRADE event by
+        # 1-3s on a normal round, longer when the chain is congested).
+        # Capping the backoff at 60s for the first attempt means we lose
+        # the entire TP window when mid crosses 1 tick later. Instead:
+        #   failure 1 -> 5s
+        #   failure 2 -> 10s
+        #   failure 3 -> 20s
+        #   failure 4+ -> 60s cap (still prevents ~4/s hot retries)
+        prev_count = getattr(self, "_tp_post_failure_count", 0)
+        self._tp_post_failure_count = prev_count + 1
+        # Step table: 5, 10, 20, 60 (capped). Index bounded by len-1.
+        backoff_steps = (5.0, 10.0, 20.0, 60.0)
+        self._tp_backoff_s = backoff_steps[min(self._tp_post_failure_count - 1, len(backoff_steps) - 1)]
         self._tp_last_post_error_ts = time.time()
         if self._round is not None:
             self._round.position._tp_inflight = False
@@ -474,64 +503,34 @@ class StrategyEngine:
             "engine.tp_backoff_engaged",
             reason=reason,
             backoff_s=self._tp_backoff_s,
-            note="trigger_tp suppressed until backoff elapses",
+            failure_count=self._tp_post_failure_count,
+            note="trigger_tp suppressed until backoff elapses; "
+                 "backoff is now PROGRESSIVE (5/10/20/60s) instead of flat 60s",
         )
 
     def notify_tp_recovered(self) -> None:
         """Called by router when a TP SELL POST succeeded (or was
         invalidated by external sync). Clears the backoff gate so the
         next `_check_take_profit` tick can re-arm TP if still eligible.
+
+        H-NEW-2026-07-12 (P0-1 fix): also resets the progressive backoff
+        counter. Otherwise a successful POST after several failures would
+        have left `_tp_post_failure_count=3` in the dict, so the NEXT
+        failure (if any) would skip straight to the 60s cap instead of
+        starting back at 5s.
+
+        H-NEW-2026-07-12 (structural-fix): historically this method's
+        body was accidentally copy-pasted from `on_order_filled` (it
+        referenced `token_id`, `server_order_id`, `fill_price`, and
+        `fill_size` which are NOT parameters of `notify_tp_recovered`).
+        That latent bug meant a NameError fired the moment the router
+        called this method — caught silently by the caller's
+        try/except, leaving the backoff engaged for the full 60s flat
+        gate. P0-1 fix is meaningless without clearing that.
         """
         self._tp_last_post_error_ts = 0.0
-
-        if self._round.position.is_empty:
-            log.debug(
-                "engine.fill_ignored no_position",
-                token=token_id[:16], order_id=server_order_id,
-            )
-            return
-
-        pos = self._round.position
-        for tier in pos.tiers:
-            if tier.server_order_id == server_order_id:
-                # Verify asset_id matches — reject mismatches (cross-token contamination)
-                if token_id and token_id != tier.token_id and tier.token_id:
-                    log.warning(
-                        "engine.fill_asset_mismatch",
-                        token=token_id[:16], expected=tier.token_id[:16], order_id=server_order_id,
-                    )
-                    return
-
-                pos.record_fill(tier, fill_price, fill_size)
-                log.info(
-                    "engine.tier_filled",
-                    tier=tier.tier,
-                    token_id=token_id[:16],
-                    fill_price=fill_price,
-                    fill_size=fill_size,
-                    cumulative_size=tier.size_filled,
-                    expected_size=tier.size_expected,
-                    avg_cost=pos.avg_cost,
-                    total_qty=pos.total_qty,
-                    tp_target=pos.tp_target(),
-                )
-                return
-
-        # Not a BUY tier fill — check if it is a registered TP (SELL) fill.
-        if pos.record_tp_fill(server_order_id, fill_price, fill_size):
-            log.info(
-                "engine.tp_filled",
-                server_order_id=server_order_id[:16],
-                token_id=token_id[:16],
-                fill_price=fill_price,
-                fill_size=fill_size,
-                total_qty=pos.total_qty,
-                avg_cost=pos.avg_cost,
-                tp_target=pos.tp_target(),
-            )
-            return
-
-        log.debug("engine.fill_unknown", order_id=server_order_id)
+        self._tp_post_failure_count = 0
+        self._tp_backoff_s = 5.0  # reset to the first-step value
 
     def on_order_cancelled(self, server_order_id: str, reason: str = "manual") -> None:
         """
@@ -1166,10 +1165,44 @@ class StrategyEngine:
         # Tolerate tests that construct engine via __new__ without
         # running __init__.
         last_err = getattr(self, "_tp_last_post_error_ts", 0.0) or 0.0
-        backoff = getattr(self, "_tp_backoff_s", 60.0) or 60.0
+        backoff = getattr(self, "_tp_backoff_s", 5.0) or 5.0
         now = time.time()
         if last_err > 0.0 and now - last_err < backoff:
             return
+
+        # H-NEW-2026-07-12 (P0-1 fix per prod window 1783818900): when the
+        # bot was stuck in TP-POST-error backoff for 60s, the price often
+        # drifted back BELOW the fire line by the time the backoff elapsed
+        # (the TP window closed while we waited on a flat 60s gate). Now
+        # we observe the live mid FIRST and skip even the backoff window
+        # if the opportunity is gone — saving both the wasted retry and
+        # any unnecessary 400-spam from a CLOB that would now reject for a
+        # different reason (price too far above best bid, for instance).
+        # Doing this BEFORE the backoff gate also lets us naturally reset
+        # the failure counter — there's no point keeping "3 failures" on
+        # the books for an opportunity that has expired.
+        if pos.entry_token:
+            cur_mid_pre = self._pc.get_midpoint(pos.entry_token)
+            if cur_mid_pre > 0:
+                tp_target_pre = pos.tp_target()
+                if tp_target_pre is not None:
+                    margin_pre = self._get_price_pre_margin()
+                    fire_line_pre = tp_target_pre * (1.0 - margin_pre)
+                    if cur_mid_pre < fire_line_pre:
+                        # Opportunity retreated — clear backoff and bail.
+                        if getattr(self, "_tp_post_failure_count", 0) > 0:
+                            log.info(
+                                "engine.tp_backoff_reset_no_opportunity",
+                                failure_count=getattr(self, "_tp_post_failure_count", 0),
+                                mid=cur_mid_pre,
+                                fire_line=fire_line_pre,
+                                note="mid retreated below fire-line during TP-backoff window; "
+                                     "no point retrying with progressive backoff",
+                            )
+                        self._tp_last_post_error_ts = 0.0
+                        self._tp_post_failure_count = 0
+                        self._tp_backoff_s = 5.0
+                        return
 
         if pos._tp_inflight:
             return
