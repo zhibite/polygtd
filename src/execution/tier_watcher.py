@@ -84,6 +84,38 @@ class WatcherResult:
 # Callback signatures the ActionRouter / engine wire up.
 OnComplete = Callable[[WatcherResult], Awaitable[None]]
 OnCrossTier = Callable[[WatcherResult], Awaitable[None]]
+# H-NEW-2026-07-12: continuous ground-truth reconciliation channel.
+#
+# WHY: before this callback existed, TierWatcher only emitted a terminal
+# `WatcherResult` (via on_complete) once the GTD reached FILLED / EXPIRED /
+# CROSSED / etc. If the WS TRADE channel dropped an event, the position view
+# (size_filled / _total_qty / _total_cost) would drift behind reality for
+# the remainder of the 99.5%-fill-ratio wait (worst case ~1.5 s between
+# polls, in a fast cascade). That drift could feed wrong TP / next-tier
+# decisions before the terminal WatcherResult arrived.
+#
+# Now: every poll iteration that observes a `size_matched` strictly greater
+# than the previously-pushed value fires `on_partial_fill(cumulative, ...)`
+# so the router can route the increment through the same
+# `om.apply_fill_event` + `eng.on_order_filled` path the WS TRADE channel
+# uses. The WS path is still the primary low-latency signal — but polling
+# is now a true *ground truth* resync rather than a one-shot reconciliation
+# at terminal state.
+#
+# `(cumulative_size_matched, fill_price)`:
+#   * `cumulative_size_matched` — the authoritative per-order cumulative
+#                                 value from the CLOB (NOT a delta). The
+#                                 router derives the delta itself by
+#                                 subtracting OrderManager's tracked
+#                                 size_matched. This keeps the dedup
+#                                 semantics simple and matches what the WS
+#                                 UPDATE path passes through.
+#   * `fill_price`              — best estimate of avg fill price for the
+#                                 delta. The watcher tracks a running
+#                                 `_avg_price_running` keyed off
+#                                 `size_matched` from CLOB; that's passed
+#                                 through.
+OnPartialFill = Callable[[float, float, "WatcherResult | None"], Awaitable[None]]
 
 
 class TierWatcher:
@@ -108,6 +140,17 @@ class TierWatcher:
         mid_price_provider:    async callable returning current mid for
                                `token_id`; required when cross_threshold is set
         on_complete:           async callback invoked once on terminal state
+        on_partial_fill:       async callback invoked every poll iteration
+                               that observes a fresh `size_matched`
+                               increment since the last push. Receives
+                               `(delta_size, fill_price, hint_result)`
+                               where `hint_result` is None during the
+                               iteration (only the terminal fire passes
+                               the WatcherResult through on_complete).
+                               Used to keep the position view continuously
+                               reconciled with CLOB ground truth even if
+                               the WS TRADE channel is dropping events.
+                               Optional — only BUY watchers wire this up.
         is_still_active:       callable returning False if this watcher
                                should self-terminate (e.g. round rolled over)
     """
@@ -126,6 +169,7 @@ class TierWatcher:
         cross_threshold: Optional[float] = None,
         mid_price_provider: Optional[Callable[[], Awaitable[float]]] = None,
         on_complete: Optional[OnComplete] = None,
+        on_partial_fill: Optional[OnPartialFill] = None,
         is_still_active: Optional[Callable[[], bool]] = None,
     ) -> None:
         self._clob = clob
@@ -140,6 +184,7 @@ class TierWatcher:
         self._cross_threshold = cross_threshold
         self._mid_provider = mid_price_provider
         self._on_complete = on_complete
+        self._on_partial_fill = on_partial_fill
         self._is_active = is_still_active or (lambda: True)
         self._task: Optional[asyncio.Task[None]] = None
         self._result: Optional[WatcherResult] = None
@@ -149,6 +194,31 @@ class TierWatcher:
         # change wires additional callbacks. Without this guard the
         # downstream `apply_tier_watcher_result` would double-count (B-NEW-3).
         self._fire_complete_called = False
+        # H-NEW-2026-07-12: continuous ground-truth reconciliation state.
+        # `_last_pushed_size_matched` is the cumulative size_matched the
+        # watcher most recently pushed through `on_partial_fill` (or
+        # `size_filled` already advanced by WS / fast-path spawn read).
+        # `_avg_price_running` is a running weighted-average fill price for
+        # the partial delta, refreshed on each poll. Both are keyed by
+        # `server_order_id` (single watcher = single order = single stream).
+        # Initialised lazily on the first observation.
+        self._last_pushed_size_matched: float = 0.0
+        self._avg_price_running: float = 0.0
+        self._partial_filling_initialised: bool = False
+        # H-NEW-2026-07-11-3 (audit, prod 14:30 round): WS User Channel
+        # pushes order.UPDATE events with the AUTHORITATIVE cumulative
+        # `size_matched` straight from the CLOB. The watcher reads this
+        # via `receive_update()` and short-circuits the REST poll loop on
+        # the next tick. Stored here as `_last_size_matched` so the next
+        # `_watch()` iteration can complete immediately without another
+        # REST round-trip. Start at -1.0 sentinel: a real UPDATE will
+        # always have size_matched ≥ 0, so the sentinel also doubles as
+        # "no WS update received yet".
+        self._last_size_matched: float = -1.0
+        # asyncio.Event used to wake the watch loop early when an UPDATE
+        # arrives — without this we'd still poll at _poll_s cadence and
+        # only notice the update on the next tick (worst case _poll_s).
+        self._update_event: asyncio.Event = asyncio.Event()
 
     def start(self) -> asyncio.Task[None]:
         """Spawn the background task. Idempotent."""
@@ -172,6 +242,42 @@ class TierWatcher:
     @property
     def result(self) -> Optional[WatcherResult]:
         return self._result
+
+    def receive_update(self, size_matched: float) -> None:
+        """Push a WS order.UPDATE size_matched value into the watcher.
+
+        H-NEW-2026-07-11-3 (audit, prod 14:30 round): the user_ws on_order
+        callback in main.py invokes this for every order.UPDATE event whose
+        `id` matches this watcher's server_order_id. The watcher holds
+        the value in `_last_size_matched` and wakes the watch loop so the
+        next iteration can short-circuit to FILLED — no REST round-trip
+        needed. Idempotent: stale or non-monotonic updates are no-ops.
+        """
+        if size_matched < 0:
+            return
+        # Take the max so out-of-order WS frames don't roll back.
+        if size_matched >= self._last_size_matched:
+            self._last_size_matched = size_matched
+            try:
+                self._update_event.set()
+            except RuntimeError:
+                # No loop bound yet — fine, the watch loop will pick up
+                # the latest _last_size_matched on its next iteration
+                # via `_maybe_complete_via_update()`.
+                pass
+
+    def _maybe_complete_via_update(self) -> bool:
+        """If WS already pushed a size_matched ≥ expected * fill_ratio,
+        return True and the caller should emit FILLED without re-reading
+        the balance. Idempotent and side-effect-free except on the actual
+        terminal-state emission path (which is guarded by
+        _fire_complete_called).
+        """
+        if self._last_size_matched < 0:
+            return False
+        if self._fire_complete_called:
+            return True  # already done
+        return self._last_size_matched >= self._expected_size * self._fill_ratio
 
     async def _run(self) -> None:
         """Main loop. One watcher = one GTD = one terminal state."""
@@ -254,12 +360,79 @@ class TierWatcher:
                 )
                 return
 
+            # H-NEW-2026-07-11-3 (audit, prod 14:30 round): if a WS
+            # order.UPDATE arrived while we were waiting on the event
+            # (typical when CLOB fills in <50ms), short-circuit to FILLED
+            # without another REST round-trip. The user_ws on_order
+            # callback already routed the cumulative size_matched into
+            # engine.on_order_filled via order_manager.apply_fill_event,
+            # so by the time we get here the position totals are correct;
+            # all we need to do is cancel the residual GTD and emit the
+            # WatcherResult so the router can call
+            # apply_tier_watcher_result without double-counting
+            # (the engine already credited the fill).
+            if self._maybe_complete_via_update():
+                cancel_sent = await self._safe_cancel()
+                self._result = WatcherResult(
+                    outcome=TierOutcome.FILLED,
+                    server_order_id=self._server_order_id,
+                    token_id=self._token_id,
+                    side=self._side,
+                    strategy_price=self._strategy_price,
+                    expected_size=self._expected_size,
+                    filled_qty=self._last_size_matched,
+                    cancel_sent=cancel_sent,
+                    avg_fill_price=self._strategy_price,
+                    dedup_key=self._dedup_key(TierOutcome.FILLED),
+                )
+                log.info(
+                    "tier_watcher.filled_via_ws_update",
+                    server_id=self._server_order_id[:16],
+                    side=self._side,
+                    size_matched=self._last_size_matched,
+                    expected=self._expected_size,
+                    cancel_sent=cancel_sent,
+                )
+                await self._fire_complete(self._result)
+                return
+
             # 1) Read the ground-truth balance.
             balance = await self._read_balance()
             if balance is None:
-                # Transient error — back off, retry on next tick.
-                await asyncio.sleep(self._poll_s)
+                # Transient error — wait for either the next poll_s tick
+                # OR an early wake from a WS UPDATE.
+                try:
+                    await asyncio.wait_for(
+                        self._update_event.wait(),
+                        timeout=self._poll_s,
+                    )
+                    self._update_event.clear()
+                except asyncio.TimeoutError:
+                    pass
                 continue
+
+            # H-NEW-2026-07-12: continuous ground-truth reconciliation.
+            #
+            # Read this order's authoritative `size_matched` and `avg_price`
+            # from the CLOB and, if the cumulative has advanced past our
+            # last push, fire `on_partial_fill(delta, avg_price)` so the
+            # router can route the increment through the same
+            # `om.apply_fill_event` + `eng.on_order_filled` path the WS
+            # TRADE channel uses. Falls back to `strategy_price` if the
+            # fill_state call transiently fails (price half is best-effort;
+            # the *delta* is what matters for reconciliation).
+            #
+            # Why balance alone isn't sufficient: balance is the token
+            # holding (shares of UP/DOWN), which can be polluted by other
+            # trades on the same token. size_matched is per-order, so the
+            # delta has a clean provenance.
+            #
+            # Idempotency: `_last_pushed_size_matched` is monotonic; a
+            # polling observation that is *not* strictly greater than
+            # what we previously pushed (or what the WS already advanced)
+            # is a no-op, which is exactly the dedup contract the WS path
+            # also obeys (line 757–779 in main.py `_make_fill_callback`).
+            await self._maybe_push_partial_fill(balance)
 
             # 2) Over-fill safety net (defensive — should not happen).
             if balance > self._expected_size * 1.01 and self._side == "BUY":
@@ -389,7 +562,21 @@ class TierWatcher:
                 )
 
             prev_balance = balance
-            await asyncio.sleep(self._poll_s)
+            # H-NEW-2026-07-11-3: instead of `await asyncio.sleep(poll_s)`,
+            # wait on `_update_event` so an order.UPDATE arriving during the
+            # sleep window wakes us immediately. The timeout is poll_s —
+            # if no WS event fires, we fall back to REST balance polling
+            # on the next tick. This is the difference between a 1.5s
+            # worst-case lag (REST only) and a ~50ms worst-case lag (WS).
+            try:
+                await asyncio.wait_for(
+                    self._update_event.wait(),
+                    timeout=self._poll_s,
+                )
+                # We were woken — clear the event for the next wait.
+                self._update_event.clear()
+            except asyncio.TimeoutError:
+                pass
 
     def _dedup_key(self, outcome: TierOutcome) -> str:
         """Stable key for downstream subscribers to dedup terminal states.
@@ -491,3 +678,103 @@ class TierWatcher:
                 server_id=self._server_order_id[:16],
                 error=str(exc),
             )
+
+    async def _maybe_push_partial_fill(self, balance: float) -> None:
+        """Ground-truth resync: if a fresh ``size_matched`` increment is
+        available, fire ``on_partial_fill`` so the position view stays
+        in step with CLOB even when WS TRADE frames are dropped.
+
+        H-NEW-2026-07-12 (audit, prod continuous-recon refactor): the
+        reconciliation now runs **on every poll iteration**, not just at
+        terminal state. The WS channel remains the primary real-time
+        signal; polling is a true ground-truth resync.
+
+        Dedup contract matches `_make_fill_callback` in main.py:
+        monotonic on `_last_pushed_size_matched`. If WS already advanced
+        past the polling observation, `effective_delta` is 0 and the
+        callback is skipped (idempotent).
+
+        Args:
+            balance: current token balance (informational — logged if the
+                CLOB returns a positive balance but the fill_state call
+                fails, so operators can see the discrepancy).
+        """
+        if self._on_partial_fill is None:
+            return
+
+        fill_state = await self._read_fill_state()
+        if fill_state is None:
+            # Best-effort: didn't get size_matched this tick. Skip — next
+            # poll will retry. We MUST NOT advance _last_pushed here.
+            log.debug(
+                "tier_watcher.partial_fill_state_unavailable",
+                server_id=self._server_order_id[:16],
+                balance=balance,
+            )
+            return
+
+        size_matched = float(fill_state.get("size_matched", 0.0) or 0.0)
+        avg_price = float(fill_state.get("avg_price", 0.0) or 0.0)
+        if avg_price > 0:
+            self._avg_price_running = avg_price
+
+        if not self._partial_filling_initialised:
+            # First observation: prime the deduper with the CLOB high-water
+            # mark (or the WS update, whichever is greater). Do NOT fire
+            # on the priming read — its purpose is just to anchor the
+            # baseline so subsequent iterations can detect increments.
+            primed = max(size_matched, self._last_size_matched)
+            self._last_pushed_size_matched = primed
+            self._avg_price_running = (
+                avg_price if avg_price > 0 else self._strategy_price
+            )
+            self._partial_filling_initialised = True
+            log.debug(
+                "tier_watcher.partial_fill_initialised",
+                server_id=self._server_order_id[:16],
+                side=self._side,
+                primed_size_matched=self._last_pushed_size_matched,
+                primed_avg=self._avg_price_running,
+            )
+            return
+
+        # Subsequent reads: fire any strict increment past the high water.
+        high_water = max(size_matched, self._last_size_matched)
+        if high_water <= self._last_pushed_size_matched + 1e-9:
+            # No new info since the last push (whether by us or WS).
+            # Just keep the high-water mark for safety.
+            self._last_pushed_size_matched = max(
+                self._last_pushed_size_matched, high_water
+            )
+            return
+
+        # Fire the AUTHORITATIVE CLOB cumulative through the same router
+        # entry the WS UPDATE path uses. The router derives the engine
+        # delta from `cumulative - tracked.size_matched`, so we just pass
+        # the raw cumulative and price.
+        try:
+            await self._on_partial_fill(
+                high_water,
+                self._avg_price_running if self._avg_price_running > 0 else self._strategy_price,
+                None,
+            )
+        except Exception as exc:
+            log.exception(
+                "tier_watcher.on_partial_fill_error",
+                server_id=self._server_order_id[:16],
+                error=str(exc),
+            )
+            # Do NOT advance _last_pushed_size_matched on error —
+            # next poll will retry. This is the safer side (we'd rather
+            # over-deliver than under-deliver on ground-truth resync).
+            return
+
+        self._last_pushed_size_matched = high_water
+        log.info(
+            "tier_watcher.partial_fill_pushed",
+            server_id=self._server_order_id[:16],
+            side=self._side,
+            cumulative=high_water,
+            avg_price=self._avg_price_running,
+            via="polling",
+        )

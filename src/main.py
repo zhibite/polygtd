@@ -235,6 +235,12 @@ class ActionRouter:
         # cancel them on round-end without losing the references.
         self._watchers: dict[tuple[int, int], TierWatcher] = {}
         self._tp_watchers: dict[int, TierWatcher] = {}
+        # H-NEW-2026-07-11-3 (audit, prod 14:30 round): reverse-lookup
+        # so the user_ws on_order UPDATE callback can route size_matched
+        # into the matching TierWatcher without the callback having to
+        # know the (round, tier) tuple. Built on every spawn, dropped on
+        # every terminal fire.
+        self._watcher_by_server_id: dict[str, TierWatcher] = {}
         # Convenience handle so other modules (e.g. _on_new_round cleanup)
         # can call stop_all_watchers() without going through the engine.
         state.router = self
@@ -242,6 +248,26 @@ class ActionRouter:
     # ------------------------------------------------------------------
     # TierWatcher lifecycle helpers
     # ------------------------------------------------------------------
+
+    def watcher_for_server_order(self, server_order_id: str) -> Optional["TierWatcher"]:
+        """Return the active watcher tracking this server_order_id, if any.
+
+        H-NEW-2026-07-11-3: used by the user_ws on_order UPDATE callback
+        to push `size_matched` into the matching TierWatcher so it can
+        short-circuit the REST poll loop on the next tick. Returns None
+        for orders that are not ours or for watchers that have already
+        reached a terminal state.
+        """
+        if not server_order_id:
+            return None
+        w = self._watcher_by_server_id.get(server_order_id)
+        if w is None:
+            return None
+        if w.result is not None:
+            # Already terminal — drop the index entry.
+            self._watcher_by_server_id.pop(server_order_id, None)
+            return None
+        return w
 
     def _spawn_tier_watcher(
         self,
@@ -305,6 +331,73 @@ class ActionRouter:
             eng = self._state.engine
             return bool(eng and eng._round and eng._round.round_start_ts == round_start_ts)
 
+        # H-NEW-2026-07-12: continuous ground-truth reconciliation.
+        #
+        # Wire a partial-fill callback so that even if the WS TRADE channel
+        # is dropping events (or `size=0` quirks swallow a row), the
+        # TierWatcher's per-poll CLOB read still keeps the position view in
+        # step with reality. The callback routes through the SAME
+        # `om.apply_fill_event` + `eng.on_order_filled` path that
+        # `_make_fill_callback` uses for the polling side of the WS/Polling
+        # double-fire, so any dedup state (FillDeduper, OrderManager's
+        # monotonic tracked order) applies uniformly.
+        #
+        # Why this is the right patch:
+        #   * WS TRADE remains the primary low-latency signal.
+        #   * Polling used to fire only ONE reconciliation at terminal state
+        #     (apply_tier_watcher_result). In a fast cascade that 99.5%
+        #     wait can be ~1.5 s during which the position view is stale.
+        #     That's exactly the window where a TP or next-tier decision
+        #     would be made on wrong data.
+        #   * Now: every poll that observes a fresh size_matched increment
+        #     pushes the AUTHORITATIVE CLOB cumulative through
+        #     `on_order_filled`. The dedup contract is monotonic on
+        #     tracked.size_matched, so if WS got there first the polling
+        #     delta is silently skipped.
+        #
+        # We do NOT wire this for SELL (TP) watchers — SELLs are FAK, the
+        # partial-fill window is sub-second, and `record_tp_fill` already
+        # handles fill-or-no-fill semantics without continuous reconcile.
+        async def on_partial_fill(
+            cumulative_size_matched: float,
+            fill_price: float,
+            hint_result: "WatcherResult | None",
+        ) -> None:
+            eng = self._state.engine
+            om = self._state.order_manager
+            if not eng or not om or cumulative_size_matched <= 0:
+                return
+            if cumulative_size_matched <= 1e-9:
+                return
+            tracked = om.by_server_id(server_order_id)
+            prev_size_matched = tracked.size_matched if tracked else 0.0
+            # The TierWatcher passed the CLOB's authoritative cumulative.
+            # Derive the per-event delta from OrderManager's monotonic
+            # tracked state. This matches the WS-pathing's contract: when
+            # WS UPDATE arrives first, the polling delta collapses to 0
+            # and the engine call is skipped.
+            effective_delta = cumulative_size_matched - prev_size_matched
+            if effective_delta <= 1e-9:
+                return
+            om.apply_fill_event(
+                server_order_id,
+                size_matched=cumulative_size_matched,
+                fill_price=fill_price,
+            )
+            om.mark_filled(server_order_id)
+            eng.on_order_filled(
+                token_id, server_order_id, fill_price, effective_delta
+            )
+            log.info(
+                "router.polling_resync",
+                token=token_id[:16],
+                order_id=server_order_id[:16],
+                cumulative=cumulative_size_matched,
+                delta_size=effective_delta,
+                fill_price=fill_price,
+                note="polling catch-up (WS TRADE channel missed/late)",
+            )
+
         watcher = TierWatcher(
             clob=self._state.clob,
             server_order_id=server_order_id,
@@ -318,6 +411,7 @@ class ActionRouter:
             cross_threshold=cross_threshold,
             mid_price_provider=mid_provider,
             on_complete=on_done,
+            on_partial_fill=on_partial_fill,
             is_still_active=is_active,
         )
         task = watcher.start()
@@ -325,6 +419,9 @@ class ActionRouter:
         self._state._bg_tasks.add(task)
         task.add_done_callback(self._state._bg_tasks.discard)
         self._watchers[(round_start_ts, tier)] = watcher
+        # H-NEW-2026-07-11-3: register in reverse-lookup so on_order UPDATE
+        # can route size_matched into this watcher.
+        self._watcher_by_server_id[server_order_id] = watcher
         # Mark the tier as "being watched" so the engine's mutex holds.
         if eng and eng._round:
             tier_snap = eng._round.position.tiers[tier - 1]
@@ -392,6 +489,8 @@ class ActionRouter:
         self._state._bg_tasks.add(task)
         task.add_done_callback(self._state._bg_tasks.discard)
         self._tp_watchers[round_start_ts] = watcher
+        # H-NEW-2026-07-11-3: same reverse-lookup registration as BUY.
+        self._watcher_by_server_id[server_order_id] = watcher
         return watcher
 
     async def stop_all_watchers(self) -> None:
@@ -402,6 +501,8 @@ class ActionRouter:
         for w in list(self._tp_watchers.values()):
             await w.stop()
         self._tp_watchers.clear()
+        # H-NEW-2026-07-11-3: clear reverse-lookup too.
+        self._watcher_by_server_id.clear()
 
     # ------------------------------------------------------------------
     # Action dispatch
@@ -504,10 +605,15 @@ class ActionRouter:
                 size_expected = order.placed_size if order.placed_size > 0 else (action.notional / action.price)
                 # Next tier's fire line — only meaningful for T2/T3 (T4 is last).
                 cross_thr: float | None = None
-                if action.tier < 4:
+                if action.tier < 3:
                     cfg = strategy()
                     margin = float(cfg.PRICE_PRE_MARGIN or 0.0)
                     drops = cfg.tier_drop_pcts
+                    # H-NEW-2026-07-11-4: 3-tier cap. action.tier < 3 means
+                    # this is T1 or T2 (action.tier ∈ {1, 2}); we are
+                    # computing the cross_threshold for the NEXT averaging
+                    # tier. tier2→tier3 is the last cross, so action.tier==2
+                    # is the boundary case that still gets a threshold.
                     if action.tier < len(drops) and drops[action.tier] is not None:
                         next_design = order.price * (1.0 - drops[action.tier])
                         cross_thr = next_design * (1.0 + margin)
@@ -693,9 +799,52 @@ class ActionRouter:
         ):
             if not eng or not om:
                 return
-            if fill_delta_size <= 0 or fill_total_size <= 0:
-                # Defensive: deduper should already have filtered these out.
+            if fill_total_size <= 0:
                 return
+
+            # H-NEW-2026-07-12 (audit): defence-in-depth against the
+            # WS-TRADE / polling double-fire race. FillDeduper's bookmark
+            # only sees fills that *this polling path* observed; the WS
+            # TRADE path advances `om.by_server_id(order_id).size_matched`
+            # directly without going through FillDeduper. Concretely:
+            #
+            #   T+0     GTD SELL 推送，FillDeduper.bookmark=0
+            #   T+50ms  WS TRADE event → main.py on_maker_fill
+            #           → om.apply_fill_event(size_matched=10)
+            #           FillDeduper.bookmark 仍是 0 ← 不一致
+            #   T+1500  polling 看到 size_matched=10
+            #           → FillDeduper.submit(10) → delta=10-0=10
+            #           → 推给 engine 又减 _total_qty 一次
+            #
+            # Monotonic-max against OrderManager trims that delta down to
+            # "only what *this* fill_callback is contributing on top of
+            # what the WS already told us". If WS got there first, the
+            # polling delta is 0 and we skip the engine call entirely.
+            tracked = om.by_server_id(order_id)
+            prev_size_matched = tracked.size_matched if tracked else 0.0
+            effective_delta = fill_total_size - prev_size_matched
+            if effective_delta <= 1e-9:
+                # WS path already advanced OrderManager past this observation,
+                # OR the FillDeduper itself rejected this as a duplicate.
+                # Mirror the cumulative into OrderManager (safe — monotonic
+                # max) and skip the engine call.
+                if effective_delta < -1e-9:
+                    log.warning(
+                        "router.fill.out_of_order",
+                        order_id=order_id[:16],
+                        fill_total_size=fill_total_size,
+                        prev_size_matched=prev_size_matched,
+                        fill_delta_size=fill_delta_size,
+                        note="polling observed an OLDER size_matched than WS "
+                             "already pushed — likely out-of-order delivery; "
+                             "clamping to skip",
+                    )
+                    om.apply_fill_event(
+                        order_id, size_matched=prev_size_matched,
+                        fill_price=fill_price,
+                    )
+                return
+            fill_delta_size = effective_delta
 
             # 1) Promote tracked-order status to "filled" (no-op if partial).
             om.mark_filled(order_id)
@@ -1331,16 +1480,23 @@ def _make_maker_fill_callback(state: AppState):
         # Build the candidate list. If user_ws supplied the keyword arg we
         # use it; otherwise fall back to the legacy single-order_id flow.
         if candidates:
-            # Each row: (order_id, asset_id, matched_amount, maker_price).
-            # All FULL hashes; per-row values come straight from
-            # maker_orders[] in user_ws so per-maker attribution is exact.
+            # Each row: (order_id, asset_id, matched_amount, maker_price,
+            # rest_filled_size). All FULL hashes; per-row values come
+            # straight from maker_orders[] in user_ws (or were filled by
+            # the per-candidate REST fallback when the WS payload
+            # collapsed the maker row's amount — see user_ws docstring
+            # H-NEW-2026-07-11-2). The rest_filled_size is informational;
+            # router uses matched_amount (chosen[2]) as the authoritative
+            # per-maker share count.
             candidate_pairs = [
-                (oid, aid, float(amt or 0), float(mprice or 0))
-                for (oid, aid, amt, mprice) in candidates
+                (oid, aid, float(amt or 0), float(mprice or 0), float(rest or 0))
+                for (oid, aid, amt, mprice, rest) in candidates
                 if oid
             ]
         else:
-            candidate_pairs = [(fill.maker_order_id, fill.asset_id, fill.size, fill.price)]
+            candidate_pairs = [
+                (fill.maker_order_id, fill.asset_id, fill.size, fill.price, 0.0)
+            ]
 
         # Pick the first candidate that lives in our OrderManager.
         # om.by_server_id does a full-hash dict lookup — no prefix matching.
@@ -1351,7 +1507,7 @@ def _make_maker_fill_callback(state: AppState):
         # NOT necessarily our fill price / our share count — the per-row
         # values in maker_orders[] are. We pick the candidate row that is
         # ours and use ITS (asset_id, size, price) for downstream routing.
-        chosen: tuple[str, str, float, float] | None = None
+        chosen: tuple[str, str, float, float, float] | None = None
         for cand in candidate_pairs:
             if om.by_server_id(cand[0]):
                 chosen = cand
@@ -1364,31 +1520,36 @@ def _make_maker_fill_callback(state: AppState):
             # delta for us.
             log.info(
                 "router.maker_fill.no_match",
-                candidates=[oid[:16] for oid, _, _, _ in candidate_pairs],
+                candidates=[oid[:16] for oid, _, _, _, _ in candidate_pairs],
                 reason="none of the candidate order_ids match OrderManager",
             )
             return
 
         order_id = chosen[0]
         asset_id = chosen[1] or fill.asset_id
-        # Use the maker-row amount — NOT fill.size. Top-level fill.size
-        # describes the taker side and overcounts our maker by a factor of
-        # (taker_total / our_maker_amount).
-        fill_size_inc = chosen[2] if chosen[2] > 0 else fill.size
-        # Use the maker-row price when present — fall back to top-level
-        # only if the row didn't carry a price.
-        fill_price = chosen[3] if chosen[3] > 0 else fill.price
+        # chosen[2] = maker row's WS amount (or REST-replaced cumulative
+        # from user_ws when the WS collapsed it to 0). When that's still
+        # 0 (REST also empty), we DO NOT fall back to fill.size —
+        # fill.size is the taker side and overcounts by the
+        # (taker_total / our_maker) ratio (H-NEW-2026-07-11 audit, prod
+        # 14:30 round). Refuse to record a phantom fill instead.
+        fill_size_inc = chosen[2]
+        # Price fallback chain for OUR maker's matched price:
+        # 1. chosen[3]  — maker_orders[].price  (the row's own price)
+        # 2. tracked.price — our limit order's placed price (always
+        #                    present, since this order_id is in OM)
+        # 3. fill.price  — top-level taker-side price (last resort; can
+        #                  be on the wrong token side)
+        fill_price = chosen[3] or tracked.price or fill.price
 
         if not order_id or fill_size_inc <= 0:
-            # Same breadcrumb the legacy router had — keep the spelling for
-            # log continuity. The H-NEW-2026-07-14 trade-level candidate
-            # path bypasses this entirely when top-level size is 0 by
-            # refusing to emit a callback. We only fall through to here on
-            # the legacy 1-arg wiring.
             log.info(
                 "router.maker_fill.skip",
                 order_id=order_id, fill_size=fill_size_inc,
-                reason="upstream delivered size=0 fill event",
+                rest_filled_size=chosen[4],
+                reason="authoritative per-maker amount is 0 (no WS amount, "
+                       "no REST amount) — refusing to use taker-side "
+                       "fill.size which would overcount",
             )
             return
 
@@ -1407,27 +1568,35 @@ def _make_maker_fill_callback(state: AppState):
 
         # Decide what *increment* to forward to the engine.
         #
-        # After H-NEW-2026-07-11 per-maker attribution, chosen[2] is the
-        # AUTHORITATIVE share count for OUR maker on this single TRADE
-        # event (not the taker side, not a cumulative since the same
-        # trade_id is dedup'd at the top of this function). For a T2 BUY
-        # DOWN @0.32 that the taker partially filled across multiple
-        # maker_orders rows of the SAME taker-side trade, OM gets one
-        # router call per (trade_id, matched_maker_row) and accumulates
-        # them via apply_fill_event's monotonic max.
+        # chosen[2] is the AUTHORITATIVE size for OUR maker on this TRADE
+        # event. When the WS payload's maker row carried an amount, it's
+        # that row's matched-amount (a per-trade delta for our maker).
+        # When the WS payload collapsed it to 0 and the REST fallback in
+        # user_ws filled it, it's the order's CUMULATIVE size_matched as
+        # returned by CLOB get_order. In both cases, monotonic-max logic
+        # in OrderManager.apply_fill_event absorbs the new value.
         #
-        # Two consecutive MATCHED events for the same trade_id are
-        # blocked by the trade_id dedupe gate above. So fill_size_inc
-        # is the delta for THIS trade; cumulative = prev + inc.
+        # chosen[4] is the REST-derived delta for THIS trade (only set
+        # when the REST fallback fired). When present it represents the
+        # net new matched size from this trade alone, so it's the cleanest
+        # delta to forward to the engine.
         prev_cumulative = tracked.size_matched or 0.0
-        new_cumulative = prev_cumulative + fill_size_inc
-        delta = fill_size_inc
-        if delta <= 1e-9:
+        rest_delta = chosen[4]
+        if rest_delta > 0:
+            # REST gave us a per-trade delta for this order_id.
+            fill_size_inc = rest_delta
+        else:
+            # WS gave us the per-row amount (which IS the per-trade
+            # contribution for this maker row).
+            fill_size_inc = max(0.0, chosen[2] - prev_cumulative)
+        if fill_size_inc <= 1e-9:
             log.debug(
                 "router.maker_fill.no_new",
-                order_id=order_id, prev=prev_cumulative, inc=fill_size_inc,
+                order_id=order_id, prev=prev_cumulative,
+                ws_amount=chosen[2], rest_delta=rest_delta,
             )
             return
+        new_cumulative = prev_cumulative + fill_size_inc
 
         om.apply_fill_event(
             order_id,
@@ -1466,6 +1635,16 @@ def _make_user_ws_order_callback(state: AppState):
     eng = state.engine
 
     def on_order(ev) -> None:  # ev: OrderEvent from user_ws.py
+        # H-NEW-2026-07-11-3 (audit, prod 14:30 round): WSS User Channel
+        # pushes order.UPDATE events with the AUTHORITATIVE cumulative
+        # `size_matched` straight from the CLOB — this is a stronger
+        # signal than waiting for a TRADE event and reverse-engineering
+        # our per-maker share count from `maker_orders[].amount`. Driving
+        # engine.on_order_filled from here (instead of only from the
+        # TRADE path) eliminates the 1.5s TierWatcher polling lag and
+        # closes the cross-tier mis-trigger window (T1 actually fills at
+        # 14:31:15.620 but TierWatcher only learns at 14:31:16+ via REST
+        # — T2 was already placed at 14:31:14).
         if not eng:
             return
 
@@ -1474,18 +1653,73 @@ def _make_user_ws_order_callback(state: AppState):
 
         if evt_type == "CANCELLATION":
             eng.on_order_cancelled(order_id, reason="user_ws")
-        elif evt_type == "UPDATE":
-            # Partial fill update — size_matched changed
-            # Engine tracks fills via on_order_filled separately,
-            # but UPDATE gives us the authoritative size_matched for the order.
+            return
+
+        if evt_type == "UPDATE":
             om = state.order_manager
-            if om:
-                om.apply_fill_event(order_id, size_matched=ev.size_matched)
-                om.mark_filled(order_id)
-            log.debug(
-                "router.order_update",
-                order_id=order_id, size_matched=ev.size_matched,
+            if not om:
+                return
+            tracked = om.by_server_id(order_id)
+            if not tracked:
+                # Not ours — could be a stale UPDATE for an order we
+                # cancelled earlier. Silently drop.
+                return
+            # H-NEW-2026-07-11-3 (audit, prod 14:30 round, A7 review):
+            # WS UPDATE carries the AUTHORITATIVE cumulative size_matched
+            # straight from the CLOB, but we MUST NOT call
+            # `eng.on_order_filled(...)` from here. Why: the SAME fill
+            # also surfaces as a TRADE event carrying the per-trade
+            # `maker_orders[].matched_amount`, and that path IS where
+            # position totals / cost_filled get advanced. Both paths
+            # running on the same fill would double-count
+            # (size_filled += delta twice, _total_qty += delta twice,
+            # cost_filled += delta * price twice).
+            #
+            # The TRADE event path is the AUTHORITATIVE source for fill
+            # accounting (it carries per-trade deltas and is deduped by
+            # trade_id via _seen_trades in `_make_maker_fill_callback`).
+            # The UPDATE event's job here is:
+            #   1. Mirror the cumulative size_matched into TrackedOrder
+            #      so other code paths (TierWatcher, status queries) see
+            #      an up-to-date view of where the order currently stands.
+            #   2. Push the cumulative into the TierWatcher so it can
+            #      short-circuit the REST poll loop on its next tick.
+            # That is exactly what `receive_update` does, so we don't
+            # need any new state — just call it.
+            new_size_matched = ev.size_matched
+            prev_size_matched = tracked.size_matched or 0.0
+            if new_size_matched <= prev_size_matched + 1e-9:
+                # WS re-fire or out-of-order; nothing new.
+                return
+            fill_price = tracked.price  # for logging only — see comment above
+            om.apply_fill_event(
+                order_id,
+                size_matched=new_size_matched,
+                fill_price=fill_price,
             )
+            # H-NEW-2026-07-11-3: push cumulative into the watcher.
+            # TierWatcher.receive_update() is monotonic — out-of-order
+            # frames are dropped — and it wakes the watch loop early so
+            # the residual GTD gets cancelled within ~1ms of the fill
+            # (instead of waiting up to `_poll_s` seconds for the next
+            # REST balance read).
+            router = state.router
+            if router is not None:
+                watcher = router.watcher_for_server_order(order_id)
+                if watcher is not None:
+                    watcher.receive_update(new_size_matched)
+            log.info(
+                "router.order_update.mirror_only",
+                order_id=order_id,        # full hash
+                token=tracked.token_id[:16],
+                tier=tracked.tier_name,
+                size_matched=new_size_matched,
+                prev_size_matched=prev_size_matched,
+                note="WS UPDATE only mirrors cumulative to OM + watcher; "
+                     "TRADE event path is the authoritative source for "
+                     "position totals (avoid double-count).",
+            )
+            return
 
     return on_order
 
