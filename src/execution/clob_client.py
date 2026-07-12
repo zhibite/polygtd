@@ -988,13 +988,46 @@ class CLOBClient:
     # ------------------------------------------------------------------
 
     async def get_open_orders(self, condition_id: str | None = None) -> list[dict]:
-        """Fetch open orders from CLOB."""
+        """Fetch open orders from CLOB.
+
+        H-NEW-2026-07-12 production: py-clob-client-v2 exposes
+        `ClobClient.get_open_orders()` (not `get_orders`). The previous
+        call raised `AttributeError` and the order_manager reconcile
+        silently fell back to "no open orders", which left any GTD
+        orders that survived a bot restart holding CLOB balance /
+        allowance indefinitely (audit v6-12 / H-NEW-2026-07-11).
+
+        Returns a list of dicts matching py-clob-client-v2 OpenOrder
+        schema. Each dict has at least:
+            id, status, market (condition_id), asset_id, side,
+            price, original_size, size_matched, expiration
+        """
         if not self._client:
             return []
         try:
-            orders = await self._run(self._client.get_orders)
+            # v2 SDK exposes get_open_orders() as the live-orders query.
+            # Some 2.x point releases also added an alias `get_orders()`
+            # that wraps the same endpoint — prefer the named alias and
+            # only fall back if the SDK is too old.
+            method = getattr(self._client, "get_open_orders", None) \
+                or getattr(self._client, "get_orders", None)
+            if method is None:
+                log.warning(
+                    "clob.get_open_orders.missing_method",
+                    note="neither get_open_orders nor get_orders exists on ClobClient; "
+                         "reconcile will be a no-op for this SDK version",
+                )
+                return []
+            orders = await self._run(method)
             if condition_id:
-                orders = [o for o in orders if o.get("conditionID") == condition_id]
+                # V2 schema uses `market` (= condition_id). Keep the V1
+                # `conditionID` as a fallback so older SDK builds still
+                # filter correctly.
+                orders = [
+                    o for o in orders
+                    if o.get("market") == condition_id
+                    or o.get("conditionID") == condition_id
+                ]
             return orders
         except Exception as exc:
             log.warning("clob.get_orders error", error=str(exc))

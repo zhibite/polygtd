@@ -126,6 +126,21 @@ class StrategyEngine:
         # cleared → next tick fires again` infinite loop.
         self._tp_last_post_error_ts: float = 0.0
         self._tp_backoff_s: float = 60.0
+        # H-NEW-2026-07-12: throttle state for the per-tick `engine.t2_diag`
+        # breadcrumb. The previous version logged every 250ms tick (~3600
+        # lines per 15m round), drowning the operator signal in identical
+        # INFO rows. We collapse to:
+        #   - one line every T2_DIAG_THROTTLE_S seconds per (round, side)
+        #   - one extra line immediately whenever the cache key set or
+        #     entry_token fingerprint changes (so we still see a state
+        #     transition even if it happens to fall between throttle
+        #     windows).
+        # The diagnostic payload itself is unchanged — it is a still-valid
+        # "is T2 evaluating at all?" breadcrumb for the H-NEW-2026-07-11
+        # audit v6-12 production symptom where T1 had filled at 0.39 and
+        # mid had crashed to 0.155 but `_check_average_down` never fired.
+        self._t2_diag_last_log_ts: dict[tuple[int, str], float] = {}
+        self._t2_diag_last_fingerprint: dict[tuple[int, str], str] = {}
 
     # H-NEW-2026-07-11: helper that reads PRICE_PRE_MARGIN safely even for
     # tests that construct engine via __new__ (bypassing __init__).
@@ -878,25 +893,70 @@ class StrategyEngine:
         # Logs every tick after the silent early-returns so we can see
         # whether the function falls through to trigger_tN or gets stuck
         # upstream. Safe to delete once the bug is located.
+        # ── DIAG-2026-07-11 (throttled 2026-07-12): trace why T2 averaging
+        # never fires. Logs one row per (round, side) every T2_DIAG_THROTTLE_S
+        # seconds, plus an extra row whenever the diagnostic fingerprint
+        # changes (entry_token, cache_keys_count, cache_first_key) so we
+        # still see a state transition even if it falls between throttle
+        # windows. The original implementation logged every 250ms tick
+        # (~3600 lines per 15m round) and drowned the operator signal.
+        # The breadcrumb itself is still valid for the H-NEW-2026-07-11
+        # audit v6-12 prod symptom ("T1 filled at 0.39, mid dropped to
+        # 0.155, but `_check_average_down` never fired").
+        T2_DIAG_THROTTLE_S = 10.0
         try:
             _cache_keys = list(self._pc.midpoint.keys())
-            log.info(
-                "engine.t2_diag",
-                entry_token=pos.entry_token[:32] if pos.entry_token else None,
-                cache_key_match=pos.entry_token in self._pc.midpoint if pos.entry_token else False,
-                cache_keys_count=len(_cache_keys),
-                cache_first_key=_cache_keys[0][:32] if _cache_keys else None,
-                cache_first_mid=self._pc.midpoint[_cache_keys[0]] if _cache_keys else None,
-                mid=mid_price,
-                tp_inflight=pos._tp_inflight,
-                baseline_realized=pos.baseline_realized_price,
-                baseline_set_realized=pos.baseline_set_realized,
-                baseline_target=pos.baseline_target_price,
-                tier2_placed=pos.tiers[1].placed,
-                tier2_watching=pos.tiers[1].watching,
-                tier2_is_complete=pos.tiers[1].is_complete,
-                tier2_server_id=pos.tiers[1].server_order_id,
+            _diag_round = self._round.round_start_ts if self._round else 0
+            _diag_side = pos.entry_side or "?"
+            _diag_rk = (_diag_round, _diag_side)
+            # Build a small fingerprint of the fields an operator would
+            # actually use to spot a state change. We deliberately
+            # exclude `mid` and `tp_inflight` (both move every tick) so
+            # the fingerprint only changes on real state transitions.
+            _fingerprint = "|".join(
+                [
+                    (pos.entry_token or "")[:32],
+                    str(len(_cache_keys)),
+                    (_cache_keys[0][:32] if _cache_keys else ""),
+                    str(bool(pos.baseline_set_realized)),
+                    str(pos.baseline_realized_price or 0.0),
+                    str(bool(pos.tiers[1].placed)),
+                    str(bool(pos.tiers[1].watching)),
+                    str(bool(pos.tiers[1].is_complete)),
+                    str(bool(pos.tiers[1].server_order_id)),
+                ]
             )
+            _now = time.time()
+            # H-NEW-2026-07-12: the throttle init must also tolerate the
+            # __new__ test path that bypasses __init__ (i.e. the dicts may
+            # not exist on the instance yet). fall back to empty dicts
+            # rather than crashing on AttributeError.
+            _last_ts = getattr(self, "_t2_diag_last_log_ts", {}).get(_diag_rk, 0.0)
+            _last_fp = getattr(self, "_t2_diag_last_fingerprint", {}).get(_diag_rk, "")
+            if _now - _last_ts >= T2_DIAG_THROTTLE_S or _fingerprint != _last_fp:
+                log.info(
+                    "engine.t2_diag",
+                    entry_token=pos.entry_token[:32] if pos.entry_token else None,
+                    cache_key_match=pos.entry_token in self._pc.midpoint if pos.entry_token else False,
+                    cache_keys_count=len(_cache_keys),
+                    cache_first_key=_cache_keys[0][:32] if _cache_keys else None,
+                    cache_first_mid=self._pc.midpoint[_cache_keys[0]] if _cache_keys else None,
+                    mid=mid_price,
+                    tp_inflight=pos._tp_inflight,
+                    baseline_realized=pos.baseline_realized_price,
+                    baseline_set_realized=pos.baseline_set_realized,
+                    baseline_target=pos.baseline_target_price,
+                    tier2_placed=pos.tiers[1].placed,
+                    tier2_watching=pos.tiers[1].watching,
+                    tier2_is_complete=pos.tiers[1].is_complete,
+                    tier2_server_id=pos.tiers[1].server_order_id,
+                )
+                if not hasattr(self, "_t2_diag_last_log_ts"):
+                    self._t2_diag_last_log_ts = {}
+                if not hasattr(self, "_t2_diag_last_fingerprint"):
+                    self._t2_diag_last_fingerprint = {}
+                self._t2_diag_last_log_ts[_diag_rk] = _now
+                self._t2_diag_last_fingerprint[_diag_rk] = _fingerprint
         except Exception as _diag_exc:
             log.warning("engine.t2_diag.error", error=str(_diag_exc))
 

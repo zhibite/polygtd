@@ -1062,7 +1062,36 @@ class OrderManager:
             log.info("order_manager.startup_reconcile", cancelled=0, note="no open orders on CLOB")
             return
 
-        server_ids = [str(o.get("orderID", "")) for o in open_orders if o.get("orderID")]
+        # H-NEW-2026-07-12: py-clob-client-v2 returns each open order with
+        # the field name `id` (the full hash), NOT `orderID` (V1 name).
+        # Same shape came back from a previous v1 client; the V2 migration
+        # rename is what the official "Migrating to CLOB V2" guide calls
+        # out: `get_orders()` → `get_open_orders()` and `id` is the
+        # canonical key. Fall back to `orderID` for safety in case a
+        # future SDK roll-back drops v1-style fields.
+        # Also filter out rows whose CLOB status is already terminal
+        # (MATCHED / CANCELED / EXPIRED / matched >= original_size):
+        # cancelling them is wasted work and noisy in logs. We only
+        # cancel LIVE / INVALID / UNKNOWN rows that may still hold
+        # maker allowance.
+        live_statuses = {"LIVE", "INVALID", "UNKNOWN"}
+        def _sid(o: dict) -> str:
+            return str(o.get("id") or o.get("orderID") or "")
+        cancel_candidates = [
+            (o, _sid(o))
+            for o in open_orders
+            if _sid(o) and (o.get("status") in live_statuses or not o.get("status"))
+        ]
+        if len(cancel_candidates) < len(open_orders):
+            skipped = len(open_orders) - len(cancel_candidates)
+            log.info(
+                "order_manager.startup_reconcile.terminal_skipped",
+                skipped=skipped,
+                statuses_seen=sorted({
+                    str(o.get("status", "NONE")) for o in open_orders
+                }),
+            )
+        server_ids = [sid for _, sid in cancel_candidates]
         log.warning(
             "order_manager.startup_reconcile.stale_orders",
             count=len(server_ids),
