@@ -255,6 +255,13 @@ async def test_h1_v2_entry_token_set_before_handler_await() -> None:
 async def test_h3_v2_average_down_uses_target_price() -> None:
     """When T1 slips (real fill 0.45 vs intended 0.40), T2 must still
     trigger at 0.40 * (1 - 0.20) = 0.32, not 0.45 * 0.80 = 0.36.
+
+    H-NEW-2026-07-12 (operator clarification, prod window 1783819800):
+    updated to also seed `baseline_realized_price` because the engine
+    now gates T2/T3 averaging on T1 having at least one confirmed fill
+    (the operator specified the 30%/60% drop is from the T1 entry
+    price, not from the pre-fill strategy bid). Without that seed the
+    loop would early-return before T2 ever evaluates.
     """
     eng = StrategyEngine.__new__(StrategyEngine)
     pos = Position()
@@ -263,6 +270,10 @@ async def test_h3_v2_average_down_uses_target_price() -> None:
     pos.baseline_target_price = 0.40  # intended entry bid
     pos.baseline_price = 0.45        # actual fill avg after slippage
     pos.baseline_set = True
+    # H-NEW-2026-07-12: anchor to realised T1 fill (0.45) so the
+    # T1-has-filled guard passes and the averaging loop evaluates.
+    pos.baseline_realized_price = 0.45
+    pos.baseline_set_realized = True
     pos._total_qty = 10.0
     pos._total_cost = 4.5
     eng._round = type("R", (), {"position": pos})()

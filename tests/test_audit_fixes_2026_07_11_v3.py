@@ -401,13 +401,26 @@ async def test_h_new_2_avg_down_skipped_when_tp_inflight() -> None:
 
 @pytest.mark.asyncio
 async def test_h_new_2_avg_down_resumes_after_tp_completes() -> None:
-    """Once the TP runner clears _tp_inflight, averaging-down resumes."""
+    """Once the TP runner clears _tp_inflight, averaging-down resumes.
+
+    H-NEW-2026-07-12 (operator clarification, prod window 1783819800):
+    updated to also seed `baseline_realized_price` because the engine
+    now gates T2/T3 averaging on T1 having at least one confirmed fill
+    (the operator specified the 30%/60% drop is from the T1 entry
+    price, not from the pre-fill strategy bid). Without that seed the
+    loop early-returns before the TP-gate check has a chance to run.
+    """
     eng = StrategyEngine.__new__(StrategyEngine)
     pos = Position()
     pos.entry_token = "tok"
     pos.entry_side = "UP"
     pos.baseline_target_price = 0.40
     pos.baseline_set = True
+    # H-NEW-2026-07-12: anchor to a realised T1 fill (using target as a
+    # stand-in is fine for the test — the test's intent is the TP gate,
+    # not the baseline anchor) so the T1-has-filled guard passes.
+    pos.baseline_realized_price = 0.40
+    pos.baseline_set_realized = True
     pos._total_qty = 10.0
     pos._total_cost = 4.0
     pos._tp_inflight = False

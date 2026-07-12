@@ -540,6 +540,12 @@ async def test_m_v4_2_stale_tier_resets_and_refires() -> None:
     """When `tier.placed=True` but `server_order_id is None` (a stale
     state from a previous router-level failure), `_check_average_down`
     must reset the tier instead of skipping it forever.
+
+    H-NEW-2026-07-12 (operator clarification, prod window 1783819800):
+    updated to also seed `baseline_realized_price` because the engine
+    now gates T2/T3 averaging on T1 having at least one confirmed fill.
+    Without that seed the loop early-returns before the stale-tier
+    reset path has a chance to run.
     """
     eng = StrategyEngine.__new__(StrategyEngine)
     pos = Position()
@@ -547,6 +553,10 @@ async def test_m_v4_2_stale_tier_resets_and_refires() -> None:
     pos.entry_side = "UP"
     pos.baseline_target_price = 0.40
     pos.baseline_set = True
+    # H-NEW-2026-07-12: anchor to realised T1 fill so the T1-has-filled
+    # guard passes and the averaging loop can reach the stale-tier path.
+    pos.baseline_realized_price = 0.40
+    pos.baseline_set_realized = True
     pos._total_qty = 5.0
     pos._total_cost = 2.0
     # Simulate the stale state.

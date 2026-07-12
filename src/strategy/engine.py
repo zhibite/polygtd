@@ -959,8 +959,27 @@ class StrategyEngine:
         except Exception as _diag_exc:
             log.warning("engine.t2_diag.error", error=str(_diag_exc))
 
-        # Baseline anchoring (unchanged from H-V6-14 — realized price wins
-        # once T1 has any fill, else target/legacy fallback).
+        # Baseline anchoring.
+        # H-NEW-2026-07-12 (operator clarification, prod window 1783819800):
+        # averaging-down tiers (T2/T3) must measure the drop from the
+        # *realized* T1 entry price — not the T1 strategy/intended bid —
+        # because that is what the operator specified ("跌幅30%、60%都
+        # 是从入场价T1算"). The previous fallback chain (target →
+        # legacy baseline) silently let T2 fire with a baseline of 0.36
+        # (the T1 cap) in prod, even though T1 had not yet filled and
+        # the realised entry would end up at 0.22.
+        #
+        # Resolution priority (new):
+        #   1. baseline_realized_price (set when T1 first fill lands)
+        #      — this is the "true" T1 entry the operator wants
+        #   2. baseline_target_price — pre-fill T1 intended bid, used
+        #      only when no fill has arrived yet; covers the common
+        #      case where T1 and T2 both fire on the same tick (the
+        #      tick before the T1 fill callback lands).
+        #   3. (REMOVED) legacy baseline_price — was a stale price from
+        #      a previous strategy design that has since been deprecated.
+        #      Falling back to it gave the prod window 1783819800 its
+        #      T2 fire at baseline=0.36 even when T1 had not filled.
         if pos.baseline_set_realized and pos.baseline_realized_price is not None:
             new_baseline = pos.baseline_realized_price
             if not getattr(pos, "_baseline_rebased_logged", False):
@@ -976,12 +995,26 @@ class StrategyEngine:
                 )
                 pos._baseline_rebased_logged = True
             baseline = new_baseline
+        elif pos.baseline_target_price is not None:
+            # No realised fill yet — use the pre-fill T1 intended bid.
+            # This is NOT the operator-preferred "from realised entry"
+            # anchor, but it is a sane number (the T1 limit price the
+            # engine itself just chose a moment ago) and prevents the
+            # function from silently bailing while T1 is still in
+            # flight.
+            baseline = pos.baseline_target_price
         else:
-            baseline = (
-                pos.baseline_target_price
-                if pos.baseline_target_price is not None
-                else pos.baseline_price
+            # No resolvable baseline at all (e.g. test stubs that bypass
+            # the production bind path). Bail cleanly and surface the
+            # state so operators see the round is alive but unanchorable.
+            log.info(
+                "engine.tN_skip_t1_not_yet_filled",
+                side=pos.entry_side,
+                baseline_target=pos.baseline_target_price,
+                note="averaging-down has no resolvable baseline; "
+                     "loop returns until T1 first fill lands",
             )
+            return
         # Defensive: if the fallback chain produced None (e.g. test stubs
         # that bypass the production bind path, or a future refactor that
         # breaks baseline anchoring), bail out cleanly and surface the state
@@ -1005,6 +1038,30 @@ class StrategyEngine:
         margin = self._get_price_pre_margin()
 
         for tier in pos.tiers[1:]:  # T2, T3 (3-tier cap — H-NEW-2026-07-11-4)
+            # H-NEW-2026-07-12 (operator clarification, prod window 1783819800):
+            # T2/T3 averaging MUST wait for at least one confirmed T1 fill
+            # before evaluating. The 30%/60% drop is measured from the
+            # T1 entry price (which we only know after T1 has filled),
+            # not from the T1 strategy/intended bid.
+            #
+            # In prod 1783819800, T1 and T2 both fired on the same tick
+            # because the engine `_evaluate` loop saw `mid=0.215 <=
+            # strategy_price*(1+margin)` for both tiers. T1 filled at
+            # 0.22 but T2's strategy_price had been computed against the
+            # T1 pre-fill limit (0.36), so T2 ended up bidding at 0.252 —
+            # ~50% above the operator's intended 30%-drop-from-entry
+            # trigger (~0.154). The per-tier guard below prevents T2/T3
+            # from evaluating at all until T1 has produced a fill.
+            if not pos.baseline_set_realized or pos.baseline_realized_price is None:
+                self._tN_skip_log(
+                    "engine.tN_skip_t1_not_yet_filled",
+                    tier=tier.tier, mid=mid_price,
+                    baseline_target=pos.baseline_target_price,
+                    note="T2/T3 averaging gated until T1 has at least one "
+                         "confirmed fill — drop is measured from realized "
+                         "entry, not the pre-fill strategy bid",
+                )
+                continue
             if tier.is_complete:
                 # H-NEW-2026-07-11 (audit v6-12): was silent. Without this
                 # breadcrumb an operator cannot distinguish "tier already
