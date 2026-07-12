@@ -56,17 +56,17 @@ Polymarket CLOB 使用 pUSD（不是原生 USDC）作为抵押品：
 ```bash
 # 马丁格尔仓位（美元名义）
 TIER1_NOTIONAL=2.0   # 首单
-TIER2_NOTIONAL=2.0   # 补仓1
-TIER3_NOTIONAL=4.0   # 补仓2
-TIER4_NOTIONAL=8.0   # 补仓3
-# 总最大暴露 = 16 USD
+TIER2_NOTIONAL=4.0   # 补仓1
+TIER3_NOTIONAL=8.0   # 补仓2
+# 总最大暴露 = 14 USD (H-NEW-2026-07-11-4: 3-tier cap, removed T4)
 
 # 策略阈值
-ENTRY_PRICE_CAP=0.40     # 入场价格上限
-TIER2_DROP_PCT=0.20      # T2 触发：价格跌到基准 × 80%
-TIER3_DROP_PCT=0.40      # T3 触发：价格跌到基准 × 60%
-TIER4_DROP_PCT=0.60      # T4 触发：价格跌到基准 × 40%
+# H-NEW-2026-07-11-5: entry cap 0.40 → 0.36, TP decrement 3% → 5%.
+ENTRY_PRICE_CAP=0.36     # 入场价格上限
+TIER2_DROP_PCT=0.30      # T2 触发：价格跌到基准 × 70%
+TIER3_DROP_PCT=0.60      # T3 触发：价格跌到基准 × 40%
 TP_PROFIT_PCT=0.20       # 止盈目标：成本 + 20%
+TP_DECREMENT_PCT=0.05    # 止盈递减：每补一档 -5% (N=1→15%, N=2→10%)
 BASELINE_DRIFT_LIMIT=0.0015  # BTC 现货偏移上限 0.15%
 
 # 订单参数
@@ -132,14 +132,14 @@ GAMMA_API=https://gamma-api.polymarket.com
 POLYMARKET_HOST=https://clob.polymarket.com
 POLYGON_RPC_URL=https://polygon-bor.publicnode.com
 TIER1_NOTIONAL=2.0
-TIER2_NOTIONAL=2.0
-TIER3_NOTIONAL=4.0
-TIER4_NOTIONAL=8.0
-ENTRY_PRICE_CAP=0.40
-TIER2_DROP_PCT=0.20
-TIER3_DROP_PCT=0.40
-TIER4_DROP_PCT=0.60
+TIER2_NOTIONAL=4.0
+TIER3_NOTIONAL=8.0
+# H-NEW-2026-07-11-5: entry cap 0.36, TP decrement 0.05.
+ENTRY_PRICE_CAP=0.36
+TIER2_DROP_PCT=0.30
+TIER3_DROP_PCT=0.60
 TP_PROFIT_PCT=0.20
+TP_DECREMENT_PCT=0.05
 BASELINE_DRIFT_LIMIT=0.0015
 T1_ENTRY_WINDOW_S=300
 GTD_LIFETIME_S=180
