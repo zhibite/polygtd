@@ -697,7 +697,7 @@ class CLOBClient:
                     token_id, order_id, avg_px, matched_sz
                 )
 
-            # Terminal states
+                # Terminal states
             if order_status in ("matched", "filled"):
                 if total_sz > 0:
                     avg_px = total_usdc / total_sz
@@ -723,15 +723,30 @@ class CLOBClient:
                         success=True,
                         expiration_ts=expiration_ts,
                     )
-                log.warning(
-                    "clob.gtd_sell matched_zero",
+                # CLOB confirmed status="matched"/"filled" but fills[] and
+                # size_matched are empty — the API responded faster than
+                # CLOB's internal fill ledger updated. Treat as a confirmed
+                # full fill: use order_size as the authoritative filled
+                # quantity and the posted price as the fill price.
+                # Pre-fix this was mis-classified as "gtd_matched_zero"
+                # failure, causing the bot to lose its position inventory
+                # (engine thought TP failed, position kept 5.55 shares)
+                # while the CLOB had already executed the full sell.
+                log.info(
+                    "clob.gtd_sell confirmed_filled_via_status",
                     order_id=order_id[:16],
                     token=token_id[:12],
                     order_size=order_size,
+                    fill_price=price_q,
+                    note="CLOB matched/filled but fills[] empty — "
+                         "treated as confirmed full fill",
                 )
                 return FillResult(
-                    order_id=order_id, tokens=0, usdc=0,
-                    fill_price=price_q, success=False, error="gtd_matched_zero",
+                    order_id=order_id,
+                    tokens=_round_down(order_size, Decimal("0.0001")),
+                    usdc=_round_down(order_size * price_q, Decimal("0.01")),
+                    fill_price=price_q,
+                    success=True,
                     expiration_ts=expiration_ts,
                 )
 

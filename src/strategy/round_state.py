@@ -480,6 +480,16 @@ class Position:
         # fill for the same server_order_id is ignored. Keeps registry clean.
         if snap.size_sold + 1e-9 >= snap.target_qty:
             self._tp_snapshots.pop(server_order_id, None)
+            # H-NEW-2026-07-12: confirmed full TP exit — position total_qty
+            # is now 0 (set by the caller via `eng.on_tp_completed` / position
+            # dedup). entry_token stays intact so _check_t1_entry guard keeps
+            # blocking re-entry until the next round.
+            if self._total_qty <= 1e-9:
+                log.info(
+                    "position.fully_closed_after_tp",
+                    token=self.entry_token or "",
+                    avg_before=avg_before,
+                )
 
         return True
 
