@@ -136,13 +136,15 @@ class StrategySettings(BaseSettings):
     TIER_NOTIONAL_MAX_MULT: float = 1.1
 
     # ── Strategy thresholds ───────────────────────────────────────────────
-    # H-NEW-2026-07-11-5 (tighter entry gate): tightened from 0.40 to
-    # 0.36. The 0.40 cap was permissive enough that T1 entries routinely
-    # filled at 0.38–0.40 against thin books at window-open, which
-    # compressed the runway into T2's -30% trigger. With 0.36 the bot
-    # refuses to enter at extreme ask prices — T1 only fires when the
-    # mid is comfortably below the 0.40 historical ceiling.
-    ENTRY_PRICE_CAP: float = 0.36      # max token price to enter
+    # H-NEW-2026-07-12 (operator adjustment): tightened from 0.36 to 0.38.
+    # Previous 0.36 cap made T1 fire too late — the average T1 entry at
+    # 0.22 left an unreasonable spread against the TP target (0.40), but
+    # too few windows actually reached that low a mid, so the bot sat on
+    # cash more often than it traded. Loosening to 0.38 widens the entry
+    # window without re-introducing the 0.40-era problem of bidding the
+    # ask at window-open against thin books: the bot still refuses to
+    # fire T1 above the 0.40 historical ceiling.
+    ENTRY_PRICE_CAP: float = 0.38      # max token price to enter
     TIER2_DROP_PCT: float = 0.30       # T2 triggers at baseline * (1 - 30%)
     TIER3_DROP_PCT: float = 0.60       # T3 triggers at baseline * (1 - 60%)
     # H-NEW-2026-07-11-4: TIER4_DROP_PCT removed. No tier 4 exists.

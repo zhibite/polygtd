@@ -61,8 +61,8 @@ TIER3_NOTIONAL=8.0   # 补仓2
 # 总最大暴露 = 14 USD (H-NEW-2026-07-11-4: 3-tier cap, removed T4)
 
 # 策略阈值
-# H-NEW-2026-07-11-5: entry cap 0.40 → 0.36, TP decrement 3% → 5%.
-ENTRY_PRICE_CAP=0.36     # 入场价格上限
+# H-NEW-2026-07-12: entry cap 0.36 → 0.38, TP decrement 3% → 5%.
+ENTRY_PRICE_CAP=0.38     # 入场价格上限
 TIER2_DROP_PCT=0.30      # T2 触发：价格跌到基准 × 70%
 TIER3_DROP_PCT=0.60      # T3 触发：价格跌到基准 × 40%
 TP_PROFIT_PCT=0.20       # 止盈目标：成本 + 20%
@@ -134,8 +134,8 @@ POLYGON_RPC_URL=https://polygon-bor.publicnode.com
 TIER1_NOTIONAL=2.0
 TIER2_NOTIONAL=4.0
 TIER3_NOTIONAL=8.0
-# H-NEW-2026-07-11-5: entry cap 0.36, TP decrement 0.05.
-ENTRY_PRICE_CAP=0.36
+# H-NEW-2026-07-12: entry cap 0.38, TP decrement 0.05.
+ENTRY_PRICE_CAP=0.38
 TIER2_DROP_PCT=0.30
 TIER3_DROP_PCT=0.60
 TP_PROFIT_PCT=0.20
