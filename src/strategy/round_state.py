@@ -643,6 +643,13 @@ class Position:
           * tier.watching   = False (watcher is done)
           * position totals _total_qty / _total_cost if filled_qty >
             tier.size_filled (catches fills missed by the WS path).
+
+        R5 (audit v6-14 hardening): tier.watching is cleared inside a
+        try/finally so an exception during the in-branch reconciliation
+        (e.g. a transient log sink failure mid-call) cannot leave the
+        engine believing a tier is still being watched. The flag is the
+        in-flight mutex used by `_check_average_down` / `_check_take_profit`
+        via `has_inflight_tier`, so leaking it True deadlocks both paths.
         """
         from src.execution.tier_watcher import TierOutcome
 
@@ -662,177 +669,199 @@ class Position:
                 return
             self._applied_watcher_dedup.add(dedup_key)
 
-        # Monotonic — fill events may have already incremented size_filled.
-        if filled_qty > tier.placed_qty:
-            tier.placed_qty = filled_qty
+        try:
+            # Monotonic — fill events may have already incremented size_filled.
+            if filled_qty > tier.placed_qty:
+                tier.placed_qty = filled_qty
 
-        if outcome in (TierOutcome.FILLED.value, TierOutcome.OVER_FILLED.value):
-            tier.filled = True
-            # If the watcher caught fills that the WS path missed, advance
-            # position-level totals so STATUS / TP math see them.
-            if filled_qty > tier.size_filled + 1e-9:
-                # Price precedence for the missed-fill reconciliation:
-                #   1. Real avg_fill_price from the watcher (preferred).
-                #   2. tier.avg_fill_price previously set by record_fill.
-                #   3. Strategy price = notional / size_expected.
-                fill_px = 0.0
-                if avg_fill_price > 0:
-                    fill_px = float(avg_fill_price)
-                elif tier.avg_fill_price and tier.avg_fill_price > 0:
-                    fill_px = float(tier.avg_fill_price)
-                elif tier.size_expected > 0 and tier.notional > 0:
-                    fill_px = tier.notional / tier.size_expected
+            if outcome in (TierOutcome.FILLED.value, TierOutcome.OVER_FILLED.value):
+                tier.filled = True
+                # If the watcher caught fills that the WS path missed, advance
+                # position-level totals so STATUS / TP math see them.
+                if filled_qty > tier.size_filled + 1e-9:
+                    # Price precedence for the missed-fill reconciliation:
+                    #   1. Real avg_fill_price from the watcher (preferred).
+                    #   2. tier.avg_fill_price previously set by record_fill.
+                    #   3. Strategy price = notional / size_expected.
+                    fill_px = 0.0
+                    if avg_fill_price > 0:
+                        fill_px = float(avg_fill_price)
+                    elif tier.avg_fill_price and tier.avg_fill_price > 0:
+                        fill_px = float(tier.avg_fill_price)
+                    elif tier.size_expected > 0 and tier.notional > 0:
+                        fill_px = tier.notional / tier.size_expected
 
-                missed = filled_qty - tier.size_filled
-                if missed > 1e-9 and fill_px > 0:
-                    self._total_qty += missed
-                    self._total_cost += missed * fill_px
-                    if self._total_qty > 0:
-                        self._avg_cost = self._total_cost / self._total_qty
-                    tier.size_filled += missed
-                    tier.cost_filled += missed * fill_px
+                    missed = filled_qty - tier.size_filled
+                    if missed > 1e-9 and fill_px > 0:
+                        self._total_qty += missed
+                        self._total_cost += missed * fill_px
+                        if self._total_qty > 0:
+                            self._avg_cost = self._total_cost / self._total_qty
+                        tier.size_filled += missed
+                        tier.cost_filled += missed * fill_px
+                        log.info(
+                            "position.watcher_reconciled_missed_fills",
+                            tier=tier.tier,
+                            missed=missed,
+                            fill_px=fill_px,
+                            fill_px_source="avg_fill_price" if avg_fill_price > 0 else (
+                                "tier.avg_fill_price" if (tier.avg_fill_price and tier.avg_fill_price > 0)
+                                else "notional/size_expected"
+                            ),
+                            total_qty=self._total_qty,
+                        )
+
+                # Anchor baseline_realized on first T1 watcher fill (same as
+                # record_fill does for the size_filled path).
+                if tier.tier == 1 and tier.size_filled > 1e-9:
+                    new_realized = tier.cost_filled / tier.size_filled
+                    if (
+                        self.baseline_realized_price is None
+                        or abs(new_realized - self.baseline_realized_price) > 1e-9
+                    ):
+                        self.baseline_realized_price = new_realized
+                    self.baseline_set_realized = True
+
+            elif outcome == TierOutcome.EXPIRED.value:
+                # Cancel-after-expiry — do not mark filled (it didn't fill).
+                # keep partial fills in size_filled/cost_filled; just close out.
+                # H-NEW-2026-07-11 (audit v6-12): if the GTD partially filled
+                # before expiring, the realised T1 fill avg MUST still anchor
+                # the T2+ trigger lines. Without this, a T1 that partially
+                # filled and then expired would leave `baseline_set_realized`
+                # stuck at False, forcing T2+ to use the design
+                # `baseline_target_price` (= ENTRY_PRICE_CAP) instead of the
+                # real cost basis. The martingale trigger lines would then be
+                # permanently miscalibrated against the actual fill average.
+                if (
+                    tier.tier == 1
+                    and tier.size_filled > 1e-9
+                    and not self.baseline_set_realized
+                ):
+                    new_realized = tier.cost_filled / tier.size_filled
+                    self.baseline_realized_price = new_realized
+                    self.baseline_set_realized = True
                     log.info(
-                        "position.watcher_reconciled_missed_fills",
+                        "position.baseline_anchored_on_expire",
                         tier=tier.tier,
-                        missed=missed,
-                        fill_px=fill_px,
-                        fill_px_source="avg_fill_price" if avg_fill_price > 0 else (
-                            "tier.avg_fill_price" if (tier.avg_fill_price and tier.avg_fill_price > 0)
-                            else "notional/size_expected"
-                        ),
-                        total_qty=self._total_qty,
+                        missed=tier.size_filled,
+                        fill_px=avg_fill_price,
+                        new_realized=new_realized,
+                        note="T1 GTD partially filled before expiry; "
+                             "rebasing T2+ trigger lines to realised avg",
+                    )
+            elif outcome == TierOutcome.CROSSED.value:
+                # Cancel because mid dropped into the next tier's zone. The
+                # next tier watcher will fire from the next _evaluate tick.
+                #
+                # H-NEW-2026-07-11 (audit v6-12): symmetric with EXPIRED —
+                # partial fills before the cross-cancel must still anchor the
+                # realised baseline. Previously this branch was a silent `pass`,
+                # which is exactly the path that fired for the 2026-07-11
+                # 11:15 incident (mid dropped past the T2 fire line while T1
+                # GTD was still live, watcher cancel-with-CROSSED outcome, no
+                # baseline anchor written).
+                if (
+                    tier.tier == 1
+                    and tier.size_filled > 1e-9
+                    and not self.baseline_set_realized
+                ):
+                    new_realized = tier.cost_filled / tier.size_filled
+                    self.baseline_realized_price = new_realized
+                    self.baseline_set_realized = True
+                    log.info(
+                        "position.baseline_anchored_on_cross",
+                        tier=tier.tier,
+                        missed=tier.size_filled,
+                        fill_px=avg_fill_price,
+                        new_realized=new_realized,
+                        note="T1 GTD had partial fills before mid crossed "
+                             "into next-tier zone; rebasing T2+ trigger "
+                             "lines to realised avg",
                     )
 
-            # Anchor baseline_realized on first T1 watcher fill (same as
-            # record_fill does for the size_filled path).
-            if tier.tier == 1 and tier.size_filled > 1e-9:
-                new_realized = tier.cost_filled / tier.size_filled
+                # H-NEW-2026-07-11 (audit v6-14): CROSSED must release the
+                # in-flight mutex for downstream strategy decisions.
+                #
+                # Production symptom (2026-07-11 13:32 round): when T2 BUY
+                # crossed into T3's zone and the watcher fell back to the
+                # CROSSED outcome, `tier.placed` stayed True forever. That
+                # made `position.has_inflight_tier` permanently True, so
+                # `_check_take_profit` would never fire even when mid moved
+                # back above `tp_target * (1 - margin)`. The position bled
+                # uPnL with no TP SELL ever posted.
+                #
+                # Without this reset, any averaging tier that crosses
+                # without filling deadlocks the take-profit path for the
+                # rest of the round. We keep `filled=False` to avoid
+                # double-counting with any post-cross on-chain fill that
+                # the WS path might still deliver, but we MUST release
+                # the placed mutex so TP / next-tier decisions can advance.
+                #
+                # Server_order_id is preserved intentionally — it lets
+                # late-arriving user_ws TRADE events still attribute fills
+                # to this tier for the M-2 dedupe / record_fill path.
+                tier.placed = False
+                log.info(
+                    "position.tier_cleared_after_cross",
+                    tier=tier.tier,
+                    server_order_id=tier.server_order_id[:16] if tier.server_order_id else None,
+                    note="tier.placed reset to False so downstream checks "
+                         "(has_inflight_tier / TP gating) release this slot",
+                )
+            elif outcome in (TierOutcome.CANCELLED.value, TierOutcome.ERROR.value):
+                # External / unexpected — keep partial fills, close out.
+                # Same partial-fill baseline anchoring as EXPIRED/CROSSED.
                 if (
-                    self.baseline_realized_price is None
-                    or abs(new_realized - self.baseline_realized_price) > 1e-9
+                    tier.tier == 1
+                    and tier.size_filled > 1e-9
+                    and not self.baseline_set_realized
                 ):
+                    new_realized = tier.cost_filled / tier.size_filled
                     self.baseline_realized_price = new_realized
-                self.baseline_set_realized = True
+                    self.baseline_set_realized = True
+                    log.info(
+                        "position.baseline_anchored_on_cancel",
+                        tier=tier.tier,
+                        missed=tier.size_filled,
+                        fill_px=avg_fill_price,
+                        new_realized=new_realized,
+                    )
 
-        elif outcome == TierOutcome.EXPIRED.value:
-            # Cancel-after-expiry — do not mark filled (it didn't fill).
-            # keep partial fills in size_filled/cost_filled; just close out.
-            # H-NEW-2026-07-11 (audit v6-12): if the GTD partially filled
-            # before expiring, the realised T1 fill avg MUST still anchor
-            # the T2+ trigger lines. Without this, a T1 that partially
-            # filled and then expired would leave `baseline_set_realized`
-            # stuck at False, forcing T2+ to use the design
-            # `baseline_target_price` (= ENTRY_PRICE_CAP) instead of the
-            # real cost basis. The martingale trigger lines would then be
-            # permanently miscalibrated against the actual fill average.
-            if (
-                tier.tier == 1
-                and tier.size_filled > 1e-9
-                and not self.baseline_set_realized
-            ):
-                new_realized = tier.cost_filled / tier.size_filled
-                self.baseline_realized_price = new_realized
-                self.baseline_set_realized = True
-                log.info(
-                    "position.baseline_anchored_on_expire",
-                    tier=tier.tier,
-                    missed=tier.size_filled,
-                    fill_px=avg_fill_price,
-                    new_realized=new_realized,
-                    note="T1 GTD partially filled before expiry; "
-                         "rebasing T2+ trigger lines to realised avg",
-                )
-        elif outcome == TierOutcome.CROSSED.value:
-            # Cancel because mid dropped into the next tier's zone. The
-            # next tier watcher will fire from the next _evaluate tick.
-            #
-            # H-NEW-2026-07-11 (audit v6-12): symmetric with EXPIRED —
-            # partial fills before the cross-cancel must still anchor the
-            # realised baseline. Previously this branch was a silent `pass`,
-            # which is exactly the path that fired for the 2026-07-11
-            # 11:15 incident (mid dropped past the T2 fire line while T1
-            # GTD was still live, watcher cancel-with-CROSSED outcome, no
-            # baseline anchor written).
-            if (
-                tier.tier == 1
-                and tier.size_filled > 1e-9
-                and not self.baseline_set_realized
-            ):
-                new_realized = tier.cost_filled / tier.size_filled
-                self.baseline_realized_price = new_realized
-                self.baseline_set_realized = True
-                log.info(
-                    "position.baseline_anchored_on_cross",
-                    tier=tier.tier,
-                    missed=tier.size_filled,
-                    fill_px=avg_fill_price,
-                    new_realized=new_realized,
-                    note="T1 GTD had partial fills before mid crossed "
-                         "into next-tier zone; rebasing T2+ trigger "
-                         "lines to realised avg",
-                )
-
-            # H-NEW-2026-07-11 (audit v6-14): CROSSED must release the
-            # in-flight mutex for downstream strategy decisions.
-            #
-            # Production symptom (2026-07-11 13:32 round): when T2 BUY
-            # crossed into T3's zone and the watcher fell back to the
-            # CROSSED outcome, `tier.placed` stayed True forever. That
-            # made `position.has_inflight_tier` permanently True, so
-            # `_check_take_profit` would never fire even when mid moved
-            # back above `tp_target * (1 - margin)`. The position bled
-            # uPnL with no TP SELL ever posted.
-            #
-            # Without this reset, any averaging tier that crosses
-            # without filling deadlocks the take-profit path for the
-            # rest of the round. We keep `filled=False` to avoid
-            # double-counting with any post-cross on-chain fill that
-            # the WS path might still deliver, but we MUST release
-            # the placed mutex so TP / next-tier decisions can advance.
-            #
-            # Server_order_id is preserved intentionally — it lets
-            # late-arriving user_ws TRADE events still attribute fills
-            # to this tier for the M-2 dedupe / record_fill path.
-            tier.placed = False
             log.info(
-                "position.tier_cleared_after_cross",
+                "position.tier_watcher_done",
                 tier=tier.tier,
-                server_order_id=tier.server_order_id[:16] if tier.server_order_id else None,
-                note="tier.placed reset to False so downstream checks "
-                     "(has_inflight_tier / TP gating) release this slot",
+                outcome=outcome,
+                filled_qty=filled_qty,
+                avg_fill_price=avg_fill_price,
+                placed_qty=tier.placed_qty,
+                size_filled=tier.size_filled,
+                size_expected=tier.size_expected,
+                filled=tier.filled,
             )
-        elif outcome in (TierOutcome.CANCELLED.value, TierOutcome.ERROR.value):
-            # External / unexpected — keep partial fills, close out.
-            # Same partial-fill baseline anchoring as EXPIRED/CROSSED.
-            if (
-                tier.tier == 1
-                and tier.size_filled > 1e-9
-                and not self.baseline_set_realized
-            ):
-                new_realized = tier.cost_filled / tier.size_filled
-                self.baseline_realized_price = new_realized
-                self.baseline_set_realized = True
-                log.info(
-                    "position.baseline_anchored_on_cancel",
-                    tier=tier.tier,
-                    missed=tier.size_filled,
-                    fill_px=avg_fill_price,
-                    new_realized=new_realized,
-                )
-
-        tier.watching = False
-
-        log.info(
-            "position.tier_watcher_done",
-            tier=tier.tier,
-            outcome=outcome,
-            filled_qty=filled_qty,
-            avg_fill_price=avg_fill_price,
-            placed_qty=tier.placed_qty,
-            size_filled=tier.size_filled,
-            size_expected=tier.size_expected,
-            filled=tier.filled,
-        )
+        except Exception as exc:
+            # R5: if any branch above blew up, the outer finally still
+            # releases the in-flight mutex. Without this, an exception in
+            # log.info (e.g. serialiser trouble on a custom field) would
+            # leak `tier.watching=True` forever, dead-locking has_inflight_tier.
+            log.exception(
+                "position.apply_tier_watcher_result.exception",
+                tier=tier.tier,
+                outcome=outcome,
+                filled_qty=filled_qty,
+                error=str(exc),
+            )
+            # R5 re-raise: callers (ActionRouter) catch this and decide
+            # whether to retry or surface to the operator. Swallowing
+            # would silently lose the exception and make production
+            # debugging impossible. The watching=False cleanup has
+            # already run in the `finally` block below.
+            raise
+        finally:
+            # R5 hardening: ALWAYS release the in-flight mutex, even on
+            # exception. This is the only flag that gates TP / next-tier
+            # decisions, so a leaked True would soft-lock the round.
+            tier.watching = False
 
     def tp_target(self) -> float | None:
         """Take-profit trigger price. None if no position.

@@ -636,6 +636,18 @@ class StrategyEngine:
 
         # Single-flight: drop re-entry rather than queue it. The next tick
         # will pick up the new state and call _evaluate again.
+        #
+        # R1 (audit 2026-07-12): invariant — `_eval_inflight` is set True
+        # on line 645 below and reset to False in the matching `finally`.
+        # This holds even when _check_t1_entry / _check_average_down /
+        # _check_take_profit raise exceptions (any exception in a try-block
+        # runs the finally before propagation). The flag is the only
+        # serialization point between ticks — if it ever became True
+        # without being cleared, the engine would freeze on the next tick
+        # (no log row, just silent no-ops). Tests cover this invariant
+        # in test_audit_fixes_2026_07_11.py::test_r1_eval_inflight_reset
+        # so a regression that lets the flag leak surfaces in CI rather
+        # than in prod at 3am.
         if self._eval_inflight:
             log.debug(
                 "engine.evaluate.skip re_entry",
@@ -711,6 +723,13 @@ class StrategyEngine:
         # Strategy price = ENTRY_PRICE_CAP; the new model pre-arms at this
         # level. We use ENTRY_PRICE_CAP as the "design price" so the trigger
         # margin is consistent with the price-cap semantics.
+        # R2 (audit 2026-07-12): the same value is also read in
+        # gatekeeper.can_enter() and in `_t1_cap_reject_summary()`. The
+        # three readers all funnel through `_s().ENTRY_PRICE_CAP` so a
+        # single-source-of-truth is already in place — this comment
+        # exists to make the implicit invariant explicit so a future
+        # refactor that introduces a fourth reader can still reason
+        # about drift between the three call sites.
         strategy_price = float(s.ENTRY_PRICE_CAP)
         # Fire when mid has dropped to (or below) strategy_price * (1 + margin).
         trigger_line = strategy_price * (1.0 + margin)
@@ -1052,15 +1071,18 @@ class StrategyEngine:
             # ~50% above the operator's intended 30%-drop-from-entry
             # trigger (~0.154). The per-tier guard below prevents T2/T3
             # from evaluating at all until T1 has produced a fill.
+            #
+            # R3 (audit 2026-07-12): the early-out here is a SILENT
+            # continue. The function-top check at line ~1010 already logs
+            # `engine.tN_skip_t1_not_yet_filled` once per (round, side)
+            # when `baseline` falls back to baseline_target_price; emitting
+            # a per-tier throttled skip HERE as well produced redundant
+            # ~4 Hz log rows (T2 + T3 each throttled at 5s) that just
+            # repeated the top-level breadcrumb. Operators reading the
+            # diagnostic trace were confused into thinking the per-tier
+            # skip was a different condition. We keep the guard (the
+            # behavior is unchanged) but drop the per-tier skip log.
             if not pos.baseline_set_realized or pos.baseline_realized_price is None:
-                self._tN_skip_log(
-                    "engine.tN_skip_t1_not_yet_filled",
-                    tier=tier.tier, mid=mid_price,
-                    baseline_target=pos.baseline_target_price,
-                    note="T2/T3 averaging gated until T1 has at least one "
-                         "confirmed fill — drop is measured from realized "
-                         "entry, not the pre-fill strategy bid",
-                )
                 continue
             if tier.is_complete:
                 # H-NEW-2026-07-11 (audit v6-12): was silent. Without this
@@ -1211,6 +1233,47 @@ class StrategyEngine:
 
         pos = self._round.position
         if not pos.entry_token or pos.total_qty <= 0:
+            return
+
+        # R6 (audit 2026-07-12): avg_cost sanity gate.
+        #
+        # tp_target() = _avg_cost * (1 + tp_pct) drives the entire TP fire
+        # line. If `_avg_cost` is stale or partially reconciled, the SELL
+        # GTD would post at the wrong price — too low and we leave money
+        # on the table, too high and the SELL sits unfilled while uPnL
+        # bleeds.
+        #
+        # Cross-check: every tier contributes `tier.size_filled` shares
+        # and `tier.cost_filled` USDC. If the TierWatcher has caught fills
+        # the WS path missed and reconciled them via
+        # `apply_tier_watcher_result`, the per-tier totals reflect them.
+        # If we have `_total_qty < sum(tier.size_filled) - slack` the
+        # position aggregate is *behind* at least one tier — the TierWatcher
+        # is mid-reconcile, and the TP target we would compute is
+        # potentially off by the missing cost basis.
+        #
+        # `slack = 1e-6 * max(_total_qty, 1.0)` tolerates FP rounding
+        # without dropping a real 6+ share gap (which would mean a TP
+        # fired against a partial position view).
+        sum_tier_qty = sum(t.size_filled for t in pos.tiers)
+        qty_slack = max(1e-6 * max(pos.total_qty, 1.0), 1e-9)
+        if sum_tier_qty - pos.total_qty > qty_slack:
+            log.warning(
+                "engine.tp_blocked_avg_cost_unreconciled",
+                total_qty=pos.total_qty,
+                sum_tier_qty=sum_tier_qty,
+                qty_gap=sum_tier_qty - pos.total_qty,
+                tiers_qty={
+                    f"T{t.tier}": {
+                        "placed_qty": t.placed_qty,
+                        "size_filled": t.size_filled,
+                        "watching": t.watching,
+                        "is_complete": t.is_complete,
+                    } for t in pos.tiers
+                },
+                note="tp_target is _avg_cost-driven; deferring TP until "
+                     "TierWatcher reconciles the missing shares (R6 audit).",
+            )
             return
 
         # H-NEW-2026-07-11 (audit v6-12 production revisit): backoff after

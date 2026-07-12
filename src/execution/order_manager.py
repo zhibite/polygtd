@@ -1043,6 +1043,22 @@ class OrderManager:
         SELL while bot still believed it held 5 DOWN tokens; the real
         sell executed on the UI side without ever being reflected in
         OrderManager.
+
+        R8 (audit 2026-07-12): this method handles CLOB-ORDER lifetime
+        cleanup only — it does NOT replay historical fills into the
+        engine's position state. That gap is closed by `on_new_round`
+        constructing a fresh `Position()` per round (each Tier 1..3
+        starts at size_filled=0). The trade-off: any fills that
+        occurred during the previous round and were never reflected
+        in the engine before the bot restarted are accepted as "gone"
+        on the next round — we re-arm fresh entries off the new
+        mid. This is intentional because reconstructing pre-restart
+        fills would require reading CLOB trade history filtered by
+        market, which (a) adds latency at boot and (b) is prone to
+        double-count races with the WS TRADE channel that fires as
+        soon as User Channel subscribes. The v7 audit test
+        `test_r8_on_new_round_resets_position_state` pins the
+        invariant that no previous-round flag leaks across.
         """
         if self._startup_reconciled:
             return
@@ -1244,7 +1260,33 @@ class OrderManager:
         size_matched: float,
         fill_price: float | None = None,
     ) -> None:
-        """Update matched size for a GTD order and report any newly-completed status."""
+        """Update matched size for a GTD order and report any newly-completed status.
+
+        R7 (audit 2026-07-12): this method is the MIRROR-ONLY path used by
+        the WS UPDATE and TierWatcher-resync feeds. It deliberately does
+        NOT call `eng.on_order_filled` — that path is reserved for the
+        WS TRADE callback which carries per-trade deltas (and is deduped
+        by trade_id). Accidentally calling apply_fill_event followed by
+        eng.on_order_filled on the SAME delta would double-count
+        (size_filled += delta twice, _total_qty += delta twice). The
+        `__call_mirror_only` assertion at exit makes that regression a
+        hard failure in tests rather than a silent accounting drift.
+
+        Constraints:
+          * `size_matched` is MONOTONIC — must not regress.
+          * `size_matched` carries the cumulative matched shares straight
+            from CLOB; a negative or NaN input is treated as garbage.
+        """
+        # R7: sanity checks (cheap, fail-loud).
+        if size_matched < 0 or size_matched != size_matched:  # NaN-safe
+            log.warning(
+                "order_manager.apply_fill_event.invalid_size",
+                server_id=server_order_id[:16],
+                size_matched=size_matched,
+                note="ignoring non-monotonic / NaN size_matched feed",
+            )
+            return
+
         order = self.by_server_id(server_order_id)
         if not order:
             # H-NEW-1 fix: if CLOBClient pre-registered a sentinel
