@@ -883,28 +883,10 @@ class StrategyEngine:
         # gating is the caller's responsibility (see _evaluate line ~595).
 
         if pos._tp_inflight:
-            # ── DIAG-2026-07-11: log silent early-return ──────────────
-            log.warning(
-                "engine.t2_diag.silent_return_tp_inflight",
-                tp_inflight=pos._tp_inflight,
-                entry_token=pos.entry_token[:32] if pos.entry_token else None,
-                mid=self._pc.get_midpoint(pos.entry_token) if pos.entry_token else 0.0,
-                total_qty=pos._total_qty,
-            )
             return
 
         mid_price = self._pc.get_midpoint(pos.entry_token)
         if mid_price <= 0:
-            # ── DIAG-2026-07-11: log silent early-return ──────────────
-            _ck = list(self._pc.midpoint.keys())
-            log.warning(
-                "engine.t2_diag.silent_return_mid_zero",
-                entry_token=pos.entry_token[:32] if pos.entry_token else None,
-                cache_key_match=pos.entry_token in self._pc.midpoint if pos.entry_token else False,
-                cache_keys_count=len(_ck),
-                cache_first_key=_ck[0][:32] if _ck else None,
-                cache_first_mid=self._pc.midpoint[_ck[0]] if _ck else None,
-            )
             return
 
         # ── DIAG-2026-07-11: trace why T2 averaging never fires ────────────
@@ -1371,8 +1353,28 @@ class StrategyEngine:
         # H-NEW-2026-07-11: pass tp_target as the GTD limit (not bid_price).
         # The SELL GTD posts at tp_target exactly; the watcher waits for
         # the maker to be lifted by a taker crossing tp_target.
-        await self._handler(ActionTakeProfit(
-            token=pos.entry_token,
-            price=tp_target,
-            qty=pos.total_qty,
-        ))
+        #
+        # H-NEW-2026-07-12 (mutex-leak guard): the post-mutex is held
+        # across the action emission so that a re-entrant `_evaluate`
+        # tick cannot stack a duplicate TP within the same `_eval_inflight`
+        # window. On the SUCCESS path the watcher (or router
+        # `notify_tp_post_error`) is responsible for releasing it. On
+        # ANY exception path (including `asyncio.CancelledError`,
+        # subclass of `BaseException`) we release it here so a bot-side
+        # crash, router-dispatch failure, or task cancellation cannot
+        # wedge `_check_average_down` into the silent-return path for
+        # the rest of the round.
+        try:
+            await self._handler(ActionTakeProfit(
+                token=pos.entry_token,
+                price=tp_target,
+                qty=pos.total_qty,
+            ))
+        except BaseException:
+            # Any failure (Exception or CancelledError) — drop the mutex
+            # before propagating so the next tick can re-evaluate. The
+            # CLOB order, if one was already POSTed, lives on until the
+            # watcher (or GTD expiry) tears it down — this guard is only
+            # about the in-memory state machine.
+            pos._tp_inflight = False
+            raise
