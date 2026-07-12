@@ -269,8 +269,14 @@ async def test_h3_v2_average_down_uses_target_price() -> None:
     eng._gate = _StubGate()
     eng._bc = _StubBinanceCache()
 
-    # Mid sits at 0.30 — well below both possible triggers, T2 must fire.
-    eng._pc = _StubPriceCache(mid=0.30, bid=0.30)
+    # Mid sits at 0.25 — well below both possible triggers, T2 must fire.
+    # H-NEW-2026-07-11-4: with the 3-tier cap TIER2_DROP_PCT=0.30, the
+    # target-derived fire line is 0.40 * 0.70 = 0.28. We use 0.25 so
+    # the test stays below both the target-derived (0.28) and the
+    # baseline-derived (0.45 * 0.80 = 0.36) fire lines, matching the
+    # test's intent: regardless of which baseline the engine uses, T2
+    # must fire at this mid.
+    eng._pc = _StubPriceCache(mid=0.25, bid=0.25)
 
     captured: list[Any] = []
 
@@ -280,7 +286,7 @@ async def test_h3_v2_average_down_uses_target_price() -> None:
     eng._s = type("S", (), {
         "TIER2_NOTIONAL": 2.0,
         "TIER3_NOTIONAL": 4.0,
-        "TIER4_NOTIONAL": 8.0,
+        # H-NEW-2026-07-11-4: TIER4_NOTIONAL removed (3-tier cap).
         "TIER_NOTIONAL_MAX_MULT": 1.1,
     })()
 
@@ -328,7 +334,7 @@ async def test_h3_v2_average_down_does_not_over_trigger_on_slippage() -> None:
     eng._s = type("S", (), {
         "TIER2_NOTIONAL": 2.0,
         "TIER3_NOTIONAL": 4.0,
-        "TIER4_NOTIONAL": 8.0,
+        # H-NEW-2026-07-11-4: TIER4_NOTIONAL removed (3-tier cap).
         "TIER_NOTIONAL_MAX_MULT": 1.1,
     })()
 

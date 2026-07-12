@@ -418,20 +418,32 @@ class UserWS:
         # row doesn't accidentally appear as "MAKER" by repeating the taker
         # order in both fields.
         # Each candidate is one row from maker_orders[] (or the taker row).
-        # Tuple layout: (order_id, asset_id, matched_amount, maker_price).
-        # The asset_id and matched_amount are the AUTHORITATIVE values for
-        # THIS maker row — never to be silently swapped for the top-level
-        # trade values. maker_price is the row's own matched price (often
-        # == top-level taker price for the simplest case, but always trust
-        # the row when present so we attribute per-maker correctly).
+        # Tuple layout: (order_id, asset_id, matched_amount, maker_price,
+        #                rest_filled_size). The asset_id and matched_amount
+        # are the AUTHORITATIVE values for THIS maker row — never to be
+        # silently swapped for the top-level trade values. maker_price is
+        # the row's own matched price (often == top-level taker price for
+        # the simplest case, but always trust the row when present so we
+        # attribute per-maker correctly). rest_filled_size is the latest
+        # REST `get_order` size_matched for this candidate — used as the
+        # AUTHORITATIVE fallback when the WS payload's maker row doesn't
+        # carry an amount (which happens on `trader_side=MAKER` events
+        # where polymarket collapses the maker row's amount field).
         # H-NEW-2026-07-11 (audit, prod 14:03 round): prior code used
         # `fill.price` / `fill.size` from the top-level TRADE event, which
         # describe the TAKER side. When our maker is one of many makers
         # in the same trade, this overcounts our shares by the ratio
         # (taker_total / our_maker_amount) and uses the wrong-side price
         # (e.g. we BUY DOWN @0.32, taker BUY UP, top_price=UP price).
+        # H-NEW-2026-07-11-2 (audit, prod 14:30 round): even the
+        # maker-row amount can be 0 when the WS event's `trader_side` is
+        # MAKER and the maker row's amount field is collapsed. The router
+        # then fell back to `fill.size` (= taker side) and over-counted
+        # again. The REST fallback per candidate provides an
+        # order-specific authoritative size.
         seen: set[str] = set()
-        candidates: list[tuple[str, str, float, float]] = []  # (oid, aid, amt, price)
+        candidates: list[tuple[str, str, float, float, float]] = []
+        # (oid, aid, amt, price, rest_filled_size)
 
         def _add_candidate(oid: str, aid: str, amt: float, mprice: float = 0.0) -> None:
             if not oid:
@@ -439,7 +451,9 @@ class UserWS:
             if oid in seen:
                 return
             seen.add(oid)
-            candidates.append((oid, aid or "", float(amt or 0), float(mprice or 0)))
+            candidates.append(
+                (oid, aid or "", float(amt or 0), float(mprice or 0), 0.0)
+            )
 
         if taker_order_id:
             _add_candidate(taker_order_id, top_asset_id, top_size, top_price)
@@ -469,40 +483,64 @@ class UserWS:
             )
             return
 
-        # ----- REST size fallback (H-V6-12):
-        # When top-level size is 0 but the trade status is MATCHED/MINED/CONFIRMED,
-        # the WS payload's size field is unreliable. Recover the
-        # authoritative filled-size from REST per candidate. The first
-        # candidate with a successful REST return that yields a positive
-        # delta wins (M-2 cumulative→delta dedupe is applied per order_id).
-        effective_size = top_size
-        if effective_size <= 0 and status in ("MATCHED", "MINED", "CONFIRMED"):
-            for oid, _aid, _amt, _mp in candidates:
-                filled = await self._rest_filled_size(oid)
-                if filled and filled > 0:
-                    prev_cum = self._last_rest_cumulative.get(oid, 0.0)
-                    delta = filled - prev_cum
-                    if delta > 0:
-                        effective_size = delta
-                        self._last_rest_cumulative[oid] = filled
-                        log.info(
-                            "user_ws.rest_filled_size",
-                            order_id=oid[:16],
-                            cumulative=filled,
-                            delta=delta,
-                            prev_cumulative=prev_cum,
-                        )
-                        break
-                    # delta == 0 → already-accounted re-fire; keep looking.
+        # ----- REST size fallback (H-V6-12 + H-NEW-2026-07-11-2):
+        # For each candidate that has no amount from the WS payload
+        # (mo_amount == 0), recover the AUTHORITATIVE size_matched from
+        # CLOB REST get_order. This is the same trick polymart3 uses for
+        # its MATCHED-no-fills recovery path. We populate candidates[i][4]
+        # so the router can pick the right per-candidate value instead
+        # of falling back to the top-level fill.size (which is the TAKER
+        # side and overcounts our maker).
+        for i, (oid, _aid, amt, _mp, _rest) in enumerate(candidates):
+            if amt > 0:
+                continue
+            if status not in ("MATCHED", "MINED", "CONFIRMED"):
+                continue
+            filled = await self._rest_filled_size(oid)
+            if filled is None or filled <= 0:
+                continue
+            prev_cum = self._last_rest_cumulative.get(oid, 0.0)
+            delta = max(0.0, filled - prev_cum)
+            if delta <= 0:
+                # Already accounted for this trade's REST delta — skip.
+                continue
+            self._last_rest_cumulative[oid] = filled
+            # Replace candidate's amount with the REST cumulative so the
+            # router can use it directly. (router applies monotonic max
+            # against tracked.size_matched; using cumulative is correct.)
+            candidates[i] = (
+                oid,
+                candidates[i][1],
+                filled,
+                candidates[i][3],
+                delta,
+            )
+            log.info(
+                "user_ws.rest_filled_size",
+                order_id=oid[:16],
+                cumulative=filled,
+                delta=delta,
+                prev_cumulative=prev_cum,
+                mo_amount_was_zero=True,
+            )
 
-        # Hard gate: zero size means no fill. Emit a breadcrumb and skip
-        # the callback. Doing so here (rather than relying on the router's
-        # downstream skip path) preserves the invariant that any callback
-        # we deliver has authoritative, positive volume.
+        # ----- Top-level effective_size (legacy gate only):
+        # effective_size is still used for the zero-fill hard gate. We
+        # compute it from the largest authoritative candidate value when
+        # top-level is 0, but the real routing uses chosen[2] / chosen[4].
+        effective_size = top_size
+        if effective_size <= 0:
+            for _oid, _aid, amt, _mp, _rest in candidates:
+                if amt > 0:
+                    effective_size = amt
+                    break
+
+        # Hard gate: zero size across the board means no fill. Emit a
+        # breadcrumb and skip the callback.
         if effective_size <= 0:
             log.debug(
                 "user_ws.trade.zero_size",
-                candidates=[oid[:16] for oid, _, _, _ in candidates],
+                candidates=[oid[:16] for oid, _, _, _, _ in candidates],
                 trader_side_hint=trader_side_hint or "UNKNOWN",
                 top_size=top_size, status=status,
             )
@@ -533,7 +571,7 @@ class UserWS:
             asset_id=(candidates[0][1] or top_asset_id)[:16],
             side=top_side,
             trader_side_hint=trader_side_hint or "UNKNOWN",
-            candidates=[oid[:16] for oid, _, _, _ in candidates],
+            candidates=[oid[:16] for oid, _, _, _, _ in candidates],
             top_size=top_size,
             status=status,
         )

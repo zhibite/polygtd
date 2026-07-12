@@ -850,11 +850,55 @@ class StrategyEngine:
         # gating is the caller's responsibility (see _evaluate line ~595).
 
         if pos._tp_inflight:
+            # ── DIAG-2026-07-11: log silent early-return ──────────────
+            log.warning(
+                "engine.t2_diag.silent_return_tp_inflight",
+                tp_inflight=pos._tp_inflight,
+                entry_token=pos.entry_token[:32] if pos.entry_token else None,
+                mid=self._pc.get_midpoint(pos.entry_token) if pos.entry_token else 0.0,
+                total_qty=pos._total_qty,
+            )
             return
 
         mid_price = self._pc.get_midpoint(pos.entry_token)
         if mid_price <= 0:
+            # ── DIAG-2026-07-11: log silent early-return ──────────────
+            _ck = list(self._pc.midpoint.keys())
+            log.warning(
+                "engine.t2_diag.silent_return_mid_zero",
+                entry_token=pos.entry_token[:32] if pos.entry_token else None,
+                cache_key_match=pos.entry_token in self._pc.midpoint if pos.entry_token else False,
+                cache_keys_count=len(_ck),
+                cache_first_key=_ck[0][:32] if _ck else None,
+                cache_first_mid=self._pc.midpoint[_ck[0]] if _ck else None,
+            )
             return
+
+        # ── DIAG-2026-07-11: trace why T2 averaging never fires ────────────
+        # Logs every tick after the silent early-returns so we can see
+        # whether the function falls through to trigger_tN or gets stuck
+        # upstream. Safe to delete once the bug is located.
+        try:
+            _cache_keys = list(self._pc.midpoint.keys())
+            log.info(
+                "engine.t2_diag",
+                entry_token=pos.entry_token[:32] if pos.entry_token else None,
+                cache_key_match=pos.entry_token in self._pc.midpoint if pos.entry_token else False,
+                cache_keys_count=len(_cache_keys),
+                cache_first_key=_cache_keys[0][:32] if _cache_keys else None,
+                cache_first_mid=self._pc.midpoint[_cache_keys[0]] if _cache_keys else None,
+                mid=mid_price,
+                tp_inflight=pos._tp_inflight,
+                baseline_realized=pos.baseline_realized_price,
+                baseline_set_realized=pos.baseline_set_realized,
+                baseline_target=pos.baseline_target_price,
+                tier2_placed=pos.tiers[1].placed,
+                tier2_watching=pos.tiers[1].watching,
+                tier2_is_complete=pos.tiers[1].is_complete,
+                tier2_server_id=pos.tiers[1].server_order_id,
+            )
+        except Exception as _diag_exc:
+            log.warning("engine.t2_diag.error", error=str(_diag_exc))
 
         # Baseline anchoring (unchanged from H-V6-14 — realized price wins
         # once T1 has any fill, else target/legacy fallback).
@@ -901,7 +945,7 @@ class StrategyEngine:
         s = self._s
         margin = self._get_price_pre_margin()
 
-        for tier in pos.tiers[1:]:  # T2, T3, T4
+        for tier in pos.tiers[1:]:  # T2, T3 (3-tier cap — H-NEW-2026-07-11-4)
             if tier.is_complete:
                 # H-NEW-2026-07-11 (audit v6-12): was silent. Without this
                 # breadcrumb an operator cannot distinguish "tier already

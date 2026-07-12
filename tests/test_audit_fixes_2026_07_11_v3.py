@@ -386,7 +386,7 @@ async def test_h_new_2_avg_down_skipped_when_tp_inflight() -> None:
     eng._s = type("S", (), {
         "TIER2_NOTIONAL": 2.0,
         "TIER3_NOTIONAL": 4.0,
-        "TIER4_NOTIONAL": 8.0,
+        # H-NEW-2026-07-11-4: TIER4_NOTIONAL removed (3-tier cap).
         "TIER_NOTIONAL_MAX_MULT": 1.1,
     })()
 
@@ -414,7 +414,10 @@ async def test_h_new_2_avg_down_resumes_after_tp_completes() -> None:
     eng._round = type("R", (), {"position": pos})()
     eng._gate = _StubGate()
     eng._bc = _StubBinanceCache()
-    eng._pc = _StubPriceCache(mid=0.30, bid=0.30)  # below T2 trigger (0.32)
+    eng._pc = _StubPriceCache(mid=0.25, bid=0.25)  # below T2 trigger
+    # H-NEW-2026-07-11-4: with the 3-tier cap TIER2_DROP_PCT=0.30, the
+    # target-derived fire line is 0.40 * 0.70 = 0.28. Lowered from 0.30
+    # to 0.25 so the test stays below the new fire line.
 
     captured: list[Any] = []
     async def handler(action):
@@ -423,7 +426,7 @@ async def test_h_new_2_avg_down_resumes_after_tp_completes() -> None:
     eng._s = type("S", (), {
         "TIER2_NOTIONAL": 2.0,
         "TIER3_NOTIONAL": 4.0,
-        "TIER4_NOTIONAL": 8.0,
+        # H-NEW-2026-07-11-4: TIER4_NOTIONAL removed (3-tier cap).
         "TIER_NOTIONAL_MAX_MULT": 1.1,
     })()
 

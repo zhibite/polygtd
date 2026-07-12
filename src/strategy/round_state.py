@@ -31,7 +31,7 @@ log = get_logger(__name__)
 
 @dataclass
 class TierSnapshot:
-    """State for a single martingale tier (T1..T4).
+    """State for a single martingale tier (T1..T3).
 
     Lifecycle:
         placed=False, watching=False   -> not yet sent
@@ -92,12 +92,12 @@ class TierSnapshot:
 
     @staticmethod
     def _next_tier_drop(tier: int) -> float | None:
-        """Drop-pct of the *next* tier, or None if this is the last tier (T4)."""
+        """Drop-pct of the *next* tier, or None if this is the last tier (T3)."""
         cfg = _s()
-        drops = cfg.tier_drop_pcts  # 0-indexed: drops[1]=T2, drops[2]=T3, drops[3]=T4
+        drops = cfg.tier_drop_pcts  # 0-indexed: drops[1]=T2, drops[2]=T3
         if tier >= len(drops):
             return None
-        return drops[tier]  # tier 1 -> drops[1] = T2's drop = 0.20, etc.
+        return drops[tier]  # tier 1 -> drops[1] = T2's drop = 0.30, etc.
 
     @property
     def fill_rate(self) -> float:
@@ -180,8 +180,14 @@ def _tier3_factory() -> TierSnapshot:
     return TierSnapshot(tier=3, notional=_s().TIER3_NOTIONAL)
 
 
-def _tier4_factory() -> TierSnapshot:
-    return TierSnapshot(tier=4, notional=_s().TIER4_NOTIONAL)
+def _tier3_factory() -> TierSnapshot:
+    return TierSnapshot(tier=3, notional=_s().TIER3_NOTIONAL)
+
+
+# H-NEW-2026-07-11-4 (simplification): _tier4_factory removed. The
+# strategy now caps at 3 tiers (T1 entry + T2 / T3 averaging layers).
+# Max total exposure = 2 + 4 + 8 = 14 USD per round. See
+# `StrategySettings.tier_notionals` for the configuration knobs.
 
 
 @dataclass
@@ -194,7 +200,7 @@ class Position:
     tier1: TierSnapshot = field(default_factory=_tier1_factory)
     tier2: TierSnapshot = field(default_factory=_tier2_factory)
     tier3: TierSnapshot = field(default_factory=_tier3_factory)
-    tier4: TierSnapshot = field(default_factory=_tier4_factory)
+    # H-NEW-2026-07-11-4: tier4 removed.
 
     baseline_price: float | None = None   # anchor: avg fill price after T1 fills
     baseline_set: bool = False             # becomes True once baseline_price is anchored
@@ -242,7 +248,11 @@ class Position:
 
     @property
     def tiers(self) -> list[TierSnapshot]:
-        return [self.tier1, self.tier2, self.tier3, self.tier4]
+        # H-NEW-2026-07-11-4: 3-tier cap — T1/T2/T3 only. The engine's
+        # averaging-down loop iterates `self.tiers[1:]` to walk the
+        # averaging chain. Returning T1-T3 here means it naturally
+        # stops at T3 with no further tier to trigger.
+        return [self.tier1, self.tier2, self.tier3]
 
     @property
     def has_inflight_tier(self) -> bool:
@@ -592,7 +602,11 @@ class Position:
 
     @property
     def tiers(self) -> list[TierSnapshot]:
-        return [self.tier1, self.tier2, self.tier3, self.tier4]
+        # H-NEW-2026-07-11-4: 3-tier cap — T1/T2/T3 only. The engine's
+        # averaging-down loop iterates `self.tiers[1:]` to walk the
+        # averaging chain. Returning T1-T3 here means it naturally
+        # stops at T3 with no further tier to trigger.
+        return [self.tier1, self.tier2, self.tier3]
 
 
     def apply_tier_watcher_result(
@@ -761,8 +775,8 @@ class Position:
             # H-NEW-2026-07-11 (audit v6-14): CROSSED must release the
             # in-flight mutex for downstream strategy decisions.
             #
-            # Production symptom (2026-07-11 13:32 round): when T3 BUY
-            # crossed into T4's zone and the watcher fell back to the
+            # Production symptom (2026-07-11 13:32 round): when T2 BUY
+            # crossed into T3's zone and the watcher fell back to the
             # CROSSED outcome, `tier.placed` stayed True forever. That
             # made `position.has_inflight_tier` permanently True, so
             # `_check_take_profit` would never fire even when mid moved
@@ -829,12 +843,15 @@ class Position:
             TP_pct = max(TP_MIN_PCT,
                          TP_PROFIT_PCT - N * TP_DECREMENT_PCT)
         where N = number of completed tiers beyond T1
-                 (T1 only → N=0; T1+T2 → N=1; ... T1..T4 → N=3).
+                 (T1 only → N=0; T1+T2 → N=1; T1..T3 → N=2).
+        3-tier cap: max decrement = 6% (N=2), so TP target never drops
+        below TP_PROFIT_PCT - 0.06 = 14% above avg_cost.
         """
         if self._avg_cost <= 0:
             return None
         cfg = _s()
-        # Count completed averaging tiers (tiers 2..4 that have fully filled).
+        # Count completed averaging tiers (T2 + T3 that have fully filled).
+        # With the 3-tier cap the max value here is 2.
         n = sum(1 for t in self.tiers[1:] if t.is_complete)
         tp_pct = cfg.TP_PROFIT_PCT - n * cfg.TP_DECREMENT_PCT
         tp_pct = max(cfg.TP_MIN_PCT, tp_pct)

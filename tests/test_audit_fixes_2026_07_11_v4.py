@@ -430,16 +430,18 @@ def test_h_v4_2_stake_cap_counts_inflight_notional() -> None:
     pos.record_fill(pos.tier1, price=0.40, size=5.0)
 
     assert pos._total_cost == pytest.approx(2.0)
-    assert pos.stake_cap_remaining == pytest.approx(14.0)  # 16 - 2
+    # H-NEW-2026-07-11-4: 3-tier cap. Total max exposure is 2+4+8=14 USD.
+    # 14 - 2 (T1 filled cost) = 12.
+    assert pos.stake_cap_remaining == pytest.approx(12.0)  # 14 - 2
 
     # Mark T2 as placed (in-flight) without any fill yet.
     pos.tier2.placed = True
     pos.tier2.server_order_id = "0xt2"
 
     # H-V4-2: stake_cap_remaining must use total_notional_committed,
-    # which now includes T2's notional (2.0). 16 - (2 + 2) = 12.
-    assert pos.total_notional_committed == pytest.approx(4.0)
-    assert pos.stake_cap_remaining == pytest.approx(12.0), (
+    # which now includes T2's notional (4.0). 14 - (2 + 4) = 8.
+    assert pos.total_notional_committed == pytest.approx(6.0)
+    assert pos.stake_cap_remaining == pytest.approx(8.0), (
         "H-V4-2 violation: stake_cap_remaining did not account for "
         "T2's in-flight notional. Use total_notional_committed, not "
         "_total_cost."
@@ -454,7 +456,8 @@ def test_h_v4_2_stake_cap_no_inflight_unchanged() -> None:
     pos.tier1.size_expected = 5.0
     pos.record_fill(pos.tier1, price=0.40, size=5.0)
     # No in-flight.
-    assert pos.stake_cap_remaining == pytest.approx(14.0)
+    # H-NEW-2026-07-11-4: 3-tier cap. 14 - 2 (T1 filled) = 12.
+    assert pos.stake_cap_remaining == pytest.approx(12.0)
 
 
 # ---------------------------------------------------------------------------
@@ -553,7 +556,8 @@ async def test_m_v4_2_stale_tier_resets_and_refires() -> None:
     eng._round = type("R", (), {"position": pos})()
     eng._gate = _StubGate2()
     eng._bc = _StubBinanceCache2()
-    eng._pc = _StubPriceCache2(mid=0.30, bid=0.30)  # below T2 trigger
+    eng._pc = _StubPriceCache2(mid=0.25, bid=0.25)  # below T2 trigger
+    # H-NEW-2026-07-11-4: 3-tier cap. TIER2_DROP_PCT=0.30 → fire_line=0.28.
 
     captured: list[Any] = []
     async def handler(action):
@@ -562,7 +566,7 @@ async def test_m_v4_2_stale_tier_resets_and_refires() -> None:
     eng._s = type("S", (), {
         "TIER2_NOTIONAL": 2.0,
         "TIER3_NOTIONAL": 4.0,
-        "TIER4_NOTIONAL": 8.0,
+        # H-NEW-2026-07-11-4: TIER4_NOTIONAL removed (3-tier cap).
         "TIER_NOTIONAL_MAX_MULT": 1.1,
     })()
 
@@ -608,7 +612,7 @@ async def test_m_v4_2_valid_inflight_tier_still_skipped() -> None:
     eng._s = type("S", (), {
         "TIER2_NOTIONAL": 2.0,
         "TIER3_NOTIONAL": 4.0,
-        "TIER4_NOTIONAL": 8.0,
+        # H-NEW-2026-07-11-4: TIER4_NOTIONAL removed (3-tier cap).
         "TIER_NOTIONAL_MAX_MULT": 1.1,
     })()
 
