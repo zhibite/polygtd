@@ -266,7 +266,7 @@ class TierWatcher:
                 pass
 
     def _maybe_complete_via_update(self) -> bool:
-        """If WS already pushed a size_matched ≥ expected_size, return True
+        """If WS already pushed a size_matched >= expected_size, return True
         and the caller should emit FILLED without re-reading the balance.
 
         H-NEW-2026-07-15: the cutoff is `>= expected_size` (full fill), not
@@ -274,6 +274,12 @@ class TierWatcher:
         terminal conditions (the GTD is fully matched). Mid-fill policy
         (e.g. "we've reached 90%, declare done and cancel the residual")
         is owned by the strategy tick.
+
+        H-NEW-2026-07-15 (fix): when the WS path short-circuits to FILLED,
+        the caller MUST also read the authoritative `avg_price` from the CLOB
+        REST API so the position accumulates at the real cost basis rather
+        than the strategy price. Call `_ensure_avg_price_for_ws_fast_fill()`
+        after this returns True.
 
         Idempotent and side-effect-free except on the actual terminal-state
         emission path (which is guarded by _fire_complete_called).
@@ -283,6 +289,25 @@ class TierWatcher:
         if self._fire_complete_called:
             return True  # already done
         return self._last_size_matched + 1e-9 >= self._expected_size
+
+    async def _ensure_avg_price_for_ws_fast_fill(self) -> None:
+        """Fill _avg_price_running from CLOB REST when WS fast-fill fired
+        without a prior REST observation.
+
+        Call this ONLY when _maybe_complete_via_update() returned True and
+        _avg_price_running is still None (i.e. no REST read ever ran before
+        the WS update arrived). The REST call gives us the authoritative
+        average fill price so the position accumulates at the true cost basis.
+        """
+        if self._avg_price_running is not None:
+            return
+        fs = await self._read_fill_state()
+        if not fs:
+            return
+        self._last_size_matched = fs.get("size_matched", self._last_size_matched)
+        avg = fs.get("avg_price", 0.0)
+        if avg > 0:
+            self._avg_price_running = avg
 
     async def _run(self) -> None:
         """Main loop. One watcher = one GTD = one terminal state."""
@@ -394,6 +419,12 @@ class TierWatcher:
             # apply_tier_watcher_result without double-counting
             # (the engine already credited the fill).
             if self._maybe_complete_via_update():
+                # H-NEW-2026-07-15 (fix): when the WS update fires the fast-fill
+                # path without a prior REST observation, we MUST read the CLOB's
+                # authoritative avg_price so the position accumulates at the true
+                # cost basis (not the strategy price). Fallback to strategy_price
+                # only if the REST call fails.
+                await self._ensure_avg_price_for_ws_fast_fill()
                 cancel_sent = await self._safe_cancel()
                 self._result = WatcherResult(
                     outcome=TierOutcome.FILLED,
@@ -404,7 +435,11 @@ class TierWatcher:
                     expected_size=self._expected_size,
                     filled_qty=self._last_size_matched,
                     cancel_sent=cancel_sent,
-                    avg_fill_price=self._strategy_price,
+                    avg_fill_price=(
+                        self._avg_price_running
+                        if self._avg_price_running is not None
+                        else self._strategy_price
+                    ),
                     dedup_key=self._dedup_key(TierOutcome.FILLED),
                 )
                 log.info(
@@ -412,6 +447,7 @@ class TierWatcher:
                     server_id=self._server_order_id[:16],
                     side=self._side,
                     size_matched=self._last_size_matched,
+                    avg_price=self._avg_price_running,
                     expected=self._expected_size,
                     cancel_sent=cancel_sent,
                 )
