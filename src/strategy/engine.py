@@ -1352,6 +1352,25 @@ class StrategyEngine:
         # without dropping a real 6+ share gap (which would mean a TP
         # fired against a partial position view).
         sum_tier_qty = sum(snap.tier_size_filled)
+        # H-NEW-2026-07-15 (fix): check near-zero position BEFORE the
+        # tier-reconciliation gap check. After a TP sell drains the inventory
+        # the position may retain an FP residual (e.g. 0.004596 from pro-rata
+        # cost removal). This is NOT a reconciled-tier mismatch — the position
+        # IS empty. Without this guard the engine logs
+        # tp_blocked_avg_cost_unreconciled every tick for the rest of the round.
+        # Threshold 1e-2 = 0.01. This is:
+        #   - well below the smallest real position (T1 qty >= 2.0 tokens)
+        #   - above the FP residual (~0.0046) from TP sell pro-rata arithmetic
+        #   - above the ~0.00003 FP rounding slack from per-tier cost accumulation
+        #   So: real positions pass through, FP residuals trigger the guard.
+        # Type guard: skip in tests where pos._total_qty may be a MagicMock.
+        qty: float = pos._total_qty
+        if isinstance(qty, float) and qty < 1e-2:
+            pos.realize_position_closed(
+                source="engine._check_take_profit",
+                note="total_qty near zero after TP fill; clearing residual state",
+            )
+            return
         qty_slack = max(1e-6 * max(snap.total_qty, 1.0), 1e-9)
         if sum_tier_qty - snap.total_qty > qty_slack:
             log.warning(

@@ -377,6 +377,51 @@ async def test_r6_tp_fires_when_position_aggregate_is_consistent():
     )
 
 
+@pytest.mark.asyncio
+async def test_r6_no_deadloop_warning_when_position_empty_after_tp():
+    """Regression: after a TP sell fully exits the position, _total_qty may
+    retain a floating-point residual (e.g. 0.004596) due to FP arithmetic.
+    This is NOT a reconciled-tier mismatch — the position IS empty.
+    _check_take_profit must NOT log tp_blocked_avg_cost_unreconciled every
+    tick; it must detect near-zero total_qty and call realize_position_closed
+    to silence the warning loop.
+
+    Bug symptom (prod 2026-07-15): TP filled at 06:01:19, position effectively
+    empty, but engine continued logging tp_blocked_avg_cost_unreconciled at 4 Hz
+    for the remainder of the round.
+    """
+    from src.strategy.round_state import Position
+
+    pos = Position()
+    pos.entry_token = "tok"
+    pos.entry_side = "UP"
+    # Simulate post-TP state: _total_qty has FP residual, tiers still have
+    # their fill records (normal — they are historical), but no inventory.
+    pos._total_qty = 0.004596000000001155  # FP residual from TP sell
+    pos._total_cost = 0.0
+    pos._avg_cost = 0.0
+    pos.tier1.size_filled = 5.0
+    pos.tier1.filled = True
+    pos.tier2.size_filled = 10.13
+    pos.tier2.filled = True
+    pos._tp_inflight = False
+
+    # Wire mid well above fire_line so tp_blocked would fire if not guarded.
+    eng = _build_engine_for_tp_check(pos, mid_price=0.50)
+    # Track whether realize_position_closed was called.
+    from unittest.mock import patch
+    with patch.object(pos, 'realize_position_closed', wraps=pos.realize_position_closed) as mock_rpc:
+        await eng._check_take_profit(0.0)
+        assert mock_rpc.call_count == 1, (
+            f"Expected realize_position_closed called once, got {mock_rpc.call_count}"
+        )
+
+    # Must NOT fire a TP action (position is empty).
+    assert eng._captured == [], (
+        f"Expected 0 actions for empty position, got {eng._captured}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # R7: apply_fill_event rejects NaN / negative size_matched
 # ---------------------------------------------------------------------------
