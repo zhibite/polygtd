@@ -14,7 +14,6 @@ import pytest
 from src.execution.clob_client import CLOBClient, FillResult
 from src.execution.order_manager import (
     OrderManager,
-    TP_FALLBACK_BUFFER_S,
     TP_GTD_LIFETIME_S,
     TrackedOrder,
 )
@@ -229,59 +228,6 @@ async def test_h1_tp_runner_crash_releases_inflight_mutex() -> None:
     await asyncio.sleep(0.05)
     # the spawned task should release _tp_inflight on the simulated crash
     assert pos._tp_inflight is False
-
-
-# ---------------------------------------------------------------------------
-# H-4: stage error tags returned by place_tp_with_fallback
-# ---------------------------------------------------------------------------
-
-
-class _FakeClobH4:
-    """Two-stage fake: GTD post fails, then FAK fills."""
-
-    def __init__(self) -> None:
-        self.place_gtd_sell_calls = 0
-        self.place_fak_sell_calls = 0
-
-    async def place_gtd_sell(self, **kw):
-        self.place_gtd_sell_calls += 1
-        return FillResult("", 0, 0, 0.50, False, "gtd_post_failed")
-
-    async def place_fak_sell(self, **kw):
-        self.place_fak_sell_calls += 1
-        return FillResult(
-            order_id="0xFak",
-            tokens=10.0, usdc=5.0, fill_price=0.50, success=True,
-        )
-
-    async def _run(self, fn, *a, **kw):
-        return None
-
-
-@pytest.mark.asyncio
-async def test_h4_stage_error_tags_propagate() -> None:
-    fake = _FakeClobH4()
-    mgr = OrderManager.__new__(OrderManager)
-    mgr._clob = fake
-    mgr._lock = asyncio.Lock()
-    mgr._orders = {}
-    mgr._by_server = {}
-    mgr._pc = None
-    mgr._pm = None
-    mgr._s = type("S", (), {"GTD_LIFETIME_S": 120, "SELL_SLIPPAGE_PCT": 1.0})()
-    mgr._adjust_sell_price = AsyncNoop()  # type: ignore[assignment]
-
-    gtd, fak, gtd_err, fak_err = await mgr.place_tp_with_fallback(
-        token_id="t", size=10.0, price=0.50,
-        round_start_ts=int(time.time()),
-        tier_name="TP", tick_size=0.01,
-    )
-
-    assert gtd is None and fak is not None
-    assert gtd_err == "gtd_post_failed"
-    assert fak_err == ""  # success on FAK
-    assert fake.place_gtd_sell_calls == 1
-    assert fake.place_fak_sell_calls == 1
 
 
 # ---------------------------------------------------------------------------

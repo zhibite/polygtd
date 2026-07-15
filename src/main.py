@@ -55,6 +55,7 @@ from src.market.user_ws import UserWS
 from src.persistence.db import DB, init_db
 from src.strategy.engine import (
     Action,
+    ActionCancelTier,
     ActionOpenT1,
     ActionOpenTN,
     ActionTakeProfit,
@@ -278,13 +279,14 @@ class ActionRouter:
         strategy_price: float,
         size_expected: float,
         expires_at: float,
-        cross_threshold: float | None = None,
     ) -> TierWatcher:
         """Spawn a TierWatcher for a BUY tier's GTD and remember it.
 
-        `cross_threshold` = the next tier's pre-arm fire line. When the
-        watched token's mid drops at or below this line, the watcher
-        cancels the GTD early so the next tier can fire cleanly.
+        H-NEW-2026-07-15 tick-driven refactor: this watcher is now passive.
+        The previous `cross_threshold` parameter (which used to drive a
+        mid-cross → cancel-and-emit-CROSSED path) has been removed: the
+        strategy tick (`_reconcile_inflight_buys`) is the sole place that
+        decides when to cancel a BUY GTD. The watcher just observes.
 
         H-NEW-2026-07-11 (B-NEW-4): guard against accidental double-spawn
         by short-circuiting if a watcher for the same (round, tier) is
@@ -312,6 +314,127 @@ class ActionRouter:
             if not eng or not eng._round:
                 return
             tier_snap = eng._round.position.tiers[tier - 1]
+
+            # H-NEW-2026-07-12 (audit R10, double-count fix): when the watcher
+            # fast-fills on spawn (or reaches FILLED via balance-poll before
+            # the WS TRADE event arrives), it must NOT bypass OrderManager's
+            # mirror bookkeeping. Otherwise the WS TRADE event that lands
+            # 50-500 ms later finds `tracked.size_matched=0` and pushes a
+            # second `record_fill(tier, 0.33, 5.26)` after the watcher
+            # already set `tier.size_filled=5.26` via
+            # `apply_tier_watcher_result`'s missed-fill branch — the
+            # symptom is exactly the prod-1783855800 case:
+            #   cumulative_size: 0 → 5.26 (watcher_reconciled_missed_fills
+            #                          fill_px=0.38)
+            #                   → 10.52 (fill_recorded fill_price=0.33)
+            # i.e. a 5.26-share BUY ended up at total_qty=10.52.
+            #
+            # The fix: advance OrderManager's tracked.size_matched BEFORE
+            # letting apply_tier_watcher_result commit. OrderManager's
+            # monotonic-max guard (line 1315 of order_manager.py) means
+            # the WS TRADE event that follows sees prev=5.26 → delta=0
+            # and skips its own on_order_filled call. apply_tier_watcher_
+            # result's missed-fill branch (round_state.py line 691) ALSO
+            # short-circuits because `tier.size_filled == filled_qty`.
+            #
+            # We deliberately do NOT route through `clob._fire_fill_callback`
+            # here — that path's FillDeduper is per-site (each fill_callback
+            # install owns its own bookmark), so it doesn't see the WS TRADE
+            # site's observations, and using it would just push another
+            # record_fill on top of apply_tier_watcher_result's accumulation.
+            om = self._state.order_manager
+            if (
+                result.outcome.value in ("filled", "over_filled")
+                and om is not None
+                and result.server_order_id
+            ):
+                # Defence-in-depth dedup: WS TRADE may have already
+                # arrived (the watcher's spawn-time fast-fill races with
+                # the WS feed on the same tick). Mirror `_make_fill_callback`:
+                # only act on the delta above `tracked.size_matched`.
+                # Without this guard a late watcher event after a WS-first
+                # path would re-push the full `filled_qty` and the
+                # `record_fill` accumulator would double-count
+                # (size_filled 5.26 → 10.52).
+                tracked = om.by_server_id(result.server_order_id)
+                prev_size_matched = (
+                    tracked.size_matched if tracked else 0.0
+                )
+                effective_delta = (
+                    float(result.filled_qty) - prev_size_matched
+                )
+                if effective_delta <= 1e-9:
+                    # WS path already credited this fill (or even more
+                    # if the WS feed saw a later partial than the watcher's
+                    # final observation). Mirror `_make_fill_callback`'s
+                    # dedup contract: skip the engine call entirely to
+                    # avoid double-counting.
+                    pass
+                else:
+                    forward_price = result.avg_fill_price
+                    if not forward_price or forward_price <= 0:
+                        # Re-fetch the CLOB fill state — the original
+                        # `_read_fill_state` call inside the watcher's
+                        # fast-fill path frequently returns avg_price=0.0
+                        # because the fill_state endpoint's response
+                        # doesn't always carry the field; ~50 ms later
+                        # (when the matched ledger has caught up) the
+                        # same endpoint often does. This second REST
+                        # call is the difference between avg_cost=0.38
+                        # (strategy-price fallback) and avg_cost=0.33
+                        # (real maker-fill avg).
+                        clob = self._state.clob
+                        if clob is not None:
+                            try:
+                                fill_state = await clob.get_order_fill_state(
+                                    result.server_order_id
+                                )
+                                if fill_state:
+                                    fetched = float(
+                                        fill_state.get("avg_price", 0.0) or 0.0
+                                    )
+                                    if fetched > 0:
+                                        forward_price = fetched
+                            except Exception as exc:  # noqa: BLE001
+                                log.debug(
+                                    "router.on_done.avg_price_refetch_failed",
+                                    server_id=result.server_order_id[:16],
+                                    error=str(exc),
+                                )
+                    if not forward_price or forward_price <= 0:
+                        forward_price = result.strategy_price
+
+                    # Step 1: monotonic-mirror OrderManager to the
+                    # watcher's authoritative cumulative (5.26). This
+                    # also closes the WS-vs-watcher race by aligning
+                    # tracked.size_matched with what the watcher just
+                    # observed; any subsequent WS TRADE for the same
+                    # order will see this value and dedup out via
+                    # `_make_fill_callback`'s monotonic guard.
+                    om.apply_fill_event(
+                        result.server_order_id,
+                        size_matched=float(result.filled_qty),
+                        fill_price=float(forward_price),
+                    )
+                    # Step 2: feed engine position state with the DELTA
+                    # above whatever the WS path already credited
+                    # (effective_delta, NOT the watcher's full
+                    # filled_qty). This is what
+                    # `apply_tier_watcher_result`'s missed-fill branch
+                    # would have done for us, but emitting the delta
+                    # through `on_order_filled` instead keeps the
+                    # engine-side accounting (`record_fill`'s
+                    # `size_filled += size`, `cost_filled += price*size`)
+                    # authoritative on a single accumulator. After this
+                    # step, tier.size_filled is exactly
+                    # watcher.filled_qty.
+                    eng.on_order_filled(
+                        token_id,
+                        result.server_order_id,
+                        fill_price=float(forward_price),
+                        fill_size=float(effective_delta),
+                    )
+
             # H-NEW-2026-07-11: forward dedup_key + real avg_fill_price so
             # apply_tier_watcher_result can dedup terminal states across
             # multiple fan-in paths and price its missed-fill fix-up
@@ -323,9 +446,6 @@ class ActionRouter:
                 dedup_key=result.dedup_key,
                 avg_fill_price=result.avg_fill_price,
             )
-
-        async def mid_provider() -> float:
-            return self._state.price_cache.get_midpoint(token_id)
 
         def is_active() -> bool:
             eng = self._state.engine
@@ -407,9 +527,6 @@ class ActionRouter:
             expected_size=size_expected,
             expires_at=expires_at,
             poll_s=cfg.TIER_WATCHER_POLL_S,
-            fill_ratio=cfg.TIER_WATCHER_FILL_RATIO,
-            cross_threshold=cross_threshold,
-            mid_price_provider=mid_provider,
             on_complete=on_done,
             on_partial_fill=on_partial_fill,
             is_still_active=is_active,
@@ -463,9 +580,6 @@ class ActionRouter:
                 # tick can re-arm TP.
                 pos._tp_inflight = False
 
-        async def mid_provider() -> float:
-            return self._state.price_cache.get_midpoint(token_id)
-
         def is_active() -> bool:
             eng = self._state.engine
             return bool(eng and eng._round and eng._round.round_start_ts == round_start_ts)
@@ -479,9 +593,6 @@ class ActionRouter:
             expected_size=size,
             expires_at=expires_at,
             poll_s=cfg.TIER_WATCHER_POLL_S,
-            fill_ratio=cfg.TIER_WATCHER_FILL_RATIO,
-            cross_threshold=None,  # TP has no "next tier" — exits cleanly on fill
-            mid_price_provider=mid_provider,
             on_complete=on_done,
             is_still_active=is_active,
         )
@@ -541,16 +652,11 @@ class ActionRouter:
                 )
                 self._state.clob.fill_callback = self._make_fill_callback()
                 size_expected = order.placed_size if order.placed_size > 0 else (action.notional / action.price)
-                # T2 fire line: trigger_price(T2) * (1 + margin). We don't
-                # know the realised baseline yet, so use the design
-                # baseline (= action.price itself for T1; the engine sets
-                # baseline_target_price to action.price via bind).
-                # The watcher will compare against the live midpoint; if
-                # the next-tier zone hasn't dropped yet, it just keeps
-                # waiting — no harm.
-                margin = float(strategy().PRICE_PRE_MARGIN or 0.0)
-                t2_design_price = action.price * (1.0 - strategy().TIER2_DROP_PCT)
-                t2_fire = t2_design_price * (1.0 + margin)
+                # H-NEW-2026-07-15: tick-driven refactor. The watcher is
+                # passive — it does NOT receive a cross_threshold. Mid-cross
+                # cancellation is owned by the strategy tick
+                # (`StrategyEngine._reconcile_inflight_buys`). The spawn
+                # site just wires the order lifecycle owner.
                 self._spawn_tier_watcher(
                     round_start_ts=round_ts,
                     tier=1,
@@ -559,7 +665,6 @@ class ActionRouter:
                     strategy_price=order.price,
                     size_expected=size_expected,
                     expires_at=expires,
-                    cross_threshold=t2_fire,
                 )
                 log.info(
                     "router.t1_placed",
@@ -603,20 +708,11 @@ class ActionRouter:
                 )
                 self._state.clob.fill_callback = self._make_fill_callback()
                 size_expected = order.placed_size if order.placed_size > 0 else (action.notional / action.price)
-                # Next tier's fire line — only meaningful for T2/T3 (T4 is last).
-                cross_thr: float | None = None
-                if action.tier < 3:
-                    cfg = strategy()
-                    margin = float(cfg.PRICE_PRE_MARGIN or 0.0)
-                    drops = cfg.tier_drop_pcts
-                    # H-NEW-2026-07-11-4: 3-tier cap. action.tier < 3 means
-                    # this is T1 or T2 (action.tier ∈ {1, 2}); we are
-                    # computing the cross_threshold for the NEXT averaging
-                    # tier. tier2→tier3 is the last cross, so action.tier==2
-                    # is the boundary case that still gets a threshold.
-                    if action.tier < len(drops) and drops[action.tier] is not None:
-                        next_design = order.price * (1.0 - drops[action.tier])
-                        cross_thr = next_design * (1.0 + margin)
+                # H-NEW-2026-07-15: tick-driven refactor. The watcher is
+                # passive and no longer receives a cross_threshold. The
+                # strategy tick (`_reconcile_inflight_buys`) owns the
+                # decision to cancel a BUY GTD once mid drops into the
+                # next-tier zone. The watcher just observes lifecycle.
                 self._spawn_tier_watcher(
                     round_start_ts=round_ts,
                     tier=action.tier,
@@ -625,7 +721,6 @@ class ActionRouter:
                     strategy_price=order.price,
                     size_expected=size_expected,
                     expires_at=expires,
-                    cross_threshold=cross_thr,
                 )
                 log.info(
                     "router.tN_placed",
@@ -769,6 +864,121 @@ class ActionRouter:
             task = asyncio.create_task(_tp_runner())
             self._state._bg_tasks.add(task)
             task.add_done_callback(self._state._bg_tasks.discard)
+
+        elif isinstance(action, ActionCancelTier):
+            # H-NEW-2026-07-15 tick-driven refactor: the engine emits
+            # ActionCancelTier when its `_reconcile_inflight_buys` step
+            # decides a BUY GTD is no longer wanted (mid dropped into
+            # the next-tier zone, or mid rose into the TP fire zone).
+            # This is the SOLE BUY-side cancel path under the new model;
+            # the TierWatcher is passive and does not cancel on
+            # fill-ratio or mid-cross.
+            #
+            # H-NEW-2026-07-15 (audit follow-up — TP mid-retreated): the
+            # engine can ALSO emit ActionCancelTier with `tier=-1` as a
+            # sentinel meaning "this is a TP SELL GTD, cancel it because
+            # mid has retreated below the fire line". We dispatch to a
+            # separate code path that doesn't touch the BUY-tier
+            # TierSnapshot (BUY tiers don't own TP GTDs) and instead
+            # releases `pos._tp_inflight` so the next tick can re-arm.
+            #
+            # H-NEW-2026-07-15 (audit follow-up): optimistic release.
+            # Previously `placed` stayed True until the CLOB round-trip
+            # finished, opening a window in which mid could oscillate
+            # back above the next-tier fire line and have the engine
+            # re-fire `trigger_tN` for the same tier. Now we drop
+            # `placed` BEFORE awaiting the cancel so subsequent ticks
+            # cannot re-trigger downstream of a pending cancel. We
+            # always clear `cancel_pending` (success or failure) so a
+            # future legitimate cancel — e.g. an external force-close
+            # — is not lost behind a stale flag.
+            #
+            # ── TP path (tier=-1 sentinel) ─────────────────────────────
+            if action.tier < 0:
+                if eng._round is None:
+                    log.warning(
+                        "router.cancel_tp.no_round",
+                        server_id=action.server_order_id[:16],
+                        reason=action.reason,
+                    )
+                    return
+                pos = eng._round.position
+                # Release the mutex optimistically. The engine already
+                # cleared _tp_inflight in the mid-retreated branch; this
+                # is idempotent.
+                if pos._tp_inflight:
+                    pos._tp_inflight = False
+                ok = await om.cancel_by_server_id(
+                    action.server_order_id, reason=action.reason
+                )
+                if ok:
+                    log.info(
+                        "router.cancel_tp.done",
+                        server_id=action.server_order_id[:16],
+                        reason=action.reason,
+                    )
+                else:
+                    log.warning(
+                        "router.cancel_tp.failed",
+                        server_id=action.server_order_id[:16],
+                        reason=action.reason,
+                        note="mutex already released; GTD will sit on CLOB "
+                             "until natural expiry or the next reconcile",
+                    )
+                return
+
+            # ── BUY-tier path (tier in 1..4) ───────────────────────────
+            tier_idx = action.tier - 1
+            tier_snap = (
+                eng._round.position.tiers[tier_idx]
+                if eng._round and 0 <= tier_idx < len(eng._round.position.tiers)
+                else None
+            )
+            if tier_snap is None:
+                log.warning(
+                    "router.cancel_tier.invalid",
+                    tier=action.tier,
+                    server_id=action.server_order_id[:16] if action.server_order_id else "",
+                    reason="tier index out of range",
+                )
+                return
+            # Optimistic release: drop the placed flag now so a mid
+            # rebound on a subsequent tick doesn't try to re-trigger
+            # an averaging tier whose GTD is on its way out.
+            tier_snap.placed = False
+            tier_snap.watching = False
+            tier_snap.expires_at = 0.0
+            ok = await om.cancel_by_server_id(action.server_order_id, reason=action.reason)
+            # Always clear the cancel-pending latch, success or fail —
+            # the dispatch attempt is final from the engine's view
+            # (the engine checks `cancel_pending` to single-flight).
+            tier_snap.cancel_pending = False
+            if ok:
+                # We keep server_order_id so a late-arriving WS TRADE
+                # event can still attribute to this tier. The
+                # optimistic release already removed the placed flag,
+                # so has_inflight_tier() no longer counts this slot.
+                log.info(
+                    "router.cancel_tier.done",
+                    tier=action.tier,
+                    server_id=action.server_order_id[:16],
+                    reason=action.reason,
+                    size_filled=tier_snap.size_filled,
+                    size_expected=tier_snap.size_expected,
+                )
+            else:
+                # CLOB rejected the cancel — log it so operators can
+                # see the failure. `placed` is already False; the
+                # watcher's EXPIRED sweep will eventually fire terminal
+                # state and reconcile.
+                log.warning(
+                    "router.cancel_tier.failed",
+                    tier=action.tier,
+                    server_id=action.server_order_id[:16],
+                    reason=action.reason,
+                    size_filled=tier_snap.size_filled,
+                    size_expected=tier_snap.size_expected,
+                )
 
     def _make_fill_callback(self):
         """Create a fill callback that routes to engine (used by CLOBClient polling).
@@ -940,7 +1150,7 @@ async def _on_new_round(round_start_ts: int) -> None:
     """
     state = STATE
 
-        # End previous round
+    # End previous round
     if state.round_start_ts > 0:
         prev = state.round_start_ts
         # H-NEW-2026-07-11: stop any active TierWatchers so they don't

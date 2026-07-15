@@ -275,9 +275,8 @@ async def test_polling_recovers_when_ws_dropped() -> int:
         expected_size=5.0,
         expires_at=float("+inf"),  # never expire in test
         poll_s=0.01,                # tight loop
-        fill_ratio=0.9,             # H-NEW-2026-07-12 config default
-        cross_threshold=None,
-        mid_price_provider=None,
+        # H-NEW-2026-07-15: fill_ratio is removed (watcher only FILLEDs
+        # on full match). Test relies on the new behaviour.
         on_complete=_build_complete_handler(eng, completed),
         on_partial_fill=on_partial_fill_router,
         is_still_active=lambda: True,
@@ -294,56 +293,49 @@ async def test_polling_recovers_when_ws_dropped() -> int:
         f"expected FILLED, got {result.outcome}"
     )
     assert clob.cancel_call_count >= 1, "watcher must cancel on FILLED terminal"
-    # With fill_ratio=0.9 the watcher FILLED at cumulative=4.8 (the
-    # CLOB-reported balance at that tick), NOT 5.0. The terminal
-    # WatcherResult reflects what the watcher actually saw, not what
-    # eventually lands. The apply_tier_watcher_result path uses this as
-    # the authoritative qty.
-    assert abs(result.filled_qty - 4.8) < 1e-6, (
-        f"watcher must report FILLED @ 4.8 (90 % of 5.0), got {result.filled_qty}"
+    # H-NEW-2026-07-15 (tick-driven refactor): the watcher is now passive
+    # and only emits FILLED on a TRUE full match (`balance >= expected_size`),
+    # not the previous 90% fill-ratio cutoff. So with this timeline
+    # 1.2 → 2.4 → 3.6 → 4.8 → 5.0 the watcher FILLEDs at 5.0.
+    assert abs(result.filled_qty - 5.0) < 1e-6, (
+        f"watcher must report FILLED @ 5.0 (full match), got {result.filled_qty}"
     )
 
     # The crux of the test: every poll that grew size_matched should have
     # fired a partial fill through the engine.
     #
-    # Timeline cumulatives (after prime): 2.4, 3.6, 4.8.
-    # First push has cumulative=2.4 (delta from prev=0 = 2.4); subsequent
-    # pushes advance cumulative by 1.2, 1.2. The 4.8→5.0 increment
-    # never reaches the watcher because fill_ratio=0.9 short-circuits
-    # the FILLED branch first (4.8 / 5.0 = 0.96 ≥ 0.9). Total qty = 4.8.
-    expected_qty = 4.8
+    # Timeline cumulatives (after prime): 2.4, 3.6, 4.8, 5.0.
+    # All four pushes land (delta from prev=0 = 2.4, +1.2, +1.2, +0.2);
+    # the watcher FILLEDs only when balance reaches the full 5.0.
+    expected_qty = 5.0
     assert abs(eng.total_qty - expected_qty) < 1e-6, (
-        f"position qty must equal watcher-terminated qty 4.8, got {eng.total_qty}"
+        f"position qty must equal watcher-terminated qty 5.0, got {eng.total_qty}"
     )
     # The watcher's `_avg_price_running` is set per tick (running avg of
     # CLOB-reported avg_price). The first push uses 0.40, then 0.41 for
-    # the next two. The 0.2 push at 0.42 never fires (FILLED @ 4.8
-    # pre-empts it).
-    expected_cost = 2.4 * 0.40 + 1.2 * 0.41 + 1.2 * 0.41
+    # the next two, then 0.42 for the final 0.2 push.
+    expected_cost = 2.4 * 0.40 + 1.2 * 0.41 + 1.2 * 0.41 + 0.2 * 0.42
     assert abs(eng.total_cost - expected_cost) < 1e-3, (
         f"position cost must reflect avg prices, "
         f"got {eng.total_cost:.4f}, expected ~{expected_cost:.4f}"
     )
 # Each tick that grew size_matched must produce exactly ONE engine call,
-    # never duplicates. With fill_ratio=0.9 the watcher FILLED at
-    # cumulative=4.8 (4.8 / 5.0 = 0.96 ≥ 0.9), so we expect 3 pushes
-    # (cumulative 2.4, 3.6, 4.8) — NOT 4 (5.0 is never reached because
-    # the FILLED branch fires first).
-    assert len(eng.on_order_filled_log) == 3, (
-        f"expected 3 partial pushes (FILLED @ 4.8 with fill_ratio=0.9), "
+    # never duplicates. With the new passive watcher (FILLED only on full
+    # match), all four pushes land (cumulatives 2.4, 3.6, 4.8, 5.0).
+    assert len(eng.on_order_filled_log) == 4, (
+        f"expected 4 partial pushes (FILLED @ 5.0 full match), "
         f"got {len(eng.on_order_filled_log)}: {eng.on_order_filled_log}"
     )
-    # Engine deltas sum: 2.4 + 1.2 + 1.2 = 4.8 (matches watcher.result.filled_qty).
+    # Engine deltas sum: 2.4 + 1.2 + 1.2 + 0.2 = 5.0 (full match).
     delta_sum = sum(call[3] for call in eng.on_order_filled_log)
-    assert abs(delta_sum - 4.8) < 1e-6, (
-        f"sum of engine deltas must equal 4.8 (terminal fill @ 90%), "
+    assert abs(delta_sum - 5.0) < 1e-6, (
+        f"sum of engine deltas must equal 5.0 (full match), "
         f"got {delta_sum}"
     )
-    # The terminal WatcherResult must report 4.8, NOT 5.0 — proving the
-    # fill_ratio=0.9 cutoff short-circuited the watcher before reaching
-    # full size_matched.
-    assert abs(result.filled_qty - 4.8) < 1e-6, (
-        f"watcher must report FILLED at 4.8 (90% of 5.0), got "
+    # The terminal WatcherResult must report the full 5.0 (the actual
+    # CLOB cumulative at FILLED), NOT a 90%-cutoff value.
+    assert abs(result.filled_qty - 5.0) < 1e-6, (
+        f"watcher must report FILLED at 5.0 (full match), got "
         f"{result.filled_qty}"
     )
     print(
@@ -406,9 +398,6 @@ async def test_polling_is_idempotent_vs_ws_first() -> int:
         expected_size=5.0,
         expires_at=float("+inf"),
         poll_s=0.01,
-        fill_ratio=0.995,
-        cross_threshold=None,
-        mid_price_provider=None,
         on_complete=_build_complete_handler(eng, completed),
         on_partial_fill=on_partial_fill_router,
         is_still_active=lambda: True,
@@ -514,9 +503,6 @@ async def test_partial_fill_error_is_safe_to_retry() -> int:
         expected_size=5.0,
         expires_at=float("+inf"),
         poll_s=0.01,
-        fill_ratio=0.995,
-        cross_threshold=None,
-        mid_price_provider=None,
         on_complete=lambda r: asyncio.sleep(0),
         on_partial_fill=flaky_on_partial_fill,
         is_still_active=lambda: True,
@@ -584,9 +570,6 @@ async def test_no_partial_fill_callback_keeps_legacy_path() -> int:
         expected_size=5.0,
         expires_at=float("+inf"),
         poll_s=0.01,
-        fill_ratio=0.995,
-        cross_threshold=None,
-        mid_price_provider=None,
         on_complete=_build_complete_handler(eng, completed),
         on_partial_fill=None,  # legacy contract
         is_still_active=lambda: True,

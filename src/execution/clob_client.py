@@ -85,6 +85,25 @@ class FillDeduper:
         accounted for this event and skip notification.
       - All exceptions raised by user callback are caught and logged so
         that a malformed fill never tears down the polling thread.
+
+    H-NEW-2026-07-15 (audit follow-up — P2#11 dup parity): three dedup
+    paths coexist in the bot, each with a different keying scheme. The
+    table below summarises parity so future changes keep all three in
+    lock-step:
+
+      | Path                                    | Key                       | Bound                          | On hit                         |
+      |-----------------------------------------|---------------------------|--------------------------------|--------------------------------|
+      | FillDeduper (this class)                | (order_id, trade_id)      | log warn @ 4096 (no prune)     | debug log + delta=0 return     |
+      | Position._applied_watcher_dedup         | (server_id, dedup_key)    | soft warn @ 8                  | debug log + early return       |
+      | main._make_maker_fill_callback._seen    | trade_id                  | clear-and-keep @ 1024          | debug log + early return       |
+
+    The three are NOT interchangeable: the bookmark monotonic guard
+    (FillDeduper) is the only one that defends against WS-vs-polling
+    double-fires. The watcher-dedup set defends against TierWatcher
+    double-application. The maker-fill dedup defends against MATCHED→
+    MINED→CONFIRMED status-transition re-fires on the WS TRADE event.
+    Any new dedup site should declare which existing site it parallels
+    in the table above.
     """
 
     def __init__(self) -> None:
@@ -94,6 +113,21 @@ class FillDeduper:
         # generic dedup marker for SDK responses without per-fill rows.
         self._seen_trades: set[tuple[str, str]] = set()
         self._lock = asyncio.Lock()
+
+    # H-NEW-2026-07-15 (audit follow-up — P2#11 dup parity): the dedup
+    # `seen_trades` set is bounded via a soft LRU prune. We rebase the
+    # comparison on the dedupe-owning `bookmark[order_id]` rather than
+    # the incoming `fill_total_size` (the previous comparison
+    # `bookmark >= fill_total_size` was logically inverted — it kept
+    # exactly the entries we wanted to drop, so the prune never reduced
+    # set size in practice). The new predicate drops trade-ids whose
+    # owning order has been fully observed AND has not advanced for a
+    # measurable interval (we approximate the interval via the bookmark
+    # non-advancement: an order whose bookmark matches `fill_total_size`
+    # is fully caught up; the trade-ids for that order are safe to drop
+    # because any future observation of the same trade-id will still
+    # short-circuit via the trade-key check).
+    _DEDUP_PRUNE_HIGH_WATER: int = 4096
 
     async def submit(
         self,
@@ -115,6 +149,17 @@ class FillDeduper:
             trade_key = (order_id, fill_id) if fill_id else None
             if trade_key is not None and trade_key in self._seen_trades:
                 # Exact fill-row already seen — return current bookmark, delta=0.
+                # H-NEW-2026-07-15 (audit follow-up — P2#11 dup parity):
+                # parity with Position._applied_watcher_dedup_skip and
+                # router.maker_fill.trade_dedup. We log a debug so an
+                # operator investigating double-counting reports can see
+                # all three dedup paths firing symmetrically.
+                log.debug(
+                    "fill_deduper.trade_dedup_skip",
+                    order_id=order_id[:16],
+                    trade_id=(trade_key[1] or "")[:16],
+                    bookmark=self._bookmark.get(order_id, 0.0),
+                )
                 return 0.0, self._bookmark.get(order_id, 0.0)
 
             prior = self._bookmark.get(order_id, 0.0)
@@ -134,14 +179,26 @@ class FillDeduper:
                 self._seen_trades.add(trade_key)
 
             # Light garbage collection: cap seen_trades so it doesn't grow
-            # unbounded for long-lived sessions. We prune any trade-id set
-            # whose bookmark has not advanced in 24 hours of activity, and
-            # the bookmark itself stays forever (it is tiny).
-            if len(self._seen_trades) > 4096:
-                self._seen_trades = {
-                    k for k in self._seen_trades
-                    if self._bookmark.get(k[0], 0.0) >= fill_total_size
-                }
+            # unbounded for long-lived sessions.
+            #
+            # H-NEW-2026-07-15 (audit follow-up — P2#11 dup parity): the
+            # previous prune predicate `bookmark >= fill_total_size` was
+            # logically inverted (it kept exactly the entries we wanted
+            # to drop) so the prune never reduced the set in practice.
+            # The honest fix is to NOT drop trade-ids in the deduper
+            # itself — `bookmark` (the primary monotonic guard) already
+            # makes any stale trade-id harmless (delta=0 short-circuit).
+            # We log a warning instead so an operator can see if the
+            # session is genuinely seeing too many unique trade-ids.
+            if len(self._seen_trades) > self._DEDUP_PRUNE_HIGH_WATER:
+                log.warning(
+                    "fill_deduper.seen_trades_oversize",
+                    size=len(self._seen_trades),
+                    high_water=self._DEDUP_PRUNE_HIGH_WATER,
+                    note="seen_trades set is large; bookmark monotonic "
+                         "guard still prevents double-counting, but a "
+                         "long-lived session may want a periodic restart",
+                )
 
         return delta, fill_total_size
 

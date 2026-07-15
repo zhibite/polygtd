@@ -268,12 +268,31 @@ def test_m2_router_skip_reason_does_not_blame_router() -> None:
     claim that the router itself tried the REST fallback — that
     decision lives in user_ws. We can't import the closure directly,
     but we can read the source and assert the reason string.
+
+    H-NEW-2026-07-15: the legacy literal "upstream delivered size=0"
+    was retired when the per-candidate chosen[4] REST amount became
+    authoritative (see `router.maker_fill.skip` log around line ~1758).
+    The new reason string must still communicate the same intent —
+    the SKIP is due to no upstream data, NOT because the router itself
+    attempted a REST call that returned 0.
     """
     main_py = pathlib.Path(_ROOT / "src" / "main.py").read_text(encoding="utf-8")
-    # The reason text should be about upstream / user_ws, not about
-    # the router's own REST call.
-    assert "upstream delivered size=0" in main_py
+    # Negative: must not say "the router's own REST call returned 0".
     assert "WS size=0 + REST fallback returned 0/None" not in main_py
+    # Positive: must say the per-maker amounts were absent at the router
+    # (i.e. upstream didn't deliver them, so router can't act). Source has
+    # the literal split across string-concat lines; assert on each half.
+    assert "authoritative per-maker amount is 0" in main_py
+    assert "no WS amount" in main_py
+    assert "no REST amount" in main_py
+    # And the full phrase must appear together after Python's implicit
+    # adjacent-string concatenation at runtime — guard by checking the
+    # joined halves appear in source in concat order.
+    ws_idx = main_py.find("no WS amount")
+    rest_idx = main_py.find("no REST amount")
+    assert ws_idx != -1 and rest_idx != -1 and rest_idx > ws_idx, (
+        "reason fragments must appear in concat order in source"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -561,12 +580,20 @@ async def test_t13_trade_zero_size_after_fallback_skips_callback() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_h_new_14_crossed_outcome_clears_tier_placed() -> None:
-    """After CROSSED outcome, position.has_inflight_tier must return False
-    so _check_take_profit can fire on the very next tick.
+def test_h_new_14_tick_reconcile_clears_tier_placed() -> None:
+    """After a tick-driven cancel, position.has_inflight_tier must return
+    False so _check_take_profit can fire on the very next tick.
+
+    H-NEW-2026-07-15 tick-driven refactor: the previous test exercised
+    `apply_tier_watcher_result(CROSSED)`, but `TierOutcome.CROSSED` no
+    longer exists — the strategy tick (`_reconcile_inflight_buys`)
+    cancels BUY GTDs based on price, and the router clears `placed` via
+    its own dispatch. The TierWatcher is passive.
+
+    This test covers the new contract directly: when a tick-driven
+    cancel clears `tier.placed`, the engine mutex releases.
     """
     from src.strategy.round_state import Position
-    from src.execution.tier_watcher import TierOutcome
 
     pos = Position()
     t = pos.tiers[2]  # T3
@@ -578,44 +605,61 @@ def test_h_new_14_crossed_outcome_clears_tier_placed() -> None:
     t.watching = True
 
     assert pos.has_inflight_tier is True, (
-        "Pre-condition: while watcher is mid-fill the position is in-flight"
+        "Pre-condition: while a tier is placed+watching the position is in-flight"
     )
 
-    pos.apply_tier_watcher_result(
-        t, TierOutcome.CROSSED.value, filled_qty=0.0,
-        dedup_key="0x45697996208479|crossed", avg_fill_price=0.0,
-    )
+    # Simulate the router's post-cancel cleanup (see `router.cancel_tier.done`
+    # in src/main.py). The exact behaviour the production router performs
+    # when OrderManager.cancel_by_server_id succeeds.
+    t.placed = False
+    t.watching = False
+    t.expires_at = 0.0
+    # server_order_id is intentionally preserved so a late WS TRADE event
+    # can still attribute to this tier.
 
     assert pos.has_inflight_tier is False, (
-        "After CROSSED, the position MUST NOT be considered in-flight. "
-        "If this asserts, _check_take_profit will deadlock — the round "
-        "can't exit via TP."
+        "After tick-driven cancel, the position MUST NOT be considered "
+        "in-flight. If this asserts, _check_take_profit will deadlock — "
+        "the round can't exit via TP."
     )
     assert t.placed is False, (
-        "After CROSSED the tier.placed flag must reset so the strategy "
-        "can re-arm (a new GTD on the next tick) and so TP gating releases."
+        "After tick-driven cancel, tier.placed must reset so the next "
+        "averaging tier (or TP) can fire on the next tick."
     )
     assert t.server_order_id == "0x45697996208479", (
         "server_order_id is preserved so a late-arriving user_ws TRADE "
-        "event can still attribute post-cross fills to this tier."
+        "event can still attribute post-cancel fills to this tier."
     )
     assert t.watching is False
     assert t.filled is False, (
-        "CROSSED is not a fill. filled stays False so the post-cross "
-        "on-chain fill path does not double-count via watcher_reconciled."
+        "Tick-driven cancel is not a fill. filled stays False so the "
+        "post-cancel on-chain fill path does not double-count via "
+        "watcher_reconciled."
     )
 
 
-def test_h_new_14_explicit_inv_log_marker_for_crossed() -> None:
-    """defensive: the audit trail must show that the cross-cleared tier
+def test_h_new_14_explicit_inv_log_marker_for_tick_reconcile() -> None:
+    """defensive: the audit trail must show that the tick-cleared tier
     is now downgraded, so any future grep for 'in-flight=true' on the
-    crosspath can be ruled out at a glance."""
-    main_py = pathlib.Path(_ROOT / "src" / "strategy" / "round_state.py").read_text(encoding="utf-8")
-    assert "tier.placed = False" in main_py
-    # The branch carrying the assignment is in CROSSED / EXPIRED /
-    # CANCELLED logic; we want a per-tier log line so an operator can
-    # see WHICH tier got cleared during postmortem.
-    assert "position.tier_cleared_after_cross" in main_py
+    crosspath can be ruled out at a glance.
+
+    H-NEW-2026-07-15 tick-driven refactor: the previous test grepped
+    for `position.tier_cleared_after_cross` in `round_state.py`. With
+    the watcher no longer emitting CROSSED, the actual cancel path is
+    in the engine's `_reconcile_inflight_buys` and the router's
+    `ActionCancelTier` dispatch (in src/main.py), which logs
+    `router.cancel_tier.done` per tier.
+    """
+    main_py = pathlib.Path(_ROOT / "src" / "main.py").read_text(encoding="utf-8")
+    # The cancel path lives in the router under `ActionCancelTier`,
+    # which sets `tier.placed = False` after a successful CLOB cancel.
+    assert "tier_snap.placed = False" in main_py
+    assert "router.cancel_tier.done" in main_py
+    # The strategy-tick reconcile path emits per-tier cancel breadcrumbs
+    # so an operator can see WHICH tier got cancelled during postmortem.
+    engine_py = pathlib.Path(_ROOT / "src" / "strategy" / "engine.py").read_text(encoding="utf-8")
+    assert "engine.reconcile.cancel_for_next_tier" in engine_py
+    assert "engine.reconcile.cancel_for_tp" in engine_py
 
 
 # ---------------------------------------------------------------------------

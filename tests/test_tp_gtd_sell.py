@@ -1,15 +1,17 @@
-"""Unit tests for the GTD-sell and two-stage TP (GTD + FAK fallback) flow.
+"""Unit tests for the GTD-sell TP flow.
 
 These tests use a fake CLOBClient so they don't hit the network. The
 behaviour we verify:
   1. CLOBClient.place_gtd_sell posts a SELL, fires fill callback incrementally.
   2. CLOBClient.place_gtd_sell returns success=False when posting fails.
   3. OrderManager.place_gtd_sell wraps a CLOB post and returns a TrackedOrder.
-  4. OrderManager.place_tp_with_fallback:
-       a) GTD fully fills → no FAK fallback.
-       b) GTD partially fills → FAK fallback fires for residual.
-       c) GTD post fails → goes straight to FAK.
-  5. OrderManager._adjust_sell_price snaps just below current ask.
+  4. OrderManager._adjust_sell_price snaps just below current ask.
+
+H-NEW-2026-07-15 (audit follow-up): the legacy two-stage TP path
+(`place_tp_with_fallback` / FAK-after-285s-wait) is no longer reachable
+from any production caller — TP uses a single GTD via
+`place_gtd_sell_at_price` and the strategy tick cancels it when mid
+retreats. Tests for that path were removed.
 """
 from __future__ import annotations
 
@@ -22,7 +24,6 @@ import pytest
 from src.execution.clob_client import FillResult
 from src.execution.order_manager import (
     OrderManager,
-    TP_FALLBACK_BUFFER_S,
     TP_GTD_LIFETIME_S,
     TrackedOrder,
 )
@@ -243,149 +244,12 @@ async def test_place_gtd_sell_returns_none_on_post_failure(om: OrderManager, fak
     assert order is None
 
 
-@pytest.mark.asyncio
-async def test_tp_fallback_full_fill_skips_fak(om: OrderManager, fake_clob: FakeCLOBClient, monkeypatch):
-    """If GTD fully fills in the schedule, FAK should NOT fire."""
-    # Patch the sleep so we don't actually wait 75 seconds
-    sleeps: list[float] = []
-    async def fake_sleep(s: float) -> None:
-        sleeps.append(s)
-    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
-
-    # Pre-record that the next GTD will fully fill 10/10
-    # (FakeCLOBClient auto-fills at size; nothing to set up.)
-    gtd, fak, gtd_err, fak_err = await om.place_tp_with_fallback(
-        token_id="tok_full",
-        size=10.0,
-        price=0.50,
-        round_start_ts=1234567890,
-        tier_name="TP",
-        tick_size=0.01,
-    )
-
-    assert gtd is not None
-    # full fill at the price → residual = 0, below 5-token min → fak skipped
-    assert fak is None
-    assert len(fake_clob.place_fak_sell_calls) == 0
-    # we did wait once for the GTD window minus the buffer.
-    # H-3 fix in OM: wait_s = max(TP_GTD_LIFETIME_S, GTD_MIN_SEC+1) - TP_FALLBACK_BUFFER_S
-    from src.execution.clob_client import CLOBClient as _CC
-    expected_sleep = max(TP_GTD_LIFETIME_S, _CC.GTD_MIN_SEC + 1) - TP_FALLBACK_BUFFER_S
-    assert len(sleeps) == 1 and sleeps[0] == expected_sleep
-
-@pytest.mark.asyncio
-async def test_tp_fallback_partial_fills_residual(om: OrderManager, fake_clob: FakeCLOBClient, monkeypatch):
-    """If GTD only partially fills, FAK should fire for the residual."""
-    # Stub the post-poll status check so size_matched reflects the partial.
-    # We do this by intercepting the FakeCLOBClient.get_order call inside OM.
-    # The simplest way: have place_gtd_sell return less than full, and the
-    # post-sleep status check returns the same matched size.
-    sleeps: list[float] = []
-    async def fake_sleep(s: float) -> None:
-        sleeps.append(s)
-    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
-
-    # Override place_gtd_sell to return 4/10 partial success
-    original = fake_clob.place_gtd_sell
-    async def partial_gtd_sell(token_id, price, size, lifetime_s, tick_size):
-        # Mimic partial: call into underlying for record-keeping
-        result = await original(token_id=token_id, price=price, size=size, lifetime_s=lifetime_s, tick_size=tick_size)
-        # rewrite to a 40% partial
-        return FillResult(
-            order_id=result.order_id,
-            tokens=4.0,
-            usdc=4.0 * price,
-            fill_price=price,
-            success=True,
-        )
-    fake_clob.place_gtd_sell = partial_gtd_sell  # type: ignore[assignment]
-
-    # Stub status poll: report matched=4.0
-    async def fake_get_order(order_id):
-        return {"size_matched": "4.0", "status": "live"}
-    # OrderManager reaches into self._clob._run(self._clob._client.get_order, ...)
-    # We patch the underlying _client.get_order route
-    fake_clob._client = type("C", (), {"get_order": fake_get_order})()
-
-    gtd, fak, gtd_err, fak_err = await om.place_tp_with_fallback(
-        token_id="tok_partial",
-        size=10.0,
-        price=0.50,
-        round_start_ts=1234567890,
-        tier_name="TP",
-        tick_size=0.01,
-    )
-
-    assert gtd is not None
-    assert fak is not None
-    assert len(fake_clob.place_fak_sell_calls) == 1
-    fak_call = fake_clob.place_fak_sell_calls[0]
-    # residual = 10 - 4 = 6
-    assert fak_call["size"] == 6.0
-
-
-@pytest.mark.asyncio
-async def test_tp_fallback_gtd_post_failure_goes_straight_to_fak(om: OrderManager, fake_clob: FakeCLOBClient, monkeypatch):
-    """If GTD post returns success=False (e.g. size below min), FAK fires for full size."""
-    sleeps: list[float] = []
-    async def fake_sleep(s: float) -> None:
-        sleeps.append(s)
-    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
-
-    fake_clob.force_sell_post_error("ignored", "tokens below CLOB 5-shares minimum")
-
-    gtd, fak, gtd_err, fak_err = await om.place_tp_with_fallback(
-        token_id="tok_fail",
-        size=10.0,
-        price=0.50,
-        round_start_ts=1234567890,
-        tier_name="TP",
-        tick_size=0.01,
-    )
-
-    assert gtd is None
-    assert fak is not None
-    assert len(fake_clob.place_fak_sell_calls) == 1
-    fak_call = fake_clob.place_fak_sell_calls[0]
-    assert fak_call["size"] == 10.0  # full size, not residual
-    # No GTD wait should have happened
-    assert sleeps == []
-
-
-@pytest.mark.asyncio
-async def test_tp_fallback_residual_below_min_skips_fak(om: OrderManager, fake_clob: FakeCLOBClient, monkeypatch):
-    """If residual < 5 tokens, FAK should NOT fire (CLOB min shares)."""
-    sleeps: list[float] = []
-    async def fake_sleep(s: float) -> None:
-        sleeps.append(s)
-    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
-
-    # Partial: GTD fills 8 of 10 → residual 2 (below 5-token min)
-    original = fake_clob.place_gtd_sell
-    async def partial_gtd_sell(token_id, price, size, lifetime_s, tick_size):
-        result = await original(token_id=token_id, price=price, size=size, lifetime_s=lifetime_s, tick_size=tick_size)
-        return FillResult(
-            order_id=result.order_id,
-            tokens=8.0,
-            usdc=8.0 * price,
-            fill_price=price,
-            success=True,
-        )
-    fake_clob.place_gtd_sell = partial_gtd_sell  # type: ignore[assignment]
-
-    async def fake_get_order(order_id):
-        return {"size_matched": "8.0", "status": "live"}
-    fake_clob._client = type("C", (), {"get_order": fake_get_order})()
-
-    gtd, fak, gtd_err, fak_err = await om.place_tp_with_fallback(
-        token_id="tok_small_residual",
-        size=10.0,
-        price=0.50,
-        round_start_ts=1234567890,
-        tier_name="TP",
-        tick_size=0.01,
-    )
-
-    assert gtd is not None
-    assert fak is None
-    assert len(fake_clob.place_fak_sell_calls) == 0
+# H-NEW-2026-07-15 (audit follow-up): the legacy
+# `place_tp_with_fallback` two-stage maker/FAK helper was removed from
+# OrderManager because production never invoked it — TP now uses a
+# single GTD via `place_gtd_sell_at_price` and the strategy tick
+# cancels it (ActionCancelTier tier=-1 sentinel) when mid retreats
+# below the fire line. The four `test_tp_fallback_*` tests were
+# removed alongside the helper; their assertions covered behaviour
+# (FAK-after-285s wait, residual-below-5 skip, post-failure straight-
+# to-FAK) that is no longer reachable from any production caller.

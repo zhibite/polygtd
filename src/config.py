@@ -109,59 +109,22 @@ class StrategySettings(BaseSettings):
     POLYGON_RPC_URL: str = "https://polygon-bor.publicnode.com"
 
     # ── Martingale tiers (USD notional per tier) ─────────────────────────
-    # H-NEW-2026-07-11-4 (simplification): cap the strategy at 3 tiers
-    # (T1 entry + 2 averaging layers = T1, T2, T3). The 4-tier cascade
-    # was the single biggest source of incidents during the prod review —
-    # 4 GTD lifecycles per round meant a 14-min market spent most of
-    # its tail in transition logic instead of waiting on a real fill,
-    # and any WS re-fire or cross-tier mis-trigger compounded across 4
-    # open orders. The 3-tier cap trades max drawdown (still 14 USD)
-    # for a 25% reduction in moving parts.
-    #
-    # Notionals follow a geometric 2x progression: 2 / 4 / 8 USD. Drop
-    # thresholds are deliberately wider than the previous 2/2/4/8
-    # ladder — T2 fires at -30%, T3 at -60% of the realised baseline
-    # (previously 20% / 40% / 60%). Fewer tiers, deeper per-tier
-    # averaging.
+    # Four-layer budget: T1 entry followed by three averaging orders.
+    # Maximum planned exposure per round is 2 + 3 + 5 + 6 = 16 USD.
     TIER1_NOTIONAL: float = 2.0
-    TIER2_NOTIONAL: float = 4.0
-    TIER3_NOTIONAL: float = 8.0
-
-    # Per-tier notional hard cap (multiplier over planned notional).
-    # Anything above this is treated as the tier being "saturated" and the
-    # engine will refuse to place another order for that tier.
-    # Example: 1.25 means T3 may spend at most 4 * 1.25 = 5 USD before being
-    # blocked. Prevents GTD loops / repeated partial fills from silently
-    # over-spending into the next tier's budget.
-    TIER_NOTIONAL_MAX_MULT: float = 1.1
+    TIER2_NOTIONAL: float = 3.0
+    TIER3_NOTIONAL: float = 5.0
+    TIER4_NOTIONAL: float = 6.0
 
     # ── Strategy thresholds ───────────────────────────────────────────────
-    # H-NEW-2026-07-12 (operator adjustment): tightened from 0.36 to 0.38.
-    # Previous 0.36 cap made T1 fire too late — the average T1 entry at
-    # 0.22 left an unreasonable spread against the TP target (0.40), but
-    # too few windows actually reached that low a mid, so the bot sat on
-    # cash more often than it traded. Loosening to 0.38 widens the entry
-    # window without re-introducing the 0.40-era problem of bidding the
-    # ask at window-open against thin books: the bot still refuses to
-    # fire T1 above the 0.40 historical ceiling.
-    ENTRY_PRICE_CAP: float = 0.38      # max token price to enter
-    TIER2_DROP_PCT: float = 0.30       # T2 triggers at baseline * (1 - 30%)
-    TIER3_DROP_PCT: float = 0.60       # T3 triggers at baseline * (1 - 60%)
-    # H-NEW-2026-07-11-4: TIER4_DROP_PCT removed. No tier 4 exists.
+    ENTRY_PRICE_CAP: float = 0.40      # max token price to enter
+    TIER2_DROP_PCT: float = 0.20       # T2 triggers at baseline * (1 - 20%)
+    TIER3_DROP_PCT: float = 0.40       # T3 triggers at baseline * (1 - 40%)
+    TIER4_DROP_PCT: float = 0.60       # T4 triggers at baseline * (1 - 60%)
     TP_PROFIT_PCT: float = 0.20         # take profit target as fraction of avg cost
-    # TP decreases by this amount per averaging tier fired. Final value is
-    # clamped at TP_MIN_PCT to avoid a sub-cost lock-loss TP target.
-    # H-NEW-2026-07-11-5 (aggressive decrement): bumped from 3% to 5%.
-    # With the 3-tier cap the deepest depth is N=2 (T1+T2+T3 fired),
-    # so the table is now:
-    #   N=0 (T1 only)        → TP_PROFIT_PCT                  (20%)
-    #   N=1 (T1+T2 fired)    → TP_PROFIT_PCT - 1*5%           (15%)
-    #   N=2 (T1..T3 fired)   → TP_PROFIT_PCT - 2*5%           (10%)
-    # The steeper decrement means the TP target walks down faster as
-    # we average in, locking in a smaller-but-real profit sooner —
-    # which is the right trade when a 3-tier cascade is already on
-    # the table.
-    TP_DECREMENT_PCT: float = 0.05
+    # N is the number of completed averaging tiers (T2-T4):
+    # 0 fills -> 20%, 1 -> 17%, 2 -> 14%, 3 -> 11%.
+    TP_DECREMENT_PCT: float = 0.03
     TP_MIN_PCT: float = 0.05             # floor (5%) so TP can never lock in a loss
     BASELINE_DRIFT_LIMIT: float = 0.0015  # 0.15% BTC spot drift cap
 
@@ -170,8 +133,13 @@ class StrategySettings(BaseSettings):
     T1_ENTRY_WINDOW_S: float = 300.0    # 5 minutes
 
     # ── Order settings ────────────────────────────────────────────────────
-    # GTD lifetime in seconds. Must be >= 180 (CLOB hard floor).
-    GTD_LIFETIME_S: int = 180
+    # GTD lifetime in seconds. CLOB enforces a 180-second hard floor
+    # (`CLOBClient.GTD_MIN_SEC = 180`); values below that are clamped to
+    # 181 by the CLOB client. The default 300 s gives the maker an extra
+    # 2 minutes on the book after the pre-arm window opens — covering the
+    # full 5-min averaging chain without forcing a re-post in the middle
+    # of a fast cascade.
+    GTD_LIFETIME_S: int = 300
 
     # Slippage for FAK sell orders (as a fraction, e.g. 0.02 = 2%)
     SELL_SLIPPAGE_PCT: float = 0.02
@@ -186,40 +154,38 @@ class StrategySettings(BaseSettings):
     # 挂单价 = strategy_price（不变），价格提前量只用于触发判断。
     PRICE_PRE_MARGIN: float = 0.10
 
-    # TierWatcher 轮询 CLOB token balance 的间隔（秒）
-    # 主动查询持仓 share 数 → 取消未填满的 GTD → 让下一档继续推进。
+    # TierWatcher WS-event 兜底超时（秒）。
+    # Watcher 主路径是等 `order.UPDATE` 推过来（~50ms 唤醒），但当 WS
+    # 失联 / 漏事件时，必须有一个上限——超过这个时间就必须主动查 REST
+    # balance，否则持仓更新会卡住。这不是"主动轮询间隔"——99% 的 tick
+    # 是事件驱动，poll_s 只决定"如果 WS 不来，最长等多久"。生产默认
+    # 1.5s 给 WS 充分时间重连；测试用 0.5s 是 TierWatcher.__init__ 里
+    # `max(0.5, ...)` 的下限——再低也不会生效。
     TIER_WATCHER_POLL_S: float = 1.5
-
-    # TierWatcher 判定「此档基本够了」的比例阈值（占 size_expected）。
-    # 触发条件：get_token_balance(token_id) >= size_expected * this_ratio
-    # H-NEW-2026-07-12: 0.9 比 0.995 更合理。0.995 太严：薄市场 / 跨档流
-    # 动下,残余 0.5% 经常在 GTD lifetime 内不会成交,watcher 会再多
-    # poll ~1.5s 才退出。这段时间如果 WS TRADE 在丢报,position view
-    # 会与实仓漂移(H-NEW-2026-07-12 的 continuous-recon 已经收窄但无法
-    # 完全消除这个窗口)。90% 覆盖率就报 FILLED + 取消 GTD 才是干净
-    # 的退出方式;残余量由 apply_tier_watcher_result 用 recorded
-    # filled_qty 对 expected_size 自动 reconcile。
-    TIER_WATCHER_FILL_RATIO: float = 0.9
 
     # ── Derived helpers ───────────────────────────────────────────────────
 
-    # H-NEW-2026-07-11-4: max tier index exposed in the strategy. The
-    # `tier_notionals` / `tier_drop_pcts` lists and the engine's
-    # averaging-down loop all terminate at this index. Bumping the
-    # strategy back to 4 tiers later is a single edit here + adding
-    # the new factory + restoring `_next_tier_drop` to use this index.
     @property
     def max_tier(self) -> int:
-        return 3
+        return 4
 
     @property
     def tier_notionals(self) -> list[float]:
-        return [self.TIER1_NOTIONAL, self.TIER2_NOTIONAL,
-                self.TIER3_NOTIONAL]
+        return [
+            self.TIER1_NOTIONAL,
+            self.TIER2_NOTIONAL,
+            self.TIER3_NOTIONAL,
+            self.TIER4_NOTIONAL,
+        ]
 
     @property
     def tier_drop_pcts(self) -> list[float | None]:
-        return [None, self.TIER2_DROP_PCT, self.TIER3_DROP_PCT]
+        return [
+            None,
+            self.TIER2_DROP_PCT,
+            self.TIER3_DROP_PCT,
+            self.TIER4_DROP_PCT,
+        ]
 
     @property
     def total_max_notional(self) -> float:

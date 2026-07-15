@@ -81,10 +81,12 @@ class _FakePos:
         self._total_qty = 5.55
         self.total_qty = 5.55
         self.avg_cost = 0.36
+        self._total_cost = self.total_qty * self.avg_cost
+        self.total_cost = self._total_cost
         self.baseline_set_realized = True
         self.baseline_realized_price = 0.36
         self.baseline_target_price = 0.36
-        self.baseline_price = 0.36
+        # NOTE: legacy baseline_price field removed (H-NEW-2026-07-15).
         # 3-tier cap (H-NEW-2026-07-11-4). T1 is "complete" with its size
         # filled already (so `sum(tier.size_filled) == pos.total_qty` and
         # the R6 avg_cost-sanity gate falls through).
@@ -106,6 +108,37 @@ class _FakePos:
     @property
     def has_inflight_tier(self) -> bool:
         return any(t.placed or t.watching for t in self.tiers)
+
+    def snapshot(self) -> Any:
+        """H-NEW-2026-07-15 tick-driven refactor: build a PositionSnapshot
+        substitute from the fake fields. We can't import
+        ``PositionSnapshot`` here without a circular dependency, so we
+        build a small duck-typed snapshot whose attributes match what
+        the engine reads (entry_token, total_qty, avg_cost,
+        tier_size_filled, tp_target, tp_inflight, has_inflight_tier,
+        baseline_set_realized, baseline_realized_price,
+        baseline_target_price).
+        """
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            entry_token=self.entry_token,
+            total_qty=self.total_qty,
+            avg_cost=self.avg_cost,
+            total_cost=self.total_cost,
+            tier_size_filled=tuple(t.size_filled for t in self.tiers),
+            tier_placed=tuple(t.placed for t in self.tiers),
+            tier_filled=tuple(t.is_complete for t in self.tiers),
+            tier_is_complete=tuple(t.is_complete for t in self.tiers),
+            tier_server_order_id=tuple(t.server_order_id for t in self.tiers),
+            tier_expires_at=tuple(getattr(t, "expires_at", 0.0) for t in self.tiers),
+            baseline_set_realized=self.baseline_set_realized,
+            baseline_realized_price=self.baseline_realized_price,
+            baseline_target_price=self.baseline_target_price,
+            tp_target=self.tp_target(),
+            tp_inflight=self._tp_inflight,
+            has_inflight_tier=self.has_inflight_tier,
+            entry_side=self.entry_side,
+        )
 
 
 class _FakeGate:

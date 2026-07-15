@@ -210,8 +210,9 @@ async def test_h_v5_1_tp_suppressed_when_averaging_inflight() -> None:
     pos.record_fill(pos.tier1, price=0.40, size=5.0)
     pos.entry_token = "tok"
     pos.entry_side = "UP"
-    pos.baseline_price = 0.40
-    pos.baseline_set = True
+    # legacy pos.baseline_price / pos.baseline_set removed (H-NEW-2026-07-15):
+    # record_fill already anchored baseline_realized_price above, which is
+    # the only anchor averaging-down / TP consult now.
 
     # T2 in-flight, no fill yet.
     pos.tier2.placed = True
@@ -277,8 +278,8 @@ async def test_h_v5_1_tp_fires_when_no_averaging_inflight() -> None:
     pos.record_fill(pos.tier1, price=0.40, size=5.0)
     pos.entry_token = "tok"
     pos.entry_side = "UP"
-    pos.baseline_price = 0.40
-    pos.baseline_set = True
+    # legacy pos.baseline_price / pos.baseline_set removed (H-NEW-2026-07-15):
+    # record_fill already anchored baseline_realized_price above.
 
     # No averaging tier in-flight — all tier.placed=False.
     tp_t = pos.tp_target()

@@ -125,11 +125,6 @@ class _SlowClob:
         self.calls_completed += 1
         return (None, None, "gtd_post_failed", "fak_post_failed")
 
-    async def place_tp_with_fallback(self, *a, **kw):
-        # fallback path used when TP runner does not call
-        # place_gtd_sell_at_price directly
-        return (None, None, "gtd_post_failed", "fak_post_failed")
-
 
 @pytest.mark.asyncio
 async def test_b3_v2_tp_runner_task_retained() -> None:
@@ -268,8 +263,6 @@ async def test_h3_v2_average_down_uses_target_price() -> None:
     pos.entry_token = "tok"
     pos.entry_side = "UP"
     pos.baseline_target_price = 0.40  # intended entry bid
-    pos.baseline_price = 0.45        # actual fill avg after slippage
-    pos.baseline_set = True
     # H-NEW-2026-07-12: anchor to realised T1 fill (0.45) so the
     # T1-has-filled guard passes and the averaging loop evaluates.
     pos.baseline_realized_price = 0.45
@@ -295,10 +288,12 @@ async def test_h3_v2_average_down_uses_target_price() -> None:
         captured.append(action)
     eng._handler = handler
     eng._s = type("S", (), {
-        "TIER2_NOTIONAL": 2.0,
-        "TIER3_NOTIONAL": 4.0,
-        # H-NEW-2026-07-11-4: TIER4_NOTIONAL removed (3-tier cap).
-        "TIER_NOTIONAL_MAX_MULT": 1.1,
+        "TIER2_NOTIONAL": 3.0,
+        "TIER3_NOTIONAL": 5.0,
+        "TIER4_NOTIONAL": 6.0,
+        # H-NEW-2026-07-15: TIER_NOTIONAL_MAX_MULT removed (engine
+        # trusts the per-(round,tier) spawn mutex; no mid-flight cap).
+        "tier_drop_pcts": [None, 0.20, 0.40, 0.60],
     })()
 
     await eng._check_average_down(100000.0)
@@ -328,8 +323,7 @@ async def test_h3_v2_average_down_does_not_over_trigger_on_slippage() -> None:
     pos.entry_token = "tok"
     pos.entry_side = "UP"
     pos.baseline_target_price = 0.40
-    pos.baseline_price = 0.45
-    pos.baseline_set = True
+    # legacy pos.baseline_price / pos.baseline_set removed (H-NEW-2026-07-15)
     pos._total_qty = 10.0
     pos._total_cost = 4.5
     eng._round = type("R", (), {"position": pos})()
@@ -343,10 +337,12 @@ async def test_h3_v2_average_down_does_not_over_trigger_on_slippage() -> None:
         captured.append(action)
     eng._handler = handler
     eng._s = type("S", (), {
-        "TIER2_NOTIONAL": 2.0,
-        "TIER3_NOTIONAL": 4.0,
-        # H-NEW-2026-07-11-4: TIER4_NOTIONAL removed (3-tier cap).
-        "TIER_NOTIONAL_MAX_MULT": 1.1,
+        "TIER2_NOTIONAL": 3.0,
+        "TIER3_NOTIONAL": 5.0,
+        "TIER4_NOTIONAL": 6.0,
+        # H-NEW-2026-07-15: TIER_NOTIONAL_MAX_MULT removed (engine
+        # trusts the per-(round,tier) spawn mutex; no mid-flight cap).
+        "tier_drop_pcts": [None, 0.20, 0.40, 0.60],
     })()
 
     await eng._check_average_down(100000.0)

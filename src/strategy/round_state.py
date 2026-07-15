@@ -31,7 +31,7 @@ log = get_logger(__name__)
 
 @dataclass
 class TierSnapshot:
-    """State for a single martingale tier (T1..T3).
+    """State for a single martingale tier (T1..T4).
 
     Lifecycle:
         placed=False, watching=False   -> not yet sent
@@ -48,8 +48,10 @@ class TierSnapshot:
       - UserWS / CLOBClient fill callbacks → `record_fill` increments
         `size_filled`, which feeds `is_complete`.
       - TierWatcher → sets `filled=True` directly when the watched
-        balance crosses `expected_size * fill_ratio` (independent of fill
-        events). This is the primary path under the new model.
+        balance reaches the full expected size (`>= expected_size`,
+        not 99.5% — the watcher only reports NATURAL terminal
+        conditions; mid-fill policy lives in the strategy tick).
+        This is the primary path under the new model.
 
     A tier can be "complete" via either path; both feed the same flag.
     """
@@ -79,25 +81,51 @@ class TierSnapshot:
     last_fill_ts: float = 0.0
     cancel_reason: str = ""
     token_id: str | None = None       # bound to the server order so fills can be matched
+    # H-NEW-2026-07-15 (audit follow-up): single-flight guard for cancel
+    # dispatches. The engine's `_reconcile_inflight_buys` runs every tick
+    # (250 ms) and re-evaluates whether an outstanding BUY GTD should be
+    # cancelled. Without this guard, the router could issue `cancel`
+    # back-to-back across ticks if mid oscillates around the next-tier
+    # fire line, and each cancel request would race the previous one at
+    # the CLOB. Set to True when an ActionCancelTier is dispatched; the
+    # router clears it after `om.cancel_by_server_id` resolves. The
+    # engine skips re-emit when this flag is True.
+    cancel_pending: bool = False
     # Optional: id of the spawned TierWatcher task (for diagnostics only).
     watcher_task: object | None = None
 
-    def trigger_price(self, baseline: float) -> float | None:
+    def trigger_price(self, t1_entry: float) -> float | None:
+        """Strategy price for this averaging tier, expressed as a fraction
+        of the T1 entry price.
+
+        H-NEW-2026-07-15 (audit follow-up — naming): the parameter is
+        `t1_entry` (token T1 fill price), NOT the BTC/binance baseline
+        used by `GateKeeper`. The two concepts share a name ("baseline")
+        historically but they are unrelated anchors — the gate baseline
+        is BTC/USD drift cap, this anchor is the token price. Renamed
+        to remove the BTC-vs-token confusion.
+
+        Formula: `t1_entry * (1 - tier_drop_pct)`
+          T2: 0.80 * t1_entry   (20% drop)
+          T3: 0.60 * t1_entry   (40% drop)
+          T4: 0.40 * t1_entry   (60% drop)
+        Returns None for tier 1 (no averaging drop defined).
+        """
         cfg = _s()
         drops = cfg.tier_drop_pcts  # [None, 0.20, 0.40, 0.60]
         drop = drops[self.tier - 1]
         if drop is None:
             return None
-        return baseline * (1 - drop)
+        return t1_entry * (1 - drop)
 
     @staticmethod
     def _next_tier_drop(tier: int) -> float | None:
-        """Drop-pct of the *next* tier, or None if this is the last tier (T3)."""
+        """Drop-pct of the next tier, or None if this is the last tier."""
         cfg = _s()
-        drops = cfg.tier_drop_pcts  # 0-indexed: drops[1]=T2, drops[2]=T3
+        drops = cfg.tier_drop_pcts
         if tier >= len(drops):
             return None
-        return drops[tier]  # tier 1 -> drops[1] = T2's drop = 0.30, etc.
+        return drops[tier]
 
     @property
     def fill_rate(self) -> float:
@@ -163,6 +191,54 @@ class TpSnapshot:
 
 
 # ---------------------------------------------------------------------------
+# Position snapshot — tick-driven refactor (H-NEW-2026-07-15)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PositionSnapshot:
+    """Frozen view of a Position's decision-relevant state at one tick.
+
+    Built by `Position.snapshot()` and consumed by every `Engine._evaluate`
+    sub-step (`_check_t1_entry`, `_check_average_down`, `_check_take_profit`,
+    `_reconcile_inflight_buys`). Tuple fields are positional across the
+    four tiers (T1, T2, T3, T4) — callers index by `tier-1`.
+
+    All numeric fields are floats; bool fields are pure. The snapshot is
+    intentionally immutable so a helper cannot accidentally mutate the
+    live Position through it.
+    """
+
+    total_qty: float
+    avg_cost: float
+    total_cost: float
+    tier_size_filled: tuple[float, float, float, float]
+    tier_cost_filled: tuple[float, float, float, float]
+    tier_size_expected: tuple[float, float, float, float]
+    tier_placed: tuple[bool, bool, bool, bool]
+    tier_filled: tuple[bool, bool, bool, bool]
+    tier_is_complete: tuple[bool, bool, bool, bool]
+    tier_server_order_id: tuple[str | None, str | None, str | None, str | None]
+    tier_expires_at: tuple[float, float, float, float]
+    baseline_realized_price: float | None
+    baseline_set_realized: bool
+    baseline_target_price: float | None
+    tp_target: float | None
+    tp_inflight: bool
+    # H-NEW-2026-07-15 (audit follow-up): server_order_id of the in-flight
+    # TP GTD, if any. Surfaced so `_check_take_profit` can issue an
+    # `ActionCancelTier` when mid retreats below the fire line after the
+    # TP has been posted but not yet filled — without this, the GTD sits
+    # on the book for the full GTD_LIFETIME_S while uPnL bleeds. None
+    # when no TP is in flight or multiple TPs are stacked (defensive —
+    # the current model only ever has one at a time).
+    tp_server_order_id: str | None
+    has_inflight_tier: bool
+    entry_token: str | None
+    entry_side: str | None
+
+
+# ---------------------------------------------------------------------------
 # Position
 # ---------------------------------------------------------------------------
 
@@ -180,14 +256,8 @@ def _tier3_factory() -> TierSnapshot:
     return TierSnapshot(tier=3, notional=_s().TIER3_NOTIONAL)
 
 
-def _tier3_factory() -> TierSnapshot:
-    return TierSnapshot(tier=3, notional=_s().TIER3_NOTIONAL)
-
-
-# H-NEW-2026-07-11-4 (simplification): _tier4_factory removed. The
-# strategy now caps at 3 tiers (T1 entry + T2 / T3 averaging layers).
-# Max total exposure = 2 + 4 + 8 = 14 USD per round. See
-# `StrategySettings.tier_notionals` for the configuration knobs.
+def _tier4_factory() -> TierSnapshot:
+    return TierSnapshot(tier=4, notional=_s().TIER4_NOTIONAL)
 
 
 @dataclass
@@ -200,16 +270,14 @@ class Position:
     tier1: TierSnapshot = field(default_factory=_tier1_factory)
     tier2: TierSnapshot = field(default_factory=_tier2_factory)
     tier3: TierSnapshot = field(default_factory=_tier3_factory)
-    # H-NEW-2026-07-11-4: tier4 removed.
+    tier4: TierSnapshot = field(default_factory=_tier4_factory)
 
-    baseline_price: float | None = None   # anchor: avg fill price after T1 fills
-    baseline_set: bool = False             # becomes True once baseline_price is anchored
     # H-3 v2 fix: baseline_target_price records the INTENDED entry price
     # (the bid at the moment _check_t1_entry decided to enter) so that
     # the martingale averaging-tier triggers stay anchored to the design
     # price, not to the actual fill average. The actual fill price still
-    # drives `_avg_cost` and TP via `baseline_price` — only the T2/T3/T4
-    # trigger lines use this target.
+    # drives `_avg_cost` and TP via `baseline_realized_price` — only the
+    # T2/T3/T4 trigger lines use this target.
     baseline_target_price: float | None = None
     # H-V6-14 fix: baseline_realized_price is the T1 avg fill price we
     # actually paid (Σ price*size / Σ size across all T1 partial fills),
@@ -248,11 +316,7 @@ class Position:
 
     @property
     def tiers(self) -> list[TierSnapshot]:
-        # H-NEW-2026-07-11-4: 3-tier cap — T1/T2/T3 only. The engine's
-        # averaging-down loop iterates `self.tiers[1:]` to walk the
-        # averaging chain. Returning T1-T3 here means it naturally
-        # stops at T3 with no further tier to trigger.
-        return [self.tier1, self.tier2, self.tier3]
+        return [self.tier1, self.tier2, self.tier3, self.tier4]
 
     @property
     def has_inflight_tier(self) -> bool:
@@ -261,6 +325,17 @@ class Position:
         H-V5-1: used by engine._check_take_profit to suppress TP while an
         averaging tier is mid-fill, since tp_target() relies on _avg_cost
         which is stale until the in-flight tier actually fills.
+
+        H-NEW-2026-07-15 tick-driven refactor: the previous condition was
+        `t.placed and not t.is_complete`, but `placed` was used as the
+        engine's "is this GTD still alive on the book" mutex, while the
+        TierWatcher's `watching` flag independently gated the slot. With
+        the watcher now passive (it no longer cancels on fill-ratio),
+        the engine's cancel decisions live in `_reconcile_inflight_buys`,
+        which sets `tier.placed = False` once it cancels the GTD. So we
+        keep the same `placed and not is_complete` semantics: `placed=True`
+        means "an unfilled GTD is on the book that the engine has not yet
+        decided to cancel".
         """
         return any(t.placed and not t.is_complete for t in self.tiers[1:])
 
@@ -287,8 +362,74 @@ class Position:
 
     @property
     def total_notional_committed(self) -> float:
-        """Sum of notional placed but not yet completed (in-flight + filled)."""
-        return sum(t.notional for t in self.tiers if t.placed)
+        """USD already filled or reserved by currently placed tier orders."""
+        return sum(
+            max(t.cost_filled, t.notional if t.placed else 0.0)
+            for t in self.tiers
+        )
+
+    # H-NEW-2026-07-15 tick-driven refactor: a single snapshot object that
+    # captures everything the strategy tick needs to make a decision in one
+    # place. Pre-snapshot, each `_check_*` helper re-derived its own view of
+    # position state from `Position`, and there was no canonical place that
+    # said "this is the round's state at this tick". Now `Engine._evaluate`
+    # computes one snapshot per tick and passes it to all four decision
+    # helpers (`_check_t1_entry`, `_check_average_down`,
+    # `_check_take_profit`, `_reconcile_inflight_buys`).
+    def snapshot(self) -> "PositionSnapshot":
+        """Return a frozen view of the position's decision-relevant state.
+
+        Recomputed on every `_evaluate` tick. Tuple fields are positional
+        over the four tiers (T1, T2, T3, T4); callers index by `tier-1`.
+        """
+        ts = self.tiers
+        return PositionSnapshot(
+            total_qty=self._total_qty,
+            avg_cost=self._avg_cost,
+            total_cost=self._total_cost,
+            tier_size_filled=tuple(t.size_filled for t in ts),
+            tier_cost_filled=tuple(t.cost_filled for t in ts),
+            tier_size_expected=tuple(t.size_expected for t in ts),
+            tier_placed=tuple(t.placed for t in ts),
+            tier_filled=tuple(t.filled for t in ts),
+            tier_is_complete=tuple(t.is_complete for t in ts),
+            tier_server_order_id=tuple(t.server_order_id for t in ts),
+            tier_expires_at=tuple(t.expires_at for t in ts),
+            baseline_realized_price=self.baseline_realized_price,
+            baseline_set_realized=self.baseline_set_realized,
+            baseline_target_price=self.baseline_target_price,
+            tp_target=self.tp_target(),
+            tp_inflight=self._tp_inflight,
+            # H-NEW-2026-07-15: surface the in-flight TP GTD's
+            # server_order_id so the engine can cancel it on mid retreat.
+            # We pick the most-recently registered snapshot whose fill is
+            # still incomplete; if no snapshot matches, None.
+            tp_server_order_id=self._resolve_inflight_tp_server_id(),
+            has_inflight_tier=self.has_inflight_tier,
+            entry_token=self.entry_token,
+            entry_side=self.entry_side,
+        )
+
+    def _resolve_inflight_tp_server_id(self) -> str | None:
+        """Return the server_order_id of the currently in-flight TP GTD.
+
+        H-NEW-2026-07-15 (audit follow-up): the engine needs this id to
+        emit an `ActionCancelTier` when mid retreats below the TP fire
+        line after the GTD has been posted. Returns the most-recent
+        snapshot that is still partially or completely unfilled; None
+        if no TP is in flight or all registered TPs are already fully
+        filled.
+
+        The dict-iteration order is insertion order in CPython 3.7+, so
+        this picks the latest registered TP when multiple are stacked
+        (defensive — current model only ever has one in flight).
+        """
+        if not self._tp_inflight or not self._tp_snapshots:
+            return None
+        for sid, snap in reversed(list(self._tp_snapshots.items())):
+            if snap.size_sold + 1e-9 < snap.target_qty:
+                return sid
+        return None
 
     @property
     def stake_cap_remaining(self) -> float:
@@ -304,15 +445,13 @@ class Position:
         """
         return max(0.0, _s().total_max_notional - self.total_notional_committed)
 
-    def tier_is_saturated(self, tier: TierSnapshot) -> bool:
-        """True if this tier has already absorbed > tier.notional * max_mult."""
-        cap = tier.notional * _s().TIER_NOTIONAL_MAX_MULT
-        return tier.cost_filled >= cap - 1e-9
-
-    def tier_notional_remaining(self, tier: TierSnapshot) -> float:
-        """How much more USD this tier may still receive before saturation."""
-        cap = tier.notional * _s().TIER_NOTIONAL_MAX_MULT
-        return max(0.0, cap - tier.cost_filled)
+    # H-NEW-2026-07-15 (tick-driven refactor): `tier_is_saturated` /
+    # `tier_notional_remaining` are removed. The new model never actively
+    # estimates USD already exposed at a tier before placement; rather, the
+    # strategy tick treats `tier.placed=True` as the single in-flight mutex,
+    # and `ActionOpenTN` only emits when the slot is free. Overspend at a
+    # tier is impossible by construction: only ONE GTD is ever on the book
+    # per (round, tier), and `_spawn_tier_watcher` rejects double-spawns.
 
     def register_tp(
         self,
@@ -374,6 +513,25 @@ class Position:
         self._tp_inflight = False
         self._last_qty_signature = 0.0
         self._tp_snapshots.clear()
+        # H-NEW-2026-07-15 (audit follow-up): when `realize_position_closed`
+        # wipes the position we also drop the watcher-result dedup set so a
+        # future legitimate watcher fire starts with a clean slate. The
+        # previous behaviour cleared silently; if a TierWatcher re-fired
+        # with the SAME `dedup_key` after a realize (e.g. stale buffered
+        # callback that the bot hadn't drained yet), it would be silently
+        # dropped by the dedupe registry. We log it so an operator can
+        # see that the dedupe set was rebuilt — by design, the round is
+        # effectively over once `realize_position_closed` runs, so any
+        # subsequent watcher fires are noise.
+        prev_dedup_size = len(self._applied_watcher_dedup)
+        if prev_dedup_size > 0:
+            log.info(
+                "position.realize_closed.dedup_reset",
+                prev_dedup_size=prev_dedup_size,
+                note="watcher dedup registry cleared alongside position; "
+                     "post-realize watcher fires with the same dedup_key "
+                     "will be re-applied (round is effectively over)",
+            )
         self._applied_watcher_dedup.clear()
 
         # Reset tier mutex state but PRESERVE buy fills so the engine
@@ -533,9 +691,14 @@ class Position:
         # the first GTD sell is still live on the CLOB (B-NEW-1, audit v3).
         # _tp_inflight is cleared only inside record_tp_fill() when a real
         # TP fill actually lands.
-        if tier.tier == 1 and not self.baseline_set and tier.size_filled > 0:
-            self.baseline_price = tier.avg_fill_price or price
-            self.baseline_set = True
+        #
+        # H-NEW-2026-07-15: the legacy `baseline_price` / `baseline_set`
+        # fields used to be written here too (as the v1 anchor for T2/T3/T4
+        # trigger lines). They became dead when `baseline_realized_price`
+        # was introduced in H-V6-14 — every consumer now reads the realized
+        # series. The fields are gone from `Position` (see top-of-class
+        # field block). The realized series below is the single source of
+        # truth for T1 fill-weighted anchoring.
 
         # H-V6-14: baseline_realized_price is the AUTHORITATIVE baseline for
         # T2/T3/T4 trigger lines once T1 has any fills. We compute it as the
@@ -547,7 +710,7 @@ class Position:
         #
         # The first time baseline_set_realized flips True is the moment T2+
         # trigger math rebases from "design price" to "real cost basis"; the
-        # transition is observable in logs as a one-shot `baseline.rebased`
+        # transition is observable in logs as a one-shot `engine.t1_rebased`
         # event. After that, baseline_realized_price continues to track the
         # live T1 VWAP (so a continued drop on T1 — e.g. another 6-share
         # partial at 0.30 — would shift the baseline lower, and T2 trigger
@@ -577,7 +740,9 @@ class Position:
             tier_filled=tier.filled,
             total_qty=self._total_qty,
             avg_cost=self._avg_cost,
-            baseline_price=self.baseline_price,
+            # NOTE: legacy baseline_price field removed (H-NEW-2026-07-15) —
+            # use baseline_realized_price / baseline_set_realized for T1
+            # anchoring; baseline_target_price for the pre-fill intent.
         )
 
     def mark_expired(self, tier: TierSnapshot, reason: str = "gtd_expired") -> None:
@@ -589,11 +754,20 @@ class Position:
 
         H-NEW-2026-07-11: also clear `watching` so the engine does not
         treat this tier as in-flight any longer.
+
+        H-NEW-2026-07-15 (audit follow-up): clear `cancel_pending` so a
+        stale dispatch latch can never block a future legitimate cancel.
+        Without this, a cancel dispatched just before the watcher's
+        EXPIRED terminal state could leave `cancel_pending=True` forever
+        (the router's `cancel_pending=False` line only runs if the
+        cancel call actually resolves; a watcher-first terminal race
+        could pre-empt the router's latch clear).
         """
         tier.placed = False
         tier.watching = False
         tier.server_order_id = None
         tier.cancel_reason = reason
+        tier.cancel_pending = False
         log.warning(
             "position.tier_expired",
             tier=tier.tier,
@@ -608,15 +782,20 @@ class Position:
     # set here so two different watcher objects observing the same order
     # (e.g. BUY + TP overlap during a single round) cannot both advance
     # position totals twice.
+    #
+    # H-NEW-2026-07-15 (audit follow-up — P2#11 dup parity): bound the
+    # dedup set with a soft warning rather than a hard cap. Per round
+    # we expect ≤ 4 entries (one terminal outcome per averaging tier +
+    # one for TP). A soft warning at 8 lets us catch runaway accumulation
+    # (e.g. a buggy watcher re-firing) without dropping legitimate dedup
+    # records on the floor. Reset on `realize_position_closed` — see
+    # P2#12 fix below for the companion logging change.
     _applied_watcher_dedup: set[tuple[str, str]] = field(default_factory=set)
+    _DEDUP_SOFT_LIMIT: int = 8
 
     @property
     def tiers(self) -> list[TierSnapshot]:
-        # H-NEW-2026-07-11-4: 3-tier cap — T1/T2/T3 only. The engine's
-        # averaging-down loop iterates `self.tiers[1:]` to walk the
-        # averaging chain. Returning T1-T3 here means it naturally
-        # stops at T3 with no further tier to trigger.
-        return [self.tier1, self.tier2, self.tier3]
+        return [self.tier1, self.tier2, self.tier3, self.tier4]
 
 
     def apply_tier_watcher_result(
@@ -678,6 +857,22 @@ class Position:
                 tier.watching = False
                 return
             self._applied_watcher_dedup.add(dedup_key)
+            # H-NEW-2026-07-15 (audit follow-up — P2#11 dup parity):
+            # soft bound on the dedup set. A clean round adds ≤ 4 entries
+            # (T1..T4 each contribute one terminal outcome) plus
+            # optionally one for TP. Beyond the soft limit, something
+            # is leaking (likely a buggy watcher re-firing the same
+            # outcome). We log a warning so an operator can investigate
+            # rather than silently truncating legitimate dedup records.
+            if len(self._applied_watcher_dedup) > self._DEDUP_SOFT_LIMIT:
+                log.warning(
+                    "position.watcher_dedup_oversize",
+                    size=len(self._applied_watcher_dedup),
+                    soft_limit=self._DEDUP_SOFT_LIMIT,
+                    note="dedup set exceeds soft limit; check for a watcher "
+                         "re-firing the same (server_id, dedup_key) — the "
+                         "round may be leaking watcher outcomes",
+                )
 
         try:
             # Monotonic — fill events may have already incremented size_filled.
@@ -881,17 +1076,18 @@ class Position:
         Formula:
             TP_pct = max(TP_MIN_PCT,
                          TP_PROFIT_PCT - N * TP_DECREMENT_PCT)
-        where N = number of completed tiers beyond T1
-                 (T1 only → N=0; T1+T2 → N=1; T1..T3 → N=2).
-        3-tier cap: max decrement = 6% (N=2), so TP target never drops
-        below TP_PROFIT_PCT - 0.06 = 14% above avg_cost.
+        where N = number of averaging tiers with an actual fill
+                 (T1 only → N=0; T1+T2 → N=1; T1..T4 → N=3).
+        With the configured 3% decrement, the four states are
+        20%, 17%, 14%, and 11% above average cost.
         """
         if self._avg_cost <= 0:
             return None
         cfg = _s()
-        # Count completed averaging tiers (T2 + T3 that have fully filled).
-        # With the 3-tier cap the max value here is 2.
-        n = sum(1 for t in self.tiers[1:] if t.is_complete)
+        n = sum(
+            1 for t in self.tiers[1:]
+            if t.size_filled > 1e-9 or t.cost_filled > 1e-9
+        )
         tp_pct = cfg.TP_PROFIT_PCT - n * cfg.TP_DECREMENT_PCT
         tp_pct = max(cfg.TP_MIN_PCT, tp_pct)
         return self._avg_cost * (1 + tp_pct)
@@ -904,7 +1100,10 @@ class Position:
         current TP target regardless of position state.
         """
         cfg = _s()
-        n = sum(1 for t in self.tiers[1:] if t.is_complete)
+        n = sum(
+            1 for t in self.tiers[1:]
+            if t.size_filled > 1e-9 or t.cost_filled > 1e-9
+        )
         tp_pct = cfg.TP_PROFIT_PCT - n * cfg.TP_DECREMENT_PCT
         return max(cfg.TP_MIN_PCT, tp_pct)
 

@@ -21,10 +21,14 @@ Covers the residual risk items from the GTD-buy/averaging/TP review:
         The mirror-only contract (never call eng.on_order_filled)
         is preserved by code review; this test pins the NaN/negative
         early-return.
-  R8  — on_new_round() resets every per-round flag (baseline_set,
-        baseline_set_realized, _applied_watcher_dedup, watcher
+  R8  — on_new_round() resets every per-round flag
+        (baseline_set_realized, _applied_watcher_dedup, watcher
         registries) so a fresh round never inherits stale reconciliation
         state from the previous round.
+
+H-NEW-2026-07-15 (audit follow-up): the legacy `baseline_set` /
+`baseline_price` fields were removed from Position, so they are no
+longer in the reset list.
 
 Run via `pytest tests/test_audit_fixes_2026_07_11_v7.py`.
 """
@@ -129,11 +133,12 @@ def _build_eval_engine(handler_raises: BaseException | None):
         TP_MIN_PCT = 0.05
         T1_ENTRY_WINDOW_S = 300
         TIER1_NOTIONAL = 2.0
-        TIER2_NOTIONAL = 4.0
-        TIER3_NOTIONAL = 8.0
-        TIER_NOTIONAL_MAX_MULT = 1.1
+        TIER2_NOTIONAL = 3.0
+        TIER3_NOTIONAL = 5.0
+        TIER4_NOTIONAL = 6.0
+        # H-NEW-2026-07-15: TIER_NOTIONAL_MAX_MULT removed.
         BASELINE_DRIFT_LIMIT = 0.0015
-        STAKE_CAP_PER_ROUND = 14.0
+        STAKE_CAP_PER_ROUND = 16.0
         tier_drop_pcts = [None, 0.30, 0.60]
     eng._s = _Cfg()
 
@@ -520,7 +525,7 @@ async def test_r8_on_new_round_resets_position_state():
     eng._t1_cap_reject_summary_logged = {}
     eng._tN_skip_last_log_ts = {}
     eng._t1_skip_last_log_ts = {}
-    eng._baseline_rebased_logged = {}  # if engine reads it on round reset
+    eng._t1_rebased_logged = {}  # if engine reads it on round reset
 
     # Minimal wiring for on_new_round (only those it touches).
     from src.strategy.gatekeeper import GateKeeper

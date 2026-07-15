@@ -63,9 +63,6 @@ async def main() -> int:
         pos._total_cost += fill_price * fill_delta
         if pos._total_qty > 0:
             pos._avg_cost = pos._total_cost / pos._total_qty
-        if tier1.tier == 1 and tier1.size_filled > 0 and not pos.baseline_set:
-            pos.baseline_price = tier1.avg_fill_price
-            pos.baseline_set = True
         if tier1.tier == 1 and tier1.size_filled > 1e-9:
             new_r = tier1.cost_filled / tier1.size_filled
             pos.baseline_realized_price = new_r

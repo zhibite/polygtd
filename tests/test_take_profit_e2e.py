@@ -251,7 +251,7 @@ async def test_take_profit_e2e_full_chain() -> None:
         TP_DECREMENT_PCT = 0.05
         TP_MIN_PCT = 0.05
         TIER_WATCHER_POLL_S = 0.5
-        TIER_WATCHER_FILL_RATIO = 0.95
+        # H-NEW-2026-07-15: TIER_WATCHER_FILL_RATIO removed.
     eng._s = _Cfg()
 
     # ------------------------------------------------------------------
@@ -277,7 +277,7 @@ async def test_take_profit_e2e_full_chain() -> None:
         "GTD_LIFETIME_S": 120,
         "SELL_SLIPPAGE_PCT": 1.0,
         "TIER_WATCHER_POLL_S": 0.5,
-        "TIER_WATCHER_FILL_RATIO": 0.95,
+        # H-NEW-2026-07-15: TIER_WATCHER_FILL_RATIO removed.
     })()
 
     # ------------------------------------------------------------------

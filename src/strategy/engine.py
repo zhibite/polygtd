@@ -23,7 +23,12 @@ from src.feeds.binance_spot import BinanceCache
 from src.market.models import MarketInfo
 from src.market.market_ws import PriceCache
 from src.strategy.gatekeeper import GateKeeper
-from src.strategy.round_state import Position, RoundState, TierSnapshot
+from src.strategy.round_state import (
+    Position,
+    PositionSnapshot,
+    RoundState,
+    TierSnapshot,
+)
 from src.infra.logging import get_logger
 
 log = get_logger(__name__)
@@ -345,12 +350,40 @@ class StrategyEngine:
     def set_binance_baseline(self, baseline: float) -> None:
         """Replace the gate baseline (called by `_on_window_baseline`).
 
-        Always overwrites whatever the gate was — safer than guarding on
-        `_round.round_start_ts` because WM sometimes re-fires the same
-        window's K-line value a few seconds later (K-line backtrack lag).
+        H-NEW-2026-07-15 (audit follow-up): guard against pathological
+        baseline jumps (e.g. WM K-line backtrack feeding a stale price,
+        or a mid-flight API error returning an order-of-magnitude value).
+        We log a WARNING if the new baseline differs from the previous
+        one by more than 1% — that's well beyond BTC's normal intra-round
+        drift and almost always indicates data corruption. We still apply
+        the new baseline (operator-visible alarm, auto-correct) instead
+        of dropping on the floor (which would freeze the gate).
         """
+        prev_baseline = (
+            self._round.binance_baseline
+            if self._round and self._round.binance_baseline
+            else (self._gate.baseline if self._gate else None)
+        )
+        if (
+            prev_baseline is not None
+            and baseline > 0
+            and prev_baseline > 0
+        ):
+            jump_pct = abs(baseline - prev_baseline) / prev_baseline
+            if jump_pct > 0.01:
+                log.warning(
+                    "engine.baseline_jump",
+                    prev=prev_baseline,
+                    new=baseline,
+                    jump_pct=round(jump_pct, 4),
+                    note="baseline moved >1% from previous value; likely "
+                         "WM K-line backtrack or upstream data issue. "
+                         "Applying anyway — operator visibility only.",
+                )
         self._gate = GateKeeper(baseline)
-        log.info("engine.baseline_set", baseline=baseline)
+        if self._round is not None:
+            self._round.binance_baseline = baseline
+        log.info("engine.baseline_set", baseline=baseline, prev_baseline=prev_baseline)
 
     async def on_round_end(self) -> None:
         """Called at round close.
@@ -599,7 +632,10 @@ class StrategyEngine:
         t.token_id = token_id
         t.expires_at = expires_at
         if placed_size is not None and placed_size > 0:
-            t.size_expected = placed_size
+            # Re-posts after a partial fill only reserve the remaining shares.
+            # Keep size_expected cumulative so is_complete still represents the
+            # whole configured tier rather than just the latest child order.
+            t.size_expected = max(t.size_expected, t.size_filled + placed_size)
         elif expected_price > 0:
             t.size_expected = t.notional / expected_price
         else:
@@ -671,19 +707,176 @@ class StrategyEngine:
                 return  # drift out of bounds — no new orders
 
             pos = self._round.position
+            # H-NEW-2026-07-15 tick-driven refactor: compute a single
+            # canonical snapshot of the position's decision-relevant state.
+            # All four `_check_*` / `_reconcile_*` helpers consume this
+            # snapshot instead of re-deriving their own view of position.
+            snap = pos.snapshot()
+
+            # ── Tick-driven cancel sweep — MUST run before any new place ───
+            # Reconcile any BUY GTDs that are still on the book but no
+            # longer wanted (mid already dropped into the next-tier zone,
+            # or mid has risen into the TP fire zone). This is the SOLE
+            # place that cancels BUY GTDs in the new model; the TierWatcher
+            # is passive and only emits lifecycle events.
+            if snap.entry_token is not None:
+                await self._reconcile_inflight_buys(bc_now, snap)
 
             # ── Not yet entered → check T1 entry ────────────────────────────
             if pos.entry_token is None:
-                await self._check_t1_entry(bc_now)
+                await self._check_t1_entry(bc_now, snap)
 
             # ── In position → check averaging-down and take-profit ───────────
             if pos.entry_token is not None:
-                await self._check_average_down(bc_now)
-                await self._check_take_profit(bc_now)
+                # Re-snapshot after reconcile; the cancel sweep may have
+                # flipped some `tier.placed` flags and we want the latest
+                # state for the place-side helpers.
+                snap = pos.snapshot()
+                await self._check_average_down(bc_now, snap)
+                await self._check_take_profit(bc_now, snap)
         finally:
             self._eval_inflight = False
 
-    async def _check_t1_entry(self, bc_now: float) -> None:
+    async def _reconcile_inflight_buys(
+        self, bc_now: float, snap: PositionSnapshot | None = None
+    ) -> None:
+        """Cancel BUY GTDs that the tick no longer wants on the book.
+
+        H-NEW-2026-07-15 tick-driven refactor: this is the SOLE BUY-side
+        cancel path under the new model. The TierWatcher is passive and
+        no longer cancels on fill-ratio or mid-cross; instead, every tick
+        inspects the live mid and decides:
+
+          1. If a tier's GTD is still on the book AND mid has crossed
+             into the next-tier fire zone (strategy_price * (1+margin)),
+             cancel it so the next tier can fire cleanly.
+          2. If a tier's GTD is still on the book AND mid has risen into
+             the TP fire zone (tp_target * (1-margin)), cancel all BUY
+             GTDs so the TP SELL can take over.
+
+        Each cancel emits an `ActionCancelTier` to the router, which calls
+        `OrderManager.cancel_by_server_id`. The router flips
+        `tier.placed = False` so `has_inflight_tier` releases and the
+        place-side helpers can advance.
+
+        Tier.is_complete tiers are skipped (no GTD to cancel). Already-
+        cancelled tiers (placed=False) are skipped.
+        """
+        if not self._round or not self._gate:
+            return
+        pos = self._round.position
+        if snap is None:
+            snap = pos.snapshot()
+        if snap.entry_token is None:
+            return
+        mid_price = self._pc.get_midpoint(snap.entry_token)
+        if mid_price <= 0:
+            return
+        margin = self._get_price_pre_margin()
+        cfg = self._s
+
+        # Compute TP fire line once. None if no TP target yet.
+        tp_target = snap.tp_target
+        tp_fire_line = (
+            tp_target * (1.0 - margin)
+            if (tp_target is not None and tp_target > 0)
+            else None
+        )
+        # TP path: mid crossed the TP fire line. Cancel every BUY GTD.
+        if tp_fire_line is not None and mid_price >= tp_fire_line:
+            for tier_idx in range(1, 4):  # T2, T3, T4 — averaging tiers
+                tier = pos.tiers[tier_idx]
+                if not tier.placed or tier.is_complete:
+                    continue
+                # H-NEW-2026-07-15 (audit follow-up): single-flight guard.
+                # Don't re-emit Cancel if a previous dispatch hasn't been
+                # resolved yet. Clearing happens in the router after
+                # `om.cancel_by_server_id` returns.
+                if tier.cancel_pending:
+                    continue
+                sid = tier.server_order_id
+                if not sid:
+                    continue
+                tier.cancel_pending = True
+                log.info(
+                    "engine.reconcile.cancel_for_tp",
+                    tier=tier.tier,
+                    server_id=sid[:16],
+                    mid=mid_price,
+                    tp_fire_line=tp_fire_line,
+                    size_filled=tier.size_filled,
+                )
+                await self._handler(ActionCancelTier(
+                    tier=tier.tier,
+                    server_order_id=sid,
+                    reason="mid_above_tp_fire",
+                ))
+            # Also cancel T1 if still on the book and unfilled.
+            tier1 = pos.tiers[0]
+            if (
+                tier1.placed
+                and not tier1.is_complete
+                and tier1.server_order_id
+                and not tier1.cancel_pending
+            ):
+                tier1.cancel_pending = True
+                log.info(
+                    "engine.reconcile.cancel_t1_for_tp",
+                    server_id=tier1.server_order_id[:16],
+                    mid=mid_price,
+                    tp_fire_line=tp_fire_line,
+                    size_filled=tier1.size_filled,
+                )
+                await self._handler(ActionCancelTier(
+                    tier=1,
+                    server_order_id=tier1.server_order_id,
+                    reason="mid_above_tp_fire",
+                ))
+            return  # do not also do the next-tier cancellation in same tick
+
+        # T1 entry anchor (token price, NOT BTC). Use realised (preferred)
+        # or target fallback. Same resolution chain as `_check_average_down`.
+        t1_entry = snap.baseline_realized_price or snap.baseline_target_price
+        if t1_entry is None or t1_entry <= 0:
+            return
+        drops = cfg.tier_drop_pcts
+
+        # Iterate T1..T3 (T4 has no next-tier).
+        for tier_idx in range(0, 3):
+            tier = pos.tiers[tier_idx]
+            if not tier.placed or tier.is_complete:
+                continue
+            # H-NEW-2026-07-15 (audit follow-up): single-flight guard.
+            if tier.cancel_pending:
+                continue
+            sid = tier.server_order_id
+            if not sid:
+                continue
+            next_drop = drops[tier_idx + 1] if tier_idx + 1 < len(drops) else None
+            if next_drop is None:
+                continue  # last tier, no next-tier to fire
+            next_strategy_price = t1_entry * (1.0 - next_drop)
+            next_fire_line = next_strategy_price * (1.0 + margin)
+            if mid_price <= next_fire_line:
+                tier.cancel_pending = True
+                log.info(
+                    "engine.reconcile.cancel_for_next_tier",
+                    tier=tier.tier,
+                    server_id=sid[:16],
+                    mid=mid_price,
+                    next_fire_line=next_fire_line,
+                    next_strategy_price=next_strategy_price,
+                    size_filled=tier.size_filled,
+                )
+                await self._handler(ActionCancelTier(
+                    tier=tier.tier,
+                    server_order_id=sid,
+                    reason="mid_below_next_fire",
+                ))
+
+    async def _check_t1_entry(
+        self, bc_now: float, snap: PositionSnapshot | None = None
+    ) -> None:
         """Check both sides for T1 entry trigger.
 
         H-NEW-2026-07-11 refactor — pre-arm trigger model:
@@ -707,12 +900,20 @@ class StrategyEngine:
 
         Output is still `ActionOpenT1(price=strategy_price)`; the router
         calls `place_buy_by_strategy_price` which uses `price_lock=True`.
+
+        H-NEW-2026-07-15: takes a `PositionSnapshot` (optional for back-
+        compat with direct test calls). When called from `_evaluate` we
+        pass the freshly-built snapshot; tests / stale callers may pass
+        None and we build one locally. This keeps the snapshot as the
+        canonical source while not breaking existing call sites.
         """
         if not self._round or not self._gate or not self._round.up_token:
             return
 
         pos = self._round.position
-        if pos.entry_token is not None:
+        if snap is None:
+            snap = pos.snapshot()
+        if snap.entry_token is not None:
             return  # already entered
 
         s = self._s
@@ -838,17 +1039,28 @@ class StrategyEngine:
             ))
             return  # enter only once per round
 
-    async def _check_average_down(self, bc_now: float) -> None:
+    async def _check_average_down(
+        self, bc_now: float, snap: PositionSnapshot | None = None
+    ) -> None:
         """
         Check if the next averaging tier should be triggered.
 
         H-NEW-2026-07-11 refactor — pre-arm trigger model:
 
-          Trigger line : `strategy_price = baseline * (1 - tier_drop_pct)`
+          Anchor       : `t1_entry` = T1 actual fill-weighted avg
+                         (NOT BTC baseline, NOT T1 pre-fill cap)
+          Trigger line : `strategy_price = t1_entry * (1 - tier_drop_pct)`
           Fire line    : mid <= strategy_price * (1 + PRICE_PRE_MARGIN)
-                         (e.g. T2 with baseline=0.40, drop=20%, margin=10%
+                         (e.g. T2 with t1_entry=0.40, drop=20%, margin=10%
                               → strategy_price=0.32, fire when mid <= 0.352)
           GTD posted at: strategy_price exactly
+
+        H-NEW-2026-07-15 (audit follow-up — naming): the parameter
+        previously called `baseline` here was the T1 entry price (token
+        market), which has no relation to the `GateKeeper.btc_baseline`
+        used for drift checks. They shared a name historically; renamed
+        the averaging anchor to `t1_entry` for clarity. See `gatekeeper.py`
+        for the BTC-vs-token contrast.
 
         This matches the T1 pre-arm design. The bot no longer waits until
         mid crosses strategy_price before posting the GTD; it posts early
@@ -863,184 +1075,90 @@ class StrategyEngine:
         (set by the watcher spawn, cleared when the watcher terminates).
         `placed=True` alone no longer holds the slot — the GTD may have
         been cancelled / expired while the watcher is still terminating.
+
+        H-NEW-2026-07-15: takes a `PositionSnapshot`. Most of the
+        baseline-resolution chain is unchanged; we just consult the
+        snapshot for `baseline_realized_price` / `baseline_target_price`
+        instead of reading `pos` repeatedly.
         """
         if not self._round or not self._gate:
             return
 
         pos = self._round.position
-        if pos.entry_token is None:
+        if snap is None:
+            snap = pos.snapshot()
+        if snap.entry_token is None:
             return
-        # NOTE: legacy `pos.baseline_set` gate removed (H-NEW-2026-07-11 audit v6-13).
-        # The flag was only flipped in `record_fill` (the WS fill path), but the
-        # TierWatcher fast-fill path bypasses `record_fill` and goes straight
-        # into `apply_tier_watcher_result`, which sets `baseline_set_realized`
-        # but NOT `baseline_set`. Result: averaging-down was stuck in the
-        # first-branch early-return for every round whose T1 filled via the
-        # fast-fill path (production saw uPnL -46% with no T2 trigger).
-        # The baseline fallback chain at lines below already prefers
-        # `baseline_realized_price` and falls back to `baseline_target_price`,
-        # so there is no longer any need for this flag. Tick-level drift
+        # NOTE: legacy `Position.baseline_set` / `Position.baseline_price`
+        # fields removed entirely (H-NEW-2026-07-15). Previously the
+        # `baseline_set` flag was only flipped in `record_fill` (the WS
+        # fill path), but the TierWatcher fast-fill path bypassed
+        # `record_fill` and went straight into `apply_tier_watcher_result`,
+        # which set `baseline_set_realized` but NOT `baseline_set`.
+        # Averaging-down was therefore stuck in the first-branch
+        # early-return for every round whose T1 filled via the fast-fill
+        # path (production saw uPnL -46% with no T2 trigger). The
+        # replacement `baseline_set_realized` anchor is written by ALL
+        # fill paths. The legacy fields had no remaining reader anywhere
+        # in the engine, so they were removed entirely. Tick-level drift
         # gating is the caller's responsibility (see _evaluate line ~595).
 
-        if pos._tp_inflight:
+        if snap.tp_inflight:
             return
 
         mid_price = self._pc.get_midpoint(pos.entry_token)
         if mid_price <= 0:
             return
 
-        # ── DIAG-2026-07-11: trace why T2 averaging never fires ────────────
-        # Logs every tick after the silent early-returns so we can see
-        # whether the function falls through to trigger_tN or gets stuck
-        # upstream. Safe to delete once the bug is located.
-        # ── DIAG-2026-07-11 (throttled 2026-07-12): trace why T2 averaging
-        # never fires. Logs one row per (round, side) every T2_DIAG_THROTTLE_S
-        # seconds, plus an extra row whenever the diagnostic fingerprint
-        # changes (entry_token, cache_keys_count, cache_first_key) so we
-        # still see a state transition even if it falls between throttle
-        # windows. The original implementation logged every 250ms tick
-        # (~3600 lines per 15m round) and drowned the operator signal.
-        # The breadcrumb itself is still valid for the H-NEW-2026-07-11
-        # audit v6-12 prod symptom ("T1 filled at 0.39, mid dropped to
-        # 0.155, but `_check_average_down` never fired").
-        T2_DIAG_THROTTLE_S = 10.0
-        try:
-            _cache_keys = list(self._pc.midpoint.keys())
-            _diag_round = self._round.round_start_ts if self._round else 0
-            _diag_side = pos.entry_side or "?"
-            _diag_rk = (_diag_round, _diag_side)
-            # Build a small fingerprint of the fields an operator would
-            # actually use to spot a state change. We deliberately
-            # exclude `mid` and `tp_inflight` (both move every tick) so
-            # the fingerprint only changes on real state transitions.
-            _fingerprint = "|".join(
-                [
-                    (pos.entry_token or "")[:32],
-                    str(len(_cache_keys)),
-                    (_cache_keys[0][:32] if _cache_keys else ""),
-                    str(bool(pos.baseline_set_realized)),
-                    str(pos.baseline_realized_price or 0.0),
-                    str(bool(pos.tiers[1].placed)),
-                    str(bool(pos.tiers[1].watching)),
-                    str(bool(pos.tiers[1].is_complete)),
-                    str(bool(pos.tiers[1].server_order_id)),
-                ]
-            )
-            _now = time.time()
-            # H-NEW-2026-07-12: the throttle init must also tolerate the
-            # __new__ test path that bypasses __init__ (i.e. the dicts may
-            # not exist on the instance yet). fall back to empty dicts
-            # rather than crashing on AttributeError.
-            _last_ts = getattr(self, "_t2_diag_last_log_ts", {}).get(_diag_rk, 0.0)
-            _last_fp = getattr(self, "_t2_diag_last_fingerprint", {}).get(_diag_rk, "")
-            if _now - _last_ts >= T2_DIAG_THROTTLE_S or _fingerprint != _last_fp:
-                log.info(
-                    "engine.t2_diag",
-                    entry_token=pos.entry_token[:32] if pos.entry_token else None,
-                    cache_key_match=pos.entry_token in self._pc.midpoint if pos.entry_token else False,
-                    cache_keys_count=len(_cache_keys),
-                    cache_first_key=_cache_keys[0][:32] if _cache_keys else None,
-                    cache_first_mid=self._pc.midpoint[_cache_keys[0]] if _cache_keys else None,
-                    mid=mid_price,
-                    tp_inflight=pos._tp_inflight,
-                    baseline_realized=pos.baseline_realized_price,
-                    baseline_set_realized=pos.baseline_set_realized,
-                    baseline_target=pos.baseline_target_price,
-                    tier2_placed=pos.tiers[1].placed,
-                    tier2_watching=pos.tiers[1].watching,
-                    tier2_is_complete=pos.tiers[1].is_complete,
-                    tier2_server_id=pos.tiers[1].server_order_id,
-                )
-                if not hasattr(self, "_t2_diag_last_log_ts"):
-                    self._t2_diag_last_log_ts = {}
-                if not hasattr(self, "_t2_diag_last_fingerprint"):
-                    self._t2_diag_last_fingerprint = {}
-                self._t2_diag_last_log_ts[_diag_rk] = _now
-                self._t2_diag_last_fingerprint[_diag_rk] = _fingerprint
-        except Exception as _diag_exc:
-            log.warning("engine.t2_diag.error", error=str(_diag_exc))
-
-        # Baseline anchoring.
-        # H-NEW-2026-07-12 (operator clarification, prod window 1783819800):
-        # averaging-down tiers (T2/T3) must measure the drop from the
-        # *realized* T1 entry price — not the T1 strategy/intended bid —
-        # because that is what the operator specified ("跌幅30%、60%都
-        # 是从入场价T1算"). The previous fallback chain (target →
-        # legacy baseline) silently let T2 fire with a baseline of 0.36
-        # (the T1 cap) in prod, even though T1 had not yet filled and
-        # the realised entry would end up at 0.22.
+        # ── T1 entry-anchor resolution ────────────────────────────────────
+        # Refill thresholds are measured from the realised T1 entry price
+        # (token price, NOT BTC/USD). T2/T3/T4 averaging must wait for at
+        # least one confirmed T1 fill so the anchor reflects what was
+        # actually paid (vs the pre-fill limit price, which can be stale
+        # by 200-500ms when T1 fills quickly).
         #
-        # Resolution priority (new):
-        #   1. baseline_realized_price (set when T1 first fill lands)
-        #      — this is the "true" T1 entry the operator wants
-        #   2. baseline_target_price — pre-fill T1 intended bid, used
-        #      only when no fill has arrived yet; covers the common
-        #      case where T1 and T2 both fire on the same tick (the
-        #      tick before the T1 fill callback lands).
-        #   3. (REMOVED) legacy baseline_price — was a stale price from
-        #      a previous strategy design that has since been deprecated.
-        #      Falling back to it gave the prod window 1783819800 its
-        #      T2 fire at baseline=0.36 even when T1 had not filled.
-        if pos.baseline_set_realized and pos.baseline_realized_price is not None:
-            new_baseline = pos.baseline_realized_price
-            if not getattr(pos, "_baseline_rebased_logged", False):
+        # Resolution priority:
+        #   1. baseline_realized_price — T1 fill-weighted avg (preferred)
+        #   2. baseline_target_price   — pre-fill intended bid (only used
+        #      when no fill has arrived yet; covers the common case where
+        #      T1 and T2 both fire on the same tick)
+        #   3. (REMOVED) legacy baseline_price — was a stale price from a
+        #      previous strategy design that has since been deprecated.
+        #      Falling back to it gave prod window 1783819800 its T2 fire
+        #      at baseline=0.36 even when T1 had not filled.
+        if snap.baseline_set_realized and snap.baseline_realized_price is not None:
+            t1_entry = snap.baseline_realized_price
+            if not getattr(pos, "_t1_rebased_logged", False):
                 log.info(
-                    "baseline.rebased",
+                    "engine.t1_rebased",
                     side=pos.entry_side,
-                    from_target=pos.baseline_target_price,
-                    from_realized=pos.baseline_realized_price,
+                    t1_target=snap.baseline_target_price,
+                    t1_realized=snap.baseline_realized_price,
                     tick_size=pos.tiers[0].size_expected if pos.tiers else None,
                     note="T2/T3/T4 trigger lines now anchored to actual T1 "
                          "fill avg (weighted across partials) instead of "
                          "intended bid at T1 decision time",
                 )
-                pos._baseline_rebased_logged = True
-            baseline = new_baseline
-        elif pos.baseline_target_price is not None:
+                pos._t1_rebased_logged = True
+        elif snap.baseline_target_price is not None:
             # No realised fill yet — use the pre-fill T1 intended bid.
-            # This is NOT the operator-preferred "from realised entry"
-            # anchor, but it is a sane number (the T1 limit price the
-            # engine itself just chose a moment ago) and prevents the
-            # function from silently bailing while T1 is still in
-            # flight.
-            baseline = pos.baseline_target_price
+            t1_entry = snap.baseline_target_price
         else:
-            # No resolvable baseline at all (e.g. test stubs that bypass
-            # the production bind path). Bail cleanly and surface the
-            # state so operators see the round is alive but unanchorable.
             log.info(
                 "engine.tN_skip_t1_not_yet_filled",
                 side=pos.entry_side,
-                baseline_target=pos.baseline_target_price,
-                note="averaging-down has no resolvable baseline; "
+                t1_target=snap.baseline_target_price,
+                note="averaging-down has no resolvable T1 anchor; "
                      "loop returns until T1 first fill lands",
             )
             return
-        # Defensive: if the fallback chain produced None (e.g. test stubs
-        # that bypass the production bind path, or a future refactor that
-        # breaks baseline anchoring), bail out cleanly and surface the state
-        # so operators see the round is alive but unanchorable. We log at
-        # INFO rather than via _tN_skip_log because this is a positional /
-        # state matter, not a tier-level decision.
-        if baseline is None:
-            log.info(
-                "engine.tN_skip_no_baseline",
-                side=pos.entry_side,
-                baseline_realized=pos.baseline_realized_price,
-                baseline_target=pos.baseline_target_price,
-                baseline_legacy=pos.baseline_price,
-                baseline_set_realized=pos.baseline_set_realized,
-                note="averaging-down called with no resolvable baseline; "
-                     "skipping all T2..T4 trigger evaluations this tick",
-            )
-            return
-        pos._last_used_baseline_value = baseline
+        pos._last_used_t1_entry = t1_entry
         s = self._s
         margin = self._get_price_pre_margin()
 
-        for tier in pos.tiers[1:]:  # T2, T3 (3-tier cap — H-NEW-2026-07-11-4)
+        for tier in pos.tiers[1:]:  # T2, T3, T4
             # H-NEW-2026-07-12 (operator clarification, prod window 1783819800):
-            # T2/T3 averaging MUST wait for at least one confirmed T1 fill
+            # T2/T3/T4 averaging MUST wait for at least one confirmed T1 fill
             # before evaluating. The 30%/60% drop is measured from the
             # T1 entry price (which we only know after T1 has filled),
             # not from the T1 strategy/intended bid.
@@ -1064,7 +1182,7 @@ class StrategyEngine:
             # diagnostic trace were confused into thinking the per-tier
             # skip was a different condition. We keep the guard (the
             # behavior is unchanged) but drop the per-tier skip log.
-            if not pos.baseline_set_realized or pos.baseline_realized_price is None:
+            if not snap.baseline_set_realized or snap.baseline_realized_price is None:
                 continue
             if tier.is_complete:
                 # H-NEW-2026-07-11 (audit v6-12): was silent. Without this
@@ -1104,24 +1222,14 @@ class StrategyEngine:
                 tier.placed = False
                 tier.expires_at = 0.0
 
-            if pos.tier_is_saturated(tier):
-                log.warning(
-                    "engine.tier_saturated_skip",
-                    tier=tier.tier,
-                    cost_filled=tier.cost_filled,
-                    cap=tier.notional * s.TIER_NOTIONAL_MAX_MULT,
-                    planned=tier.notional,
-                )
-                continue
-
-            strategy_price = tier.trigger_price(baseline)
+            strategy_price = tier.trigger_price(t1_entry)
             if strategy_price is None:
                 # H-NEW-2026-07-11 (audit v6-12): was silent. Should never
                 # happen for T2..T4 because tier_drop_pcts has entries for
                 # those tiers, but surface it if it does.
                 self._tN_skip_log(
                     "engine.tN_skip_no_trigger_price",
-                    tier=tier.tier, baseline=baseline,
+                    tier=tier.tier, t1_entry=t1_entry,
                     drop_pcts=s.tier_drop_pcts,
                 )
                 continue
@@ -1137,14 +1245,14 @@ class StrategyEngine:
                 self._tN_skip_log(
                     "engine.tN_skip_price_above_fire",
                     tier=tier.tier, mid=mid_price, fire_line=fire_line,
-                    strategy_price=strategy_price, baseline=baseline,
+                    strategy_price=strategy_price, t1_entry=t1_entry,
                     margin=margin,
                 )
                 continue
 
             # BTC drift gate for averaging.
             next_drop = TierSnapshot._next_tier_drop(tier.tier)
-            if not self._gate.can_double_down(bc_now, mid_price, tier.tier, next_drop, baseline):
+            if not self._gate.can_double_down(bc_now, mid_price, tier.tier, next_drop, t1_entry):
                 # H-NEW-2026-07-11 (audit v6-12): was silent. Drift
                 # blocking averaging is rare (the gate has a bypass once
                 # price has dropped past the next-tier zone) but when it
@@ -1152,25 +1260,25 @@ class StrategyEngine:
                 gs = self._gate.state(bc_now)
                 self._tN_skip_log(
                     "engine.tN_skip_drift_gate",
-                    tier=tier.tier, mid=mid_price, baseline=baseline,
+                    tier=tier.tier, mid=mid_price, t1_entry=t1_entry,
                     drift=gs.drift, within_limit=gs.within_limit,
                     bc_now=bc_now, next_drop=next_drop,
                 )
                 continue
 
-            # Per-tier remaining cap (defense-in-depth)
-            tier_remaining = pos.tier_notional_remaining(tier)
-            if tier_remaining < tier.notional * 0.5:
-                log.warning(
-                    "engine.tier_remaining_low_skip",
-                    tier=tier.tier, tier_remaining=tier_remaining,
-                )
-                continue
+            # H-NEW-2026-07-15 (tick-driven refactor): the per-tier
+            # notional-remaining cap is removed. Under the new model only
+            # ONE GTD is ever on the book per (round, tier) — the
+            # ActionRouter's `_spawn_tier_watcher` rejects double-spawns
+            # at the same key, and the strategy tick cancels the existing
+            # GTD before placing the next tier's. We therefore trust
+            # `tier.notional` directly: no mid-flight USD budget check.
+            order_notional = tier.notional
 
-            if pos.stake_cap_remaining < tier.notional:
+            if pos.stake_cap_remaining < order_notional:
                 log.debug(
                     "engine.tN_skip_cap",
-                    tier=tier.tier, remaining=pos.stake_cap_remaining, needed=tier.notional,
+                    tier=tier.tier, remaining=pos.stake_cap_remaining, needed=order_notional,
                 )
                 continue
 
@@ -1180,22 +1288,23 @@ class StrategyEngine:
                 mid=mid_price,
                 fire_line=fire_line,
                 strategy_price=strategy_price,
-                baseline=baseline,
-                notional=tier.notional,
+                t1_entry=t1_entry,
+                notional=order_notional,
             )
 
-            # H-NEW-2026-07-11: pass strategy_price (not bid_price).
-            # Same pre-arm logic as T1.
+            # Same pre-arm logic as T1: post at the configured strategy price.
             await self._handler(ActionOpenTN(
                 tier=tier.tier,
                 token=pos.entry_token,
                 price=strategy_price,
-                notional=tier.notional,
+                notional=order_notional,
                 trigger_price=fire_line,
             ))
             return  # place one tier at a time
 
-    async def _check_take_profit(self, bc_now: float) -> None:
+    async def _check_take_profit(
+        self, bc_now: float, snap: PositionSnapshot | None = None
+    ) -> None:
         """Check if take-profit should trigger.
 
         H-NEW-2026-07-11 refactor — pre-arm trigger model (SELL side):
@@ -1209,12 +1318,17 @@ class StrategyEngine:
         callback), do not enqueue a new TP action. The flag is cleared by the
         next fill event so residual position can re-arm if mid is still
         above the target.
+
+        H-NEW-2026-07-15: takes a `PositionSnapshot`. Behaviour is unchanged;
+        we just read state from the snapshot instead of `pos.*`.
         """
         if not self._round or not self._gate:
             return
 
         pos = self._round.position
-        if not pos.entry_token or pos.total_qty <= 0:
+        if snap is None:
+            snap = pos.snapshot()
+        if not snap.entry_token or snap.total_qty <= 0:
             return
 
         # R6 (audit 2026-07-12): avg_cost sanity gate.
@@ -1237,14 +1351,14 @@ class StrategyEngine:
         # `slack = 1e-6 * max(_total_qty, 1.0)` tolerates FP rounding
         # without dropping a real 6+ share gap (which would mean a TP
         # fired against a partial position view).
-        sum_tier_qty = sum(t.size_filled for t in pos.tiers)
-        qty_slack = max(1e-6 * max(pos.total_qty, 1.0), 1e-9)
-        if sum_tier_qty - pos.total_qty > qty_slack:
+        sum_tier_qty = sum(snap.tier_size_filled)
+        qty_slack = max(1e-6 * max(snap.total_qty, 1.0), 1e-9)
+        if sum_tier_qty - snap.total_qty > qty_slack:
             log.warning(
                 "engine.tp_blocked_avg_cost_unreconciled",
-                total_qty=pos.total_qty,
+                total_qty=snap.total_qty,
                 sum_tier_qty=sum_tier_qty,
-                qty_gap=sum_tier_qty - pos.total_qty,
+                qty_gap=sum_tier_qty - snap.total_qty,
                 tiers_qty={
                     f"T{t.tier}": {
                         "placed_qty": t.placed_qty,
@@ -1286,16 +1400,40 @@ class StrategyEngine:
         if pos.entry_token:
             cur_mid_pre = self._pc.get_midpoint(pos.entry_token)
             if cur_mid_pre > 0:
-                tp_target_pre = pos.tp_target()
+                tp_target_pre = snap.tp_target
                 if tp_target_pre is not None:
                     margin_pre = self._get_price_pre_margin()
                     fire_line_pre = tp_target_pre * (1.0 - margin_pre)
                     if cur_mid_pre < fire_line_pre:
                         # Opportunity retreated — clear backoff and bail.
-                        if getattr(self, "_tp_post_failure_count", 0) > 0:
+                        #
+                        # H-NEW-2026-07-15 (audit follow-up): release the
+                        # in-flight mutex in lockstep with the backoff
+                        # reset. Without this, an earlier
+                        # `_check_take_profit` could have set
+                        # `_tp_inflight=True` while it waited on the
+                        # backoff timer (see `notify_tp_post_error`), so
+                        # clearing only the backoff fields leaves the
+                        # TP path wedged in the next tick
+                        # (`_tp_inflight` would short-circuit
+                        # `trigger_tp`). Reset both as an atomic
+                        # state-machine transition.
+                        prev_inflight = bool(pos._tp_inflight)
+                        prev_tp_sid = (
+                            snap.tp_server_order_id
+                            if hasattr(snap, "tp_server_order_id")
+                            else None
+                        )
+                        if prev_inflight:
+                            pos._tp_inflight = False
+                        if getattr(self, "_tp_post_failure_count", 0) > 0 or prev_inflight:
                             log.info(
                                 "engine.tp_backoff_reset_no_opportunity",
                                 failure_count=getattr(self, "_tp_post_failure_count", 0),
+                                prev_tp_inflight=prev_inflight,
+                                tp_server_order_id=(
+                                    prev_tp_sid[:16] if prev_tp_sid else None
+                                ),
                                 mid=cur_mid_pre,
                                 fire_line=fire_line_pre,
                                 note="mid retreated below fire-line during TP-backoff window; "
@@ -1304,20 +1442,49 @@ class StrategyEngine:
                         self._tp_last_post_error_ts = 0.0
                         self._tp_post_failure_count = 0
                         self._tp_backoff_s = 5.0
+                        # H-NEW-2026-07-15 (audit follow-up): when an
+                        # in-flight TP GTD is alive on the CLOB but the
+                        # opportunity has retreated, cancel the GTD
+                        # instead of letting it sit for the full
+                        # GTD_LIFETIME_S. Without this the GTD blocks
+                        # the maker allowance for up to 5 minutes while
+                        # uPnL bleeds. The router uses `tier=5` as a
+                        # sentinel meaning "this is a TP GTD, not a BUY
+                        # tier"; on its way out it releases `_tp_inflight`
+                        # so the next tick can re-evaluate cleanly.
+                        if prev_inflight and prev_tp_sid:
+                            try:
+                                await self._handler(ActionCancelTier(
+                                    tier=-1,               # sentinel for TP GTD
+                                    server_order_id=prev_tp_sid,
+                                    reason="tp_mid_retreated",
+                                ))
+                            except Exception as exc:
+                                # Defensive: if the router dispatch fails,
+                                # we still released the mutex — next tick
+                                # can re-fire. Log so operators see it.
+                                log.warning(
+                                    "engine.tp_retreated_cancel_dispatch_failed",
+                                    tp_server_order_id=prev_tp_sid[:16],
+                                    error=str(exc),
+                                    note="mutex already released; the "
+                                         "GTD may sit on the CLOB until "
+                                         "natural expiry",
+                                )
                         return
 
-        if pos._tp_inflight:
+        if snap.tp_inflight:
             return
 
         # H-V5-1 fix: TP must wait for any in-flight averaging tier to settle.
-        if pos.has_inflight_tier:
+        if snap.has_inflight_tier:
             return
 
         mid_price = self._pc.get_midpoint(pos.entry_token)
         if mid_price <= 0:
             return
 
-        tp_target = pos.tp_target()
+        tp_target = snap.tp_target
         if tp_target is None:
             return
 
@@ -1346,8 +1513,8 @@ class StrategyEngine:
             fire_line=fire_line,
             tp_target=tp_target,
             tp_pct=pos.tp_pct_for_current_state(),
-            avg_cost=pos.avg_cost,
-            qty=pos.total_qty,
+            avg_cost=snap.avg_cost,
+            qty=snap.total_qty,
         )
 
         # H-NEW-2026-07-11: pass tp_target as the GTD limit (not bid_price).
@@ -1368,7 +1535,7 @@ class StrategyEngine:
             await self._handler(ActionTakeProfit(
                 token=pos.entry_token,
                 price=tp_target,
-                qty=pos.total_qty,
+                qty=snap.total_qty,
             ))
         except BaseException:
             # Any failure (Exception or CancelledError) — drop the mutex

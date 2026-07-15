@@ -3,11 +3,14 @@
 Covers:
   B-V4-1  — place_buy / place_gtd_sell / place_sell drop sentinel + pending_fills on failure
   B-V4-2  — ActionRouter rolls back entry_token / entry_side / tier state on place_buy=None
-  H-V4-1  — place_buy_by_notional sizes the order AFTER the orderbook price snap
   H-V4-2  — stake_cap_remaining uses total_notional_committed (in-flight counts)
   M-V4-1  — purge_round drops in-memory state for finished rounds
   M-V4-2  — _check_average_down resets a tier whose `placed=True` has no `server_order_id`
   M-V4-3  — cancel / cancel_market drain pending_fills for the affected server_id
+
+H-NEW-2026-07-15 (audit follow-up): H-V4-1 was removed alongside the
+`place_buy_by_notional` wrapper it tested — that method no longer
+exists on OrderManager.
 
 Run via `pytest tests/test_audit_fixes_2026_07_11_v4.py`.
 """
@@ -255,9 +258,6 @@ class _StubEngine:
 class _FailingOM:
     """place_buy / place_gtd_sell / place_sell / place_buy_by_strategy_price all return None."""
 
-    async def place_buy_by_notional(self, **kw):
-        return None
-
     async def place_buy_by_strategy_price(self, **kw):
         return None
 
@@ -334,84 +334,12 @@ async def test_b_v4_2_router_tn_failure_resets_tier_state() -> None:
     assert pos.tier2.expires_at == 0.0
 
 
-# ---------------------------------------------------------------------------
-# H-V4-1: place_buy_by_notional sizes AFTER the price snap
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_h_v4_1_place_buy_by_notional_uses_adjusted_price() -> None:
-    """`place_buy_by_notional(notional=2.0)` with ref_price=0.40 must
-    end up calling the underlying place_gtd_buy with size = 2.0 /
-    adjusted_price, where adjusted_price is the orderbook bid + BUY_STEP
-    (i.e. 0.405, not 0.40).
-
-    This closes the H-V4-1 audit finding: previously router computed
-    size with the engine's decision-time bid, while CLOB accepted the
-    order at adjusted_price, so actual cost was 1-3% over planned
-    notional.
-    """
-    captured: list[dict[str, Any]] = []
-
-    class _RecordingClob:
-        async def place_gtd_buy(self, **kw: Any) -> FillResult:
-            captured.append(kw)
-            return FillResult(
-                order_id="0xT1",
-                tokens=kw["size"],
-                usdc=kw["size"] * kw["price"],
-                fill_price=kw["price"],
-                success=True,
-                expiration_ts=int(time.time()) + 200,
-            )
-
-    clob = _RecordingClob()
-    mgr = _build_om(clob)
-
-    # Force _adjust_buy_price to return 0.405 (bid 0.40 + half tick 0.005).
-    async def _stub_adjust(token_id, price, tick_size=0.01):
-        return 0.405
-    mgr._adjust_buy_price = _stub_adjust
-
-    order = await mgr.place_buy_by_notional(
-        token_id="tok",
-        notional=2.0,
-        ref_price=0.40,
-        round_start_ts=int(time.time()),
-        tier_name="T1",
-        tick_size=0.01,
-    )
-
-    assert order is not None
-    assert len(captured) == 1
-    sent = captured[0]
-    assert sent["price"] == pytest.approx(0.405)
-    # size = notional / adjusted_price = 2.0 / 0.405 ≈ 4.9383
-    assert sent["size"] == pytest.approx(2.0 / 0.405)
-    # And critically: NOT 2.0 / 0.40 = 5.0
-    assert sent["size"] != pytest.approx(5.0)
-
-
-@pytest.mark.asyncio
-async def test_h_v4_1_place_buy_by_notional_no_price_returns_none() -> None:
-    """If both orderbook and ref_price are unusable, return None cleanly
-    (no negative size, no division by zero)."""
-    clob = _StubClob()
-    mgr = _build_om(clob)
-
-    async def _bad_adjust(token_id, price, tick_size=0.01):
-        return 0.0
-    mgr._adjust_buy_price = _bad_adjust
-
-    order = await mgr.place_buy_by_notional(
-        token_id="tok",
-        notional=2.0,
-        ref_price=0.0,
-        round_start_ts=int(time.time()),
-        tier_name="T1",
-        tick_size=0.01,
-    )
-    assert order is None
+# H-NEW-2026-07-15 (audit follow-up): `place_buy_by_notional` was
+# removed from OrderManager (see order_manager.py docstring). The
+# H-V4-1 tests above were removed alongside the wrapper — they covered
+# a sizing path (notional / ref_price) that is no longer reachable from
+# any production caller. Sizing now happens inside
+# `place_buy_by_strategy_price`.
 
 
 # ---------------------------------------------------------------------------
@@ -430,18 +358,17 @@ def test_h_v4_2_stake_cap_counts_inflight_notional() -> None:
     pos.record_fill(pos.tier1, price=0.40, size=5.0)
 
     assert pos._total_cost == pytest.approx(2.0)
-    # H-NEW-2026-07-11-4: 3-tier cap. Total max exposure is 2+4+8=14 USD.
-    # 14 - 2 (T1 filled cost) = 12.
-    assert pos.stake_cap_remaining == pytest.approx(12.0)  # 14 - 2
+    # Four-layer strategy. Total max exposure is 2+3+5+6=16 USD.
+    # 16 - 2 (T1 filled) = 14.
+    assert pos.stake_cap_remaining == pytest.approx(14.0)
 
     # Mark T2 as placed (in-flight) without any fill yet.
     pos.tier2.placed = True
     pos.tier2.server_order_id = "0xt2"
 
-    # H-V4-2: stake_cap_remaining must use total_notional_committed,
-    # which now includes T2's notional (4.0). 14 - (2 + 4) = 8.
-    assert pos.total_notional_committed == pytest.approx(6.0)
-    assert pos.stake_cap_remaining == pytest.approx(8.0), (
+    # T2 reserves 3 USD, so 16 - (2 + 3) = 11.
+    assert pos.total_notional_committed == pytest.approx(5.0)
+    assert pos.stake_cap_remaining == pytest.approx(11.0), (
         "H-V4-2 violation: stake_cap_remaining did not account for "
         "T2's in-flight notional. Use total_notional_committed, not "
         "_total_cost."
@@ -456,8 +383,8 @@ def test_h_v4_2_stake_cap_no_inflight_unchanged() -> None:
     pos.tier1.size_expected = 5.0
     pos.record_fill(pos.tier1, price=0.40, size=5.0)
     # No in-flight.
-    # H-NEW-2026-07-11-4: 3-tier cap. 14 - 2 (T1 filled) = 12.
-    assert pos.stake_cap_remaining == pytest.approx(12.0)
+    # No in-flight orders: 16 - 2 (T1 filled) = 14.
+    assert pos.stake_cap_remaining == pytest.approx(14.0)
 
 
 # ---------------------------------------------------------------------------
@@ -552,7 +479,7 @@ async def test_m_v4_2_stale_tier_resets_and_refires() -> None:
     pos.entry_token = "tok"
     pos.entry_side = "UP"
     pos.baseline_target_price = 0.40
-    pos.baseline_set = True
+    # legacy pos.baseline_set removed (H-NEW-2026-07-15)
     # H-NEW-2026-07-12: anchor to realised T1 fill so the T1-has-filled
     # guard passes and the averaging loop can reach the stale-tier path.
     pos.baseline_realized_price = 0.40
@@ -574,10 +501,12 @@ async def test_m_v4_2_stale_tier_resets_and_refires() -> None:
         captured.append(action)
     eng._handler = handler
     eng._s = type("S", (), {
-        "TIER2_NOTIONAL": 2.0,
-        "TIER3_NOTIONAL": 4.0,
-        # H-NEW-2026-07-11-4: TIER4_NOTIONAL removed (3-tier cap).
-        "TIER_NOTIONAL_MAX_MULT": 1.1,
+        "TIER2_NOTIONAL": 3.0,
+        "TIER3_NOTIONAL": 5.0,
+        "TIER4_NOTIONAL": 6.0,
+        # H-NEW-2026-07-15: TIER_NOTIONAL_MAX_MULT removed (engine
+        # trusts the per-(round,tier) spawn mutex; no mid-flight cap).
+        "tier_drop_pcts": [None, 0.20, 0.40, 0.60],
     })()
 
     await eng._check_average_down(100000.0)
@@ -604,7 +533,7 @@ async def test_m_v4_2_valid_inflight_tier_still_skipped() -> None:
     pos.entry_token = "tok"
     pos.entry_side = "UP"
     pos.baseline_target_price = 0.40
-    pos.baseline_set = True
+    # legacy pos.baseline_set removed (H-NEW-2026-07-15)
     pos._total_qty = 5.0
     pos._total_cost = 2.0
     pos.tier2.placed = True
@@ -620,10 +549,12 @@ async def test_m_v4_2_valid_inflight_tier_still_skipped() -> None:
         captured.append(action)
     eng._handler = handler
     eng._s = type("S", (), {
-        "TIER2_NOTIONAL": 2.0,
-        "TIER3_NOTIONAL": 4.0,
-        # H-NEW-2026-07-11-4: TIER4_NOTIONAL removed (3-tier cap).
-        "TIER_NOTIONAL_MAX_MULT": 1.1,
+        "TIER2_NOTIONAL": 3.0,
+        "TIER3_NOTIONAL": 5.0,
+        "TIER4_NOTIONAL": 6.0,
+        # H-NEW-2026-07-15: TIER_NOTIONAL_MAX_MULT removed (engine
+        # trusts the per-(round,tier) spawn mutex; no mid-flight cap).
+        "tier_drop_pcts": [None, 0.20, 0.40, 0.60],
     })()
 
     await eng._check_average_down(100000.0)

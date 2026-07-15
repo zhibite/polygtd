@@ -1,28 +1,33 @@
 """TierWatcher — single source of truth for an in-flight GTD order.
 
-Refactor (H-NEW-2026-07-11): replaces the previous "CLOBClient poll loop
-+ UserWS fill events + GtdExpiryWatcher sweep" triad with ONE background
-task per placed order. The watcher:
+Refactor (H-NEW-2026-07-15 tick-driven refactor): the watcher is now a
+PASSIVE GTD lifecycle owner. It does NOT make policy decisions (no
+fill-ratio cancel, no cross-threshold cancel). Those are owned by the
+strategy tick (`StrategyEngine._reconcile_inflight_buys`).
 
-  1. Polls the CLOB token balance (ground truth from the exchange) every
-     `poll_s` seconds.
-  2. Decides the order's terminal state from the balance alone:
-       - balance >= expected_size * fill_ratio → cancel GTD, mark complete
-       - balance >= expected_size * (1 + tiny) → over-fill (shouldn't
-         happen, but we cancel the residual to lock in cost basis)
-       - GTD expired server-side → mark expired (cancel is a no-op)
-       - mid price has crossed into the next tier's trigger zone →
-         cancel GTD so the next tier can fire cleanly
-  3. Pushes the terminal state back into Position / TierSnapshot via
-     callbacks so the engine can advance.
+The watcher still:
 
-Why balance instead of fill callbacks:
-  - The CLOB is the only authoritative source for "how many shares do I
-    actually hold for this token". Fill events from WS can be dropped
-    (size=0 quirks), aggregated late (UPDATE-style events), or arrive
-    after a restart. Reading balance once per poll is deterministic.
-  - We do not need to react to FAK sells here — TPs use a separate
-    watcher (TierWatcher with side='SELL').
+  1. Polls the CLOB token balance / size_matched and pushes incremental
+     fills through `on_partial_fill` so the position view stays reconciled
+     even if the WS TRADE channel drops events. This is the
+     "continuous ground-truth reconciliation" path.
+  2. Short-circuits to FILLED when the WS order.UPDATE channel reports
+     the order has fully matched (size_matched >= expected_size), or
+     when the fast-path read on spawn observes the order is already
+     complete. These are NATURAL terminal conditions (the GTD filled),
+     not policy decisions.
+  3. Terminates with EXPIRED once `expires_at` has passed. The cancel is
+     defensive (the GTD has already self-cancelled server-side); the
+     terminal event is so the engine can re-arm / advance the strategy.
+  4. Terminates with CANCELLED if `_stopped` or `_is_active()` returns
+     False (e.g. round rolled over).
+
+The watcher NO LONGER:
+  - cancels a GTD because balance >= expected * fill_ratio (engine does
+    this via tick when next-tier or TP fires);
+  - cancels a GTD because mid has crossed into the next-tier zone
+    (engine does this via tick);
+  - emits the TierOutcome.CROSSED value (removed).
 
 Lifecycle:
   - spawn from ActionRouter after `place_buy_by_strategy_price` returns
@@ -45,11 +50,15 @@ log = get_logger(__name__)
 
 
 class TierOutcome(str, Enum):
-    """Terminal states a TierWatcher can land in."""
+    """Terminal states a TierWatcher can land in.
 
-    FILLED = "filled"             # balance hit expected_size * fill_ratio
-    EXPIRED = "expired"           # GTD lifetime crossed, no fill
-    CROSSED = "crossed"           # mid dropped into next tier zone, cancel
+    H-NEW-2026-07-15: CROSSED removed. The watcher no longer cancels
+    GTDs based on mid-price crossings — that decision belongs to the
+    strategy tick. Remaining outcomes are pure GTD-lifecycle states.
+    """
+
+    FILLED = "filled"             # GTD fully matched (WS or spawn fast-path)
+    EXPIRED = "expired"           # GTD lifetime crossed, no fill (or partial)
     CANCELLED = "cancelled"       # manual or external cancel
     OVER_FILLED = "over_filled"   # balance > expected_size (defensive)
     ERROR = "error"               # repeated CLOB errors
@@ -121,6 +130,11 @@ OnPartialFill = Callable[[float, float, "WatcherResult | None"], Awaitable[None]
 class TierWatcher:
     """Watch a single GTD order's progress via token-balance polling.
 
+    H-NEW-2026-07-15 tick-driven refactor: this watcher is now a
+    passive GTD lifecycle owner. It does NOT decide when to cancel the
+    GTD based on fill-ratio or mid-cross. Those decisions live in
+    `StrategyEngine._reconcile_inflight_buys` (tick-driven).
+
     Args:
         clob:                  CLOBClient (for get_token_balance, cancel_order)
         server_order_id:       server-side order id from the post-response
@@ -129,16 +143,7 @@ class TierWatcher:
         strategy_price:        the exact limit price we posted (no adjustment)
         expected_size:         shares the GTD was sized for (= notional / price)
         expires_at:            unix ts when the GTD self-cancels server-side
-        poll_s:                poll interval (default from config)
-        fill_ratio:            fraction of expected_size at which we declare
-                               the tier "complete enough" and cancel the GTD
-                               (default from config)
-        cross_threshold:       optional (mid_price) — if set and current
-                               midpoint drops at or below this level,
-                               cancel the GTD early (e.g. when price has
-                               dropped into the next tier's trigger zone)
-        mid_price_provider:    async callable returning current mid for
-                               `token_id`; required when cross_threshold is set
+        poll_s:                WS-event 兜底超时（秒）—— 见 config.TIER_WATCHER_POLL_S 注释
         on_complete:           async callback invoked once on terminal state
         on_partial_fill:       async callback invoked every poll iteration
                                that observes a fresh `size_matched`
@@ -165,9 +170,6 @@ class TierWatcher:
         expected_size: float,
         expires_at: float,
         poll_s: float = 1.5,
-        fill_ratio: float = 0.995,
-        cross_threshold: Optional[float] = None,
-        mid_price_provider: Optional[Callable[[], Awaitable[float]]] = None,
         on_complete: Optional[OnComplete] = None,
         on_partial_fill: Optional[OnPartialFill] = None,
         is_still_active: Optional[Callable[[], bool]] = None,
@@ -180,9 +182,6 @@ class TierWatcher:
         self._expected_size = expected_size
         self._expires_at = float(expires_at)
         self._poll_s = max(0.5, float(poll_s))
-        self._fill_ratio = float(fill_ratio)
-        self._cross_threshold = cross_threshold
-        self._mid_provider = mid_price_provider
         self._on_complete = on_complete
         self._on_partial_fill = on_partial_fill
         self._is_active = is_still_active or (lambda: True)
@@ -267,17 +266,23 @@ class TierWatcher:
                 pass
 
     def _maybe_complete_via_update(self) -> bool:
-        """If WS already pushed a size_matched ≥ expected * fill_ratio,
-        return True and the caller should emit FILLED without re-reading
-        the balance. Idempotent and side-effect-free except on the actual
-        terminal-state emission path (which is guarded by
-        _fire_complete_called).
+        """If WS already pushed a size_matched ≥ expected_size, return True
+        and the caller should emit FILLED without re-reading the balance.
+
+        H-NEW-2026-07-15: the cutoff is `>= expected_size` (full fill), not
+        `>= expected * fill_ratio`. The watcher's job is to report NATURAL
+        terminal conditions (the GTD is fully matched). Mid-fill policy
+        (e.g. "we've reached 90%, declare done and cancel the residual")
+        is owned by the strategy tick.
+
+        Idempotent and side-effect-free except on the actual terminal-state
+        emission path (which is guarded by _fire_complete_called).
         """
         if self._last_size_matched < 0:
             return False
         if self._fire_complete_called:
             return True  # already done
-        return self._last_size_matched >= self._expected_size * self._fill_ratio
+        return self._last_size_matched + 1e-9 >= self._expected_size
 
     async def _run(self) -> None:
         """Main loop. One watcher = one GTD = one terminal state."""
@@ -314,16 +319,33 @@ class TierWatcher:
         that already landed during place_gtd_buy is detected within ~100 ms
         of spawn. Only if that returns size_matched=0 do we fall through to
         the balance-poll loop.
+
+        H-NEW-2026-07-15 tick-driven refactor: this loop is PASSIVE. It no
+        longer cancels the GTD based on a fill-ratio or a mid-cross
+        threshold. The only terminal conditions it emits are:
+
+          - FILLED         — GTD fully matched (detected via WS UPDATE,
+                             spawn fast-path, or balance reaching
+                             expected_size)
+          - OVER_FILLED    — balance > expected_size (defensive)
+          - EXPIRED        — GTD lifetime crossed
+          - CANCELLED      — external cancel / round rollover
+
+        Mid-fill state is pushed through `on_partial_fill` and the loop
+        sleeps until the next event. The strategy tick
+        (`StrategyEngine._reconcile_inflight_buys`) is the SOLE place
+        that decides "this GTD is no longer wanted → cancel".
         """
         next_log_ts = 0.0
-        prev_balance = 0.0
 
         # Fast path: detect fills that completed BEFORE the watcher
         # spawned (very common — fills that crossed during place_gtd_buy).
+        # H-NEW-2026-07-15: only treat as FILLED if the order is fully
+        # matched (size_matched >= expected_size), not just partial.
         fast_state = await self._read_fill_state()
         fast_size = fast_state.get("size_matched", 0.0) if fast_state else 0.0
         fast_avg = fast_state.get("avg_price", 0.0) if fast_state else 0.0
-        if fast_size and fast_size > 0:
+        if fast_size + 1e-9 >= self._expected_size and fast_size > 0:
             cancel_sent = await self._safe_cancel()
             self._result = WatcherResult(
                 outcome=TierOutcome.FILLED,
@@ -459,8 +481,11 @@ class TierWatcher:
                 await self._fire_complete(self._result)
                 return
 
-            # 3) Filled enough — cancel the residual GTD and exit.
-            if balance >= self._expected_size * self._fill_ratio:
+            # 3) Fully matched — emit FILLED so position state finalises.
+            # H-NEW-2026-07-15: was `balance >= expected * fill_ratio`
+            # (which short-circuited at 90%). Now only fires on a true
+            # full fill. Mid-fill policy is owned by the strategy tick.
+            if balance + 1e-9 >= self._expected_size:
                 cancel_sent = await self._safe_cancel()
                 self._result = WatcherResult(
                     outcome=TierOutcome.FILLED,
@@ -485,40 +510,7 @@ class TierWatcher:
                 await self._fire_complete(self._result)
                 return
 
-            # 4) Cross into next tier zone — cancel so the next tier can
-            #    fire without waiting on this GTD's expiry.
-            if (
-                self._cross_threshold is not None
-                and self._mid_provider is not None
-            ):
-                cur_mid = await self._safe_mid()
-                if cur_mid is not None and cur_mid <= self._cross_threshold:
-                    cancel_sent = await self._safe_cancel()
-                    self._result = WatcherResult(
-                        outcome=TierOutcome.CROSSED,
-                        server_order_id=self._server_order_id,
-                        token_id=self._token_id,
-                        side=self._side,
-                        strategy_price=self._strategy_price,
-                        expected_size=self._expected_size,
-                        filled_qty=balance,
-                        cancel_sent=cancel_sent,
-                        avg_fill_price=self._strategy_price,
-                        dedup_key=self._dedup_key(TierOutcome.CROSSED),
-                    )
-                    log.info(
-                        "tier_watcher.crossed_into_next_tier",
-                        server_id=self._server_order_id[:16],
-                        side=self._side,
-                        balance=balance,
-                        cur_mid=cur_mid,
-                        cross_threshold=self._cross_threshold,
-                        cancel_sent=cancel_sent,
-                    )
-                    await self._fire_complete(self._result)
-                    return
-
-            # 5) GTD expired server-side (or about to).
+            # 4) GTD expired server-side (or about to).
             now = time.time()
             if now >= self._expires_at:
                 # Cancel is a no-op (already self-cancelled) but we call it
@@ -542,12 +534,12 @@ class TierWatcher:
                     side=self._side,
                     balance=balance,
                     expected=self._expected_size,
-                    lifetime_s=self._expires_at - (now - (self._expires_at - 0)),
+                    lifetime_s=int(self._expires_at - now),
                 )
                 await self._fire_complete(self._result)
                 return
 
-            # 6) Periodic progress log (~10s) so operators see the GTD is
+            # 5) Periodic progress log (~10s) so operators see the GTD is
             #    alive without flooding the log on every poll.
             if now - next_log_ts >= 10.0:
                 next_log_ts = now
@@ -561,7 +553,6 @@ class TierWatcher:
                     remaining_s=max(0.0, self._expires_at - now),
                 )
 
-            prev_balance = balance
             # H-NEW-2026-07-11-3: instead of `await asyncio.sleep(poll_s)`,
             # wait on `_update_event` so an order.UPDATE arriving during the
             # sleep window wakes us immediately. The timeout is poll_s —
@@ -628,19 +619,6 @@ class TierWatcher:
         except Exception as exc:
             log.debug(
                 "tier_watcher.fill_state_error",
-                server_id=self._server_order_id[:16],
-                error=str(exc),
-            )
-            return None
-
-    async def _safe_mid(self) -> Optional[float]:
-        if self._mid_provider is None:
-            return None
-        try:
-            return float(await self._mid_provider())
-        except Exception as exc:
-            log.debug(
-                "tier_watcher.mid_error",
                 server_id=self._server_order_id[:16],
                 error=str(exc),
             )

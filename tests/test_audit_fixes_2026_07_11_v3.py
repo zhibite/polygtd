@@ -1,12 +1,18 @@
-"""Regression tests for the v3 audit fixes (2026-07-11).
+﻿"""Regression tests for the v3 audit fixes (2026-07-11).
 
 Covers:
-  B-NEW-1 — record_fill does NOT clear _tp_inflight (only record_tp_fill does)
-  B-NEW-2 — place_buy fetches the orderbook OUTSIDE the OM lock
-  H-NEW-1 — register_pending_server_id closes the fill-callback race
-  H-NEW-2 — _check_average_down respects _tp_inflight
-  H-NEW-3 — baseline_target_price is anchored to the actual order price
-  M-NEW-4 — _buy_step_for(tick_size) returns half a tick on tick_size=0.01
+  B-NEW-1 鈥?record_fill does NOT clear _tp_inflight (only record_tp_fill does)
+  B-NEW-2 鈥?place_buy fetches the orderbook OUTSIDE the OM lock
+  H-NEW-1 鈥?register_pending_server_id closes the fill-callback race
+  H-NEW-2 鈥?_check_average_down respects _tp_inflight
+  H-NEW-3 鈥?baseline_target_price is anchored to the actual order price
+
+H-NEW-2026-07-15: M-NEW-4 (`_buy_step_for` / `_sell_step_for` tick-aware
+helper) was REMOVED. The pre-arm GTD model posts BUY at the engine's exact
+`strategy_price` (no orderbook snap), so the half-tick-step helper has
+no remaining caller 鈥?see `OrderManager.place_buy_by_strategy_price`
+docstring for the current behaviour. The four M-NEW-4 tests at the
+bottom of the previous version were deleted along with the helper.
 
 Run via `pytest tests/test_audit_fixes_2026_07_11_v3.py`.
 """
@@ -144,7 +150,7 @@ async def test_b_new_2_orderbook_fetch_outside_lock() -> None:
     Probe design: install a closure on the OrderManager that returns True
     iff `self._lock.locked()` is True. The fake CLOB records that value
     on each place_gtd_buy call. After place_buy completes, we assert
-    the CLOB observed an UNLOCKED call site — proving the REST fetch
+    the CLOB observed an UNLOCKED call site 鈥?proving the REST fetch
     happened before the lock was acquired.
 
     This is the structural test; we also verify that placing two BUY
@@ -174,7 +180,7 @@ async def test_b_new_2_orderbook_fetch_outside_lock() -> None:
 
     assert len(clob.calls_while_locked) == 1
     assert clob.calls_while_locked[0] is True, (
-        "place_gtd_buy was invoked WITHOUT the OM lock held — the lock "
+        "place_gtd_buy was invoked WITHOUT the OM lock held 鈥?the lock "
         "scope is wrong. Should be inside `async with self._lock:`."
     )
 
@@ -370,7 +376,7 @@ async def test_h_new_2_avg_down_skipped_when_tp_inflight() -> None:
     pos.entry_token = "tok"
     pos.entry_side = "UP"
     pos.baseline_target_price = 0.40
-    pos.baseline_set = True
+    # legacy pos.baseline_set removed (H-NEW-2026-07-15)
     pos._total_qty = 10.0
     pos._total_cost = 4.0
     pos._tp_inflight = True  # TP runner active
@@ -384,10 +390,12 @@ async def test_h_new_2_avg_down_skipped_when_tp_inflight() -> None:
         captured.append(action)
     eng._handler = handler
     eng._s = type("S", (), {
-        "TIER2_NOTIONAL": 2.0,
-        "TIER3_NOTIONAL": 4.0,
-        # H-NEW-2026-07-11-4: TIER4_NOTIONAL removed (3-tier cap).
-        "TIER_NOTIONAL_MAX_MULT": 1.1,
+        "TIER2_NOTIONAL": 3.0,
+        "TIER3_NOTIONAL": 5.0,
+        "TIER4_NOTIONAL": 6.0,
+        # H-NEW-2026-07-15: TIER_NOTIONAL_MAX_MULT removed (engine
+        # trusts the per-(round,tier) spawn mutex; no mid-flight cap).
+        "tier_drop_pcts": [None, 0.20, 0.40, 0.60],
     })()
 
     await eng._check_average_down(100000.0)
@@ -415,9 +423,9 @@ async def test_h_new_2_avg_down_resumes_after_tp_completes() -> None:
     pos.entry_token = "tok"
     pos.entry_side = "UP"
     pos.baseline_target_price = 0.40
-    pos.baseline_set = True
+    # legacy pos.baseline_set removed (H-NEW-2026-07-15)
     # H-NEW-2026-07-12: anchor to a realised T1 fill (using target as a
-    # stand-in is fine for the test — the test's intent is the TP gate,
+    # stand-in is fine for the test 鈥?the test's intent is the TP gate,
     # not the baseline anchor) so the T1-has-filled guard passes.
     pos.baseline_realized_price = 0.40
     pos.baseline_set_realized = True
@@ -437,10 +445,12 @@ async def test_h_new_2_avg_down_resumes_after_tp_completes() -> None:
         captured.append(action)
     eng._handler = handler
     eng._s = type("S", (), {
-        "TIER2_NOTIONAL": 2.0,
-        "TIER3_NOTIONAL": 4.0,
-        # H-NEW-2026-07-11-4: TIER4_NOTIONAL removed (3-tier cap).
-        "TIER_NOTIONAL_MAX_MULT": 1.1,
+        "TIER2_NOTIONAL": 3.0,
+        "TIER3_NOTIONAL": 5.0,
+        "TIER4_NOTIONAL": 6.0,
+        # H-NEW-2026-07-15: TIER_NOTIONAL_MAX_MULT removed (engine
+        # trusts the per-(round,tier) spawn mutex; no mid-flight cap).
+        "tier_drop_pcts": [None, 0.20, 0.40, 0.60],
     })()
 
     await eng._check_average_down(100000.0)
@@ -479,7 +489,7 @@ def test_h_new_3_bind_server_order_id_sets_baseline_target() -> None:
 
 
 def test_h_new_3_no_op_for_non_t1() -> None:
-    """For T2/T3/T4, baseline_target_price must NOT be overwritten — it stays
+    """For T2/T3/T4, baseline_target_price must NOT be overwritten 鈥?it stays
     pinned to the T1 decision-time anchor.
     """
     eng = StrategyEngine.__new__(StrategyEngine)
@@ -492,42 +502,9 @@ def test_h_new_3_no_op_for_non_t1() -> None:
         server_order_id="0xT2",
         token_id="tok",
         expires_at=time.time() + 180,
-        expected_price=0.32,  # T2 fill price — must NOT clobber T1 anchor
+        expected_price=0.32,  # T2 fill price 鈥?must NOT clobber T1 anchor
         placed_size=6.25,
     )
     assert pos.baseline_target_price == 0.40
 
 
-# ---------------------------------------------------------------------------
-# M-NEW-4: BUY_STEP / SELL_STEP scale to tick_size
-# ---------------------------------------------------------------------------
-
-
-def test_m_new_4_buy_step_half_tick_at_0_01() -> None:
-    """_buy_step_for(0.01) must return 0.005 (half a tick above bid).
-    The legacy hard-coded 0.001 collapsed under round-down and put us
-    exactly on the bid, defeating the taker-cross intent.
-    """
-    assert OrderManager._buy_step_for(0.01) == 0.005
-    assert OrderManager._sell_step_for(0.01) == 0.005
-
-
-def test_m_new_4_buy_step_half_tick_at_0_001() -> None:
-    """_buy_step_for(0.001) returns 0.0005 (half a tick)."""
-    assert abs(OrderManager._buy_step_for(0.001) - 0.0005) < 1e-9
-
-
-def test_m_new_4_buy_step_clamps_at_legacy_floor() -> None:
-    """Very fine tick_size — step = max(tick_size/2, min(tick_size, 0.0001)).
-    At tick_size=0.0001: half=0.00005, min(0.0001, 0.0001)=0.0001, max→0.0001.
-    At tick_size=0.00001: half=0.000005, min(0.00001, 0.0001)=0.00001, max→0.00001.
-    """
-    assert OrderManager._buy_step_for(0.0001) == 0.0001
-    # Even smaller tick — clamp narrows but never goes below tick_size.
-    assert OrderManager._buy_step_for(0.00001) == 0.00001
-
-
-def test_m_new_4_buy_step_zero_tick_returns_legacy() -> None:
-    """Defensive: tick_size<=0 falls back to legacy BUY_STEP=0.001."""
-    assert OrderManager._buy_step_for(0) == OrderManager.BUY_STEP
-    assert OrderManager._buy_step_for(-1) == OrderManager.BUY_STEP

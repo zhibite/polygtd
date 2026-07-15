@@ -75,10 +75,11 @@ def _make_engine(mid: float = 0.20) -> Any:
         "S",
         (),
         {
-            "TIER2_NOTIONAL": 2.0,
-            "TIER3_NOTIONAL": 4.0,
-            "TIER_NOTIONAL_MAX_MULT": 1.1,
-            "tier_drop_pcts": [None, 0.30, 0.60],
+            "TIER2_NOTIONAL": 3.0,
+            "TIER3_NOTIONAL": 5.0,
+            "TIER4_NOTIONAL": 6.0,
+            # H-NEW-2026-07-15: TIER_NOTIONAL_MAX_MULT removed.
+            "tier_drop_pcts": [None, 0.20, 0.40, 0.60],
         },
     )()
     return eng
@@ -100,10 +101,16 @@ def _make_pos(
     pos.entry_token = "tok"
     pos.entry_side = "UP"
     pos.baseline_target_price = baseline_target
-    pos.baseline_price = baseline_legacy
-    pos.baseline_set = True
     pos.baseline_realized_price = baseline_realized
     pos.baseline_set_realized = baseline_realized is not None
+    # Stash the legacy value under a non-conflicting attribute. The
+    # legacy `baseline_price` / `baseline_set` Position fields were
+    # removed entirely (H-NEW-2026-07-15), so we cannot write to
+    # them any more — and importantly, the engine no longer reads
+    # any such value, so this attribute is purely informational.
+    # The `test_legacy_baseline_not_used_as_fallback` test still
+    # passes `baseline_legacy` to confirm the value is ignored.
+    pos._legacy_baseline_price = baseline_legacy
     pos.tiers = [
         TierSnapshot(tier=1, notional=2.0),
         TierSnapshot(tier=2, notional=2.0),
@@ -117,13 +124,44 @@ def _make_pos(
     pos._tp_inflight = False
     pos._total_qty = 5.55
     pos._total_cost = 2.0
-    pos.tier_is_saturated = lambda *_a, **_k: False
+    # H-NEW-2026-07-15: tier_is_saturated / tier_notional_remaining removed;
+    # fake stubs only need to satisfy the (very few) call sites.
     pos.has_inflight_tier = False
-    pos._baseline_rebased_logged = False
-    pos.tier_notional_remaining = lambda tier: max(
-        0.0, tier.notional * eng._s.TIER_NOTIONAL_MAX_MULT - tier.cost_filled,
-    )
+    pos._t1_rebased_logged = False
     pos.stake_cap_remaining = 999.0  # big enough that no tier hits it
+
+    # H-NEW-2026-07-15 (tick-driven refactor): `_check_average_down`
+    # now expects a PositionSnapshot. Mirror the production snapshot()
+    # shape from a duck-typed SimpleNamespace so the stub tests can
+    # continue to pass.
+    from types import SimpleNamespace
+
+    def _snapshot() -> Any:
+        ts = pos.tiers
+        return SimpleNamespace(
+            total_qty=pos._total_qty,
+            avg_cost=pos._avg_cost,
+            total_cost=pos._total_cost,
+            tier_size_filled=tuple(t.size_filled for t in ts),
+            tier_cost_filled=tuple(t.cost_filled for t in ts),
+            tier_size_expected=tuple(t.size_expected for t in ts),
+            tier_placed=tuple(t.placed for t in ts),
+            tier_filled=tuple(t.filled for t in ts),
+            tier_is_complete=tuple(t.is_complete for t in ts),
+            tier_server_order_id=tuple(t.server_order_id for t in ts),
+            tier_expires_at=tuple(t.expires_at for t in ts),
+            baseline_set_realized=pos.baseline_set_realized,
+            baseline_realized_price=pos.baseline_realized_price,
+            baseline_target_price=pos.baseline_target_price,
+            tp_target=None,
+            tp_inflight=pos._tp_inflight,
+            has_inflight_tier=pos.has_inflight_tier,
+            entry_token=pos.entry_token,
+            entry_side=pos.entry_side,
+        )
+
+    pos.snapshot = _snapshot
+    pos._avg_cost = pos._total_cost / pos._total_qty if pos._total_qty > 0 else 0.0
     return pos
 
 
@@ -221,9 +259,9 @@ async def test_legacy_baseline_not_used_as_fallback() -> None:
 
 
 @pytest.mark.asyncio
-async def test_baseline_rebased_logged_only_once() -> None:
+async def test_t1_rebased_logged_only_once() -> None:
     """When T1's realised fill is set, the engine should log a single
-    `baseline.rebased` breadcrumb showing the cap → realised
+    `engine.t1_rebased` breadcrumb showing the cap → realised
     transition. Subsequent ticks with the same realised value must
     not re-log. This guards against log spam from the new branch.
     """
@@ -235,21 +273,21 @@ async def test_baseline_rebased_logged_only_once() -> None:
     )
     eng._round = type("R", (), {"position": pos})()
 
-    # First call: baseline.rebased should log once.
+    # First call: engine.t1_rebased should log once.
     captured: list[Any] = []
 
     async def handler1(action):
         captured.append(action)
     eng._handler = handler1
     await eng._check_average_down(100000.0)
-    assert pos._baseline_rebased_logged is True, (
-        "first call should mark _baseline_rebased_logged=True"
+    assert pos._t1_rebased_logged is True, (
+        "first call should mark _t1_rebased_logged=True"
     )
 
-    # Second call: should NOT change _baseline_rebased_logged state.
+    # Second call: should NOT change _t1_rebased_logged state.
     async def handler2(action):
         pass
     eng._handler = handler2
-    pos._baseline_rebased_logged = True  # ensure still set
+    pos._t1_rebased_logged = True  # ensure still set
     await eng._check_average_down(100001.0)
-    assert pos._baseline_rebased_logged is True
+    assert pos._t1_rebased_logged is True

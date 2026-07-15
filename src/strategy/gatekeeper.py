@@ -96,10 +96,16 @@ class GateKeeper:
         token_price: float,
         current_tier: int,
         next_tier_drop_pct: float | None,
-        baseline: float,
+        t1_entry: float,
     ) -> bool:
         """
-        Average-down check for T2/T3.
+        Average-down check for T2/T3/T4.
+
+        H-NEW-2026-07-15 (audit follow-up — naming): the `t1_entry` argument
+        is the token T1 fill-weighted average price, NOT the BTC/binance
+        baseline used by `GateKeeper.__init__`. The two share the legacy
+        name "baseline" but mean very different things; renamed here to
+        remove the BTC-vs-token confusion.
 
         Drift bypass: if price has already dropped to the *next* tier's trigger
         (e.g. checking T2 but price has already hit T3's -40% line), the trade
@@ -108,7 +114,7 @@ class GateKeeper:
         T4 has no next tier — drift is always checked.
         """
         if next_tier_drop_pct is not None:
-            next_trigger = baseline * (1 - next_tier_drop_pct)
+            next_trigger = t1_entry * (1 - next_tier_drop_pct)
             if token_price <= next_trigger:
                 log.debug(
                     "gatekeeper.drift_bypass",
