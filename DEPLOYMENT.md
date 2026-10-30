@@ -99,12 +99,17 @@ python -m src.main
 
 ## 五、Docker 部署
 
-```bash
-# 1. 构建
-docker build -t polymarket-gtd .
+`.env.docker` 只放**非敏感配置**（已随仓库提供，并会被打进镜像）；密钥通过
+compose 的 `${VAR}` 插值注入，不要把密钥写进 `.env.docker`。
 
-# 2. 运行（编辑 .env.docker 填入凭证）
-docker compose --env-file .env.docker up -d
+```bash
+# 1. 准备密钥（.env 已被 .gitignore 忽略，也已被 .dockerignore 排除）
+cp .env.example .env
+# 编辑 .env：只填 API_KEY / API_SECRET / API_PASSPHRASE
+# （或 WALLET_PRIVATE_KEY / SIGNATURE_TYPE / FUNDER_ADDRESS）
+
+# 2. 构建并启动（compose 会自动读取 .env 做变量插值）
+docker compose up -d --build
 
 # 3. 查看日志
 docker compose logs -f
@@ -114,43 +119,38 @@ docker compose logs -f
 
 ## 六、Coolify 部署
 
-Coolify 原生支持 Docker Compose。部署步骤：
+### 1. 创建 Application 并授权仓库
 
-### 1. 上传代码
-
-```bash
-# 在 Coolify 中创建新 Application
-# 仓库地址：https://github.com/YOUR_USER/polymarket-gtd
-# 构建方式：Dockerfile
-```
+- 仓库：`https://github.com/zhibite/polygtd`，分支：`main`
+- 仓库是**私有**的，必须让 Coolify 有读取权限：
+  - **推荐**：Coolify → Sources → Add → GitHub App → 安装并授权该仓库；
+  - 或：使用只读 Deploy Key + SSH 仓库地址（见常见问题）。
+- 构建方式：**Dockerfile**（推荐）。也支持 Docker Compose，此时
+  `docker-compose.yml` 的 `env_file: .env.docker` 会生效。
 
 ### 2. 配置环境变量
 
-在 Coolify 的 Environment Variables 中添加：
+**只有密钥是必须在这里设置的**（写入 Coolify → Environment Variables）：
 
 ```
 API_KEY=xxxxx
 API_SECRET=xxxxx
 API_PASSPHRASE=xxxxx
-GAMMA_API=https://gamma-api.polymarket.com
-POLYMARKET_HOST=https://clob.polymarket.com
-POLYGON_RPC_URL=https://polygon-bor.publicnode.com
-TIER1_NOTIONAL=2.0
-TIER2_NOTIONAL=3.0
-TIER3_NOTIONAL=5.0
-TIER4_NOTIONAL=6.0
-ENTRY_PRICE_CAP=0.40
-TIER2_DROP_PCT=0.20
-TIER3_DROP_PCT=0.40
-TIER4_DROP_PCT=0.60
-TP_PROFIT_PCT=0.20
-TP_DECREMENT_PCT=0.03
-BASELINE_DRIFT_LIMIT=0.0015
-T1_ENTRY_WINDOW_S=300
-GTD_LIFETIME_S=300
-SELL_SLIPPAGE_PCT=0.02
-STARTUP_RECONCILE_CANCEL_ALL=true
 ```
+
+私钥方式则改为：
+
+```
+WALLET_PRIVATE_KEY=0x...
+SIGNATURE_TYPE=0
+FUNDER_ADDRESS=0x...        # SIG_TYPE=1/2 时必填
+```
+
+其它非敏感配置已写在仓库的 `.env.docker` 中，并会随镜像一起加载。
+如需覆盖某项策略参数，可以在 Coolify 面板再添加同名变量（进程环境变量
+优先级最高）。
+
+> 不要把密钥写进 `.env.docker`：它会被提交到 git，并被打进镜像。
 
 ### 3. 配置持久化
 
@@ -208,6 +208,20 @@ UP(last=0.35 bid=0.35)  DOWN(last=0.65 bid=0.65)
 ---
 
 ## 八、故障排查
+
+### 0. Coolify 拉取仓库失败（exit code 128）
+
+报错形如：
+
+```
+fatal: could not read Username for 'https://github.com'
+```
+
+说明仓库是私有的，而 Coolify 没有凭据。任选其一：
+- Coolify → Sources → GitHub App，授权 `zhibite/polygtd`，然后在
+  Application 的 Source 设置里切换为该 GitHub App；
+- 或在 GitHub 仓库 Settings → Deploy keys 添加只读公钥，把仓库地址改成
+  `git@github.com:zhibite/polygtd.git` 并在 Coolify 填入对应私钥。
 
 ### 1. CLOB 订单一直不成交
 

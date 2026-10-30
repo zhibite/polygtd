@@ -13,9 +13,11 @@ __pycache__
 .pytest_cache
 
 # Secrets & runtime data — must never be baked into the image.
-# docker-compose reads .env.docker on the HOST via `env_file`; it is not
-# needed inside the build context.
 .env
 .env.local
-.env.docker
 data/
+
+# NOTE: .env.docker is intentionally INCLUDED in the build context — it
+# holds non-secret configuration only and the app reads it as a fallback
+# env file. Never put credentials in .env.docker; set them in Coolify's
+# environment panel (process env always wins).

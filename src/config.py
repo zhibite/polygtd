@@ -73,12 +73,23 @@ class LogConfig(BaseSettings):
 
 class StrategySettings(BaseSettings):
     """
-    All values come from .env (or .env file).
+    Values come from the process environment, then .env, then .env.docker.
+
+    Priority (low → high):
+        code defaults < .env.docker < .env < process environment
+
+    Why .env.docker is read in-process: Coolify/Dockerfile deployments bake
+    the non-secret config file into the image, and Coolify injects the
+    secrets as process environment variables. Reading both files means the
+    same image works for Coolify, docker-compose, and local runs.
 
     IMPORTANT: DRY_RUN has been removed. Trading is always live.
     """
 
-    model_config = SettingsConfigDict(env_file=str(_ROOT / ".env"), extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=(str(_ROOT / ".env.docker"), str(_ROOT / ".env")),
+        extra="ignore",
+    )
 
     # ── CLOB Credentials ──────────────────────────────────────────────────
     # Option A: provide all three L2 API credentials directly (recommended)

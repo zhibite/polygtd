@@ -12,6 +12,15 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - PYTHONDONTWRITEBYTECODE=1
+      # Secrets are NOT stored in .env.docker. Compose resolves these from
+      # the host environment (Coolify injects them) or from a local,
+      # git-ignored .env file used for ${VAR} interpolation.
+      - API_KEY=${API_KEY:-}
+      - API_SECRET=${API_SECRET:-}
+      - API_PASSPHRASE=${API_PASSPHRASE:-}
+      - WALLET_PRIVATE_KEY=${WALLET_PRIVATE_KEY:-}
+      - SIGNATURE_TYPE=${SIGNATURE_TYPE:-0}
+      - FUNDER_ADDRESS=${FUNDER_ADDRESS:-}
 
 volumes:
   polymarket_data:
