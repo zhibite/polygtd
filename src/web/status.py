@@ -202,9 +202,13 @@ SELECT r.round_start_ts,
        r.finished_at,
        COALESCE(SUM(CASE WHEN f.side = 'BUY'  THEN f.price * f.size END), 0.0) AS buy_cost,
        COALESCE(SUM(CASE WHEN f.side = 'SELL' THEN f.price * f.size END), 0.0) AS sell_proceeds,
-       COUNT(f.fill_id) AS fill_count
+       COUNT(f.fill_id) AS fill_count,
+       (SELECT COUNT(*) FROM orders o
+         WHERE o.round_start_ts = r.round_start_ts) AS order_count
 FROM rounds r
 LEFT JOIN fills f ON f.round_start_ts = r.round_start_ts
+WHERE EXISTS (SELECT 1 FROM orders o2 WHERE o2.round_start_ts = r.round_start_ts)
+   OR EXISTS (SELECT 1 FROM fills  f2 WHERE f2.round_start_ts = r.round_start_ts)
 GROUP BY r.round_start_ts
 ORDER BY r.round_start_ts DESC
 LIMIT ?
@@ -215,17 +219,31 @@ def rounds_with_pnl(conn: Any, limit: int = 100) -> list[dict[str, Any]]:
     """Rounds with realised PnL derived from fills.
 
     A round is `closed` once it has at least one SELL fill. Rounds with only
-    BUY fills are still open (or were abandoned) and report `pnl_usd=None`
-    so they are excluded from win-rate / realised-PnL stats.
+    BUY fills are `open` and report `pnl_usd=None` so they are excluded from
+    win-rate / realised-PnL stats. Rounds that have orders but no fills are
+    `unfilled` (the bot posted, nothing traded) — they are NOT open
+    positions.
+
+    Rounds with neither orders nor fills are excluded entirely. Older
+    builds wrote a `rounds` row at every window boundary, so windows where
+    nothing was ever bought (e.g. every BUY rejected for insufficient
+    balance) lingered in the history as phantom open positions.
     """
     rows = conn.execute(_ROUNDS_SQL, (int(limit),)).fetchall()
     out: list[dict[str, Any]] = []
     for row in rows:
         (round_ts, slug, started_at, finished_at,
-         buy_cost, sell_proceeds, fill_count) = row
+         buy_cost, sell_proceeds, fill_count, order_count) = row
         buy_cost = float(buy_cost or 0.0)
         sell_proceeds = float(sell_proceeds or 0.0)
+        fill_count = int(fill_count or 0)
         closed = sell_proceeds > 0
+        if closed:
+            round_status = "closed"
+        elif fill_count > 0:
+            round_status = "open"
+        else:
+            round_status = "unfilled"
         pnl = (sell_proceeds - buy_cost) if closed else None
         out.append({
             "round_start_ts": round_ts,
@@ -234,7 +252,9 @@ def rounds_with_pnl(conn: Any, limit: int = 100) -> list[dict[str, Any]]:
             "finished_at": finished_at,
             "buy_cost": buy_cost,
             "sell_proceeds": sell_proceeds,
-            "fill_count": int(fill_count or 0),
+            "fill_count": fill_count,
+            "order_count": int(order_count or 0),
+            "status": round_status,
             "closed": closed,
             "pnl_usd": pnl,
             "pnl_pct": (pnl / buy_cost) if (closed and buy_cost > 0) else None,
@@ -244,6 +264,10 @@ def rounds_with_pnl(conn: Any, limit: int = 100) -> list[dict[str, Any]]:
 
 def compute_stats(rounds: list[dict[str, Any]]) -> dict[str, Any]:
     closed = [r for r in rounds if r["closed"]]
+    # Only rounds with an actual BUY fill are "未平" (open position). A
+    # round where orders were posted but never filled has no position.
+    open_rounds = [r for r in rounds if r.get("status") == "open"]
+    unfilled = [r for r in rounds if r.get("status") == "unfilled"]
     wins = [r for r in closed if (r["pnl_usd"] or 0.0) > 0]
     losses = [r for r in closed if (r["pnl_usd"] or 0.0) <= 0]
     total_pnl = sum(r["pnl_usd"] or 0.0 for r in closed)
@@ -260,7 +284,8 @@ def compute_stats(rounds: list[dict[str, Any]]) -> dict[str, Any]:
     ]
     return {
         "closed_rounds": len(closed),
-        "open_rounds": len(rounds) - len(closed),
+        "open_rounds": len(open_rounds),
+        "unfilled_rounds": len(unfilled),
         "wins": len(wins),
         "losses": len(losses),
         "win_rate": (len(wins) / len(closed)) if closed else None,

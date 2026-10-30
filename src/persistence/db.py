@@ -72,6 +72,11 @@ CREATE TABLE IF NOT EXISTS fills (
   confirmed      INTEGER DEFAULT 0,
   recorded_at     TEXT
 );
+
+-- The dashboard filters rounds by activity. These keep that lookup cheap
+-- as fills accumulate (rounds are keyed by round_start_ts already).
+CREATE INDEX IF NOT EXISTS idx_orders_round ON orders(round_start_ts);
+CREATE INDEX IF NOT EXISTS idx_fills_round  ON fills(round_start_ts);
 """
 
 
@@ -112,19 +117,27 @@ class DB:
         tick_size: float = 0.01,
         binance_baseline: float | None = None,
     ) -> None:
+        # `started_at` is the WINDOW start, derived from the round key, not
+        # the moment this row happened to be written. Rounds are inserted
+        # lazily on the first fill (see OrderManager._ensure_round_row), so
+        # a wall-clock value here would show the fill time under the
+        # "开始 (UTC)" column instead of the actual window start.
+        started_at = datetime.fromtimestamp(
+            int(round_start_ts), tz=timezone.utc
+        ).isoformat()
         self._c.execute("""
             INSERT INTO rounds (round_start_ts, slug, condition_id, up_token, down_token,
                                 tick_size, binance_baseline, started_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(round_start_ts) DO UPDATE SET
-              slug=excluded.slug,
-              condition_id=excluded.condition_id,
-              up_token=excluded.up_token,
-              down_token=excluded.down_token,
+              slug=COALESCE(excluded.slug, slug),
+              condition_id=COALESCE(excluded.condition_id, condition_id),
+              up_token=COALESCE(excluded.up_token, up_token),
+              down_token=COALESCE(excluded.down_token, down_token),
               tick_size=excluded.tick_size,
-              binance_baseline=excluded.binance_baseline
+              binance_baseline=COALESCE(excluded.binance_baseline, binance_baseline)
         """, (round_start_ts, slug, condition_id, up_token, down_token,
-              tick_size, binance_baseline, datetime.now(timezone.utc).isoformat()))
+              tick_size, binance_baseline, started_at))
         self._c.commit()
 
     def finish_round(self, round_start_ts: int) -> None:

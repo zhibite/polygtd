@@ -165,11 +165,50 @@ def test_open_round_is_not_counted_as_loss(conn) -> None:
 
     rounds = status_mod.rounds_with_pnl(conn)
     assert rounds[0]["closed"] is False
+    assert rounds[0]["status"] == "open"
     assert rounds[0]["pnl_usd"] is None
     stats = status_mod.compute_stats(rounds)
     assert stats["closed_rounds"] == 0
     assert stats["open_rounds"] == 1
     assert stats["total_pnl_usd"] == 0.0
+
+
+def test_round_without_activity_is_not_listed(conn) -> None:
+    """A window where nothing was ever bought must not appear in history.
+
+    Legacy builds inserted a `rounds` row at every window boundary, before
+    any order. With an empty wallet every BUY is rejected by the CLOB, yet
+    those windows rendered as "未平仓" open positions (production
+    2026-10-30: two phantom rounds with $0 cost and 0 fills).
+    """
+    db = DB(conn)
+    db.upsert_round(round_start_ts=3_000, slug="r3")
+
+    assert status_mod.rounds_with_pnl(conn) == []
+    stats = status_mod.compute_stats([])
+    assert stats["open_rounds"] == 0
+    assert stats["closed_rounds"] == 0
+
+
+def test_round_with_order_but_no_fill_is_unfilled(conn) -> None:
+    """Orders posted but never filled are 'unfilled', not open positions."""
+    db = DB(conn)
+    db.upsert_round(round_start_ts=4_000, slug="r4")
+    db.insert_order(
+        client_order_id="c4", server_order_id="s4", round_start_ts=4_000,
+        side="BUY", token_id="tok", tier_name="T1", price=0.40, size=5.0,
+        lifetime_s=300, expires_at=4_300, placed_at=4_000,
+    )
+
+    rounds = status_mod.rounds_with_pnl(conn)
+    assert len(rounds) == 1
+    assert rounds[0]["status"] == "unfilled"
+    assert rounds[0]["order_count"] == 1
+    assert rounds[0]["fill_count"] == 0
+    assert rounds[0]["closed"] is False
+    stats = status_mod.compute_stats(rounds)
+    assert stats["open_rounds"] == 0
+    assert stats["unfilled_rounds"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -179,9 +218,13 @@ def test_open_round_is_not_counted_as_loss(conn) -> None:
 
 class _FakeDB:
     def __init__(self) -> None:
+        self.rounds: list[dict] = []
         self.orders: list[dict] = []
         self.statuses: list[tuple] = []
         self.fills: list[dict] = []
+
+    def upsert_round(self, **kw) -> None:
+        self.rounds.append(kw)
 
     def insert_order(self, **kw) -> None:
         self.orders.append(kw)
@@ -230,6 +273,41 @@ def test_order_manager_mirrors_order_and_fills() -> None:
     assert [f["size"] for f in fake.fills] == [2.0, 3.0]
     assert fake.fills[0]["order_id"] == "c1"
     assert fake.fills[0]["side"] == "BUY"
+
+
+def test_round_row_written_lazily_on_first_fill() -> None:
+    """Window open and order placement create no history row; a fill does."""
+    fake = _FakeDB()
+    om = OrderManager(clob=object(), db=fake)  # type: ignore[arg-type]
+    om.set_round_meta(
+        1_000,
+        slug="btc-updown-15m-1000",
+        condition_id="0xabc",
+        up_token="up",
+        down_token="down",
+        tick_size=0.01,
+    )
+
+    # Registering metadata (window open) must not create a history row.
+    assert fake.rounds == []
+
+    order = _tracked_order()
+    om._orders[order.client_order_id] = order
+    om._by_server[order.server_order_id] = order.client_order_id
+    om._persist_order(order)
+    # An order alone (e.g. a GTD that never crossed) is not a traded round.
+    assert fake.rounds == []
+    assert fake.orders and fake.orders[0]["client_order_id"] == "c1"
+
+    om.apply_fill_event("s1", 2.0, 0.40)
+    assert len(fake.rounds) == 1
+    assert fake.rounds[0]["round_start_ts"] == 1_000
+    assert fake.rounds[0]["slug"] == "btc-updown-15m-1000"
+    assert fake.rounds[0]["condition_id"] == "0xabc"
+    assert fake.rounds[0]["up_token"] == "up"
+    assert fake.rounds[0]["down_token"] == "down"
+    assert fake.rounds[0]["tick_size"] == 0.01
+    assert fake.fills and fake.fills[0]["side"] == "BUY"
 
 
 def test_order_manager_without_db_is_noop() -> None:

@@ -1494,6 +1494,23 @@ def _on_market_discovered(asset: str, mkt) -> None:
     # leave `current_market` pointing at the previous (expired) window.
     state.current_market = mkt
 
+    # Late discovery: `_on_new_round` may have run before this market was
+    # listed (Gamma lag at the boundary), leaving the round metadata empty.
+    # The history row is written lazily on the first fill, so refresh the
+    # registered metadata now that the tokens are known.
+    om = getattr(state, "order_manager", None)
+    register_round_meta = getattr(om, "set_round_meta", None)
+    round_ts = mkt.round_start_ts or state.round_start_ts
+    if callable(register_round_meta) and round_ts:
+        register_round_meta(
+            round_start_ts=round_ts,
+            slug=mkt.slug or None,
+            condition_id=mkt.condition_id or None,
+            up_token=mkt.token_up_id or None,
+            down_token=mkt.token_down_id or None,
+            tick_size=mkt.tick_size,
+        )
+
     if state.market_ws:
         try:
             state.market_ws.subscribe_tokens([mkt.token_up_id, mkt.token_down_id])
@@ -1675,16 +1692,23 @@ async def _on_new_round(round_start_ts: int) -> None:
                      "(late boot or cross-window BTC drift)",
             )
 
-    # Persist round start
+    # Register the round's market metadata for the history table. The
+    # `rounds` row itself is written lazily by OrderManager on the first
+    # fill. Writing it here (the old behaviour) created a round record for
+    # every 15-min window — with an empty wallet every BUY is rejected, yet
+    # those windows showed up as "未平仓" open positions in the dashboard.
     mkt = state.current_market
-    state.db.upsert_round(
-        round_start_ts=round_start_ts,
-        slug=mkt.slug if mkt else None,
-        condition_id=mkt.condition_id if mkt else None,
-        up_token=mkt.up_token if mkt else None,
-        down_token=mkt.down_token if mkt else None,
-        tick_size=mkt.tick_size if mkt else 0.01,
-    )
+    om = getattr(state, "order_manager", None)
+    register_round_meta = getattr(om, "set_round_meta", None)
+    if callable(register_round_meta):
+        register_round_meta(
+            round_start_ts=round_start_ts,
+            slug=mkt.slug if mkt else None,
+            condition_id=mkt.condition_id if mkt else None,
+            up_token=mkt.up_token if mkt else None,
+            down_token=mkt.down_token if mkt else None,
+            tick_size=mkt.tick_size if mkt else 0.01,
+        )
 
 
 

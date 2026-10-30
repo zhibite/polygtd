@@ -101,6 +101,11 @@ class OrderManager:
         # history. Kept optional and fully exception-guarded: a DB hiccup
         # must never block order placement or cancellation.
         self._db = db
+        # round_start_ts -> market metadata, registered by main at window
+        # open / late discovery. Used to write the `rounds` row lazily on
+        # the first order instead of eagerly at every window boundary (see
+        # `set_round_meta` / `_ensure_round_row`).
+        self._round_meta: dict[int, dict] = {}
         self._lock = asyncio.Lock()
         self._orders: dict[str, TrackedOrder] = {}          # client_order_id -> order
         self._by_server: dict[str, str] = {}               # server_id -> client_id
@@ -124,6 +129,67 @@ class OrderManager:
     # ------------------------------------------------------------------
     # Persistence hooks (optional — see `db` in __init__)
     # ------------------------------------------------------------------
+
+    def set_round_meta(
+        self,
+        round_start_ts: int,
+        *,
+        slug: str | None = None,
+        condition_id: str | None = None,
+        up_token: str | None = None,
+        down_token: str | None = None,
+        tick_size: float = 0.01,
+        binance_baseline: float | None = None,
+    ) -> None:
+        """Register the current round's market metadata for lazy persistence.
+
+        Production 2026-10-30: `_on_new_round` used to INSERT a `rounds` row
+        at every 15-minute boundary, before — and regardless of — any order.
+        With an empty wallet (every BUY rejected by the CLOB) those windows
+        still appeared in the dashboard history as "未平仓" (open position)
+        rounds. Rounds are now written by `_ensure_round_row` on the first
+        fill, i.e. only when a buy actually happened; this method just
+        remembers the metadata that row needs.
+
+        Called from `_on_new_round` (window open) and `_on_market_discovered`
+        (late discovery, when the market was not listed at the boundary).
+        """
+        self._round_meta[int(round_start_ts)] = {
+            "slug": slug,
+            "condition_id": condition_id,
+            "up_token": up_token,
+            "down_token": down_token,
+            "tick_size": tick_size,
+            "binance_baseline": binance_baseline,
+        }
+        # Keep a short tail of recent rounds: a GTD placed just before the
+        # boundary can fill a moment after the next round registers its
+        # metadata, and that late fill still needs the old round's metadata
+        # for its lazy history row. Anything older can no longer fill.
+        cutoff = int(round_start_ts) - 3600
+        for ts in [t for t in self._round_meta if t < cutoff]:
+            self._round_meta.pop(ts, None)
+
+    def _ensure_round_row(self, order: TrackedOrder) -> None:
+        """INSERT the round row for `order`, idempotently (best effort).
+
+        Rounds are created lazily at the first fill so that a window in
+        which nothing was ever bought — orders rejected for insufficient
+        balance, GTDs that never crossed — has no history entry at all.
+        A missing `upsert_round` (test doubles) is a no-op, never an error.
+        """
+        db = getattr(self, "_db", None)
+        upsert = getattr(db, "upsert_round", None) if db is not None else None
+        if upsert is None:
+            return
+        meta = (getattr(self, "_round_meta", None) or {}).get(
+            order.round_start_ts, {}
+        )
+        try:
+            upsert(round_start_ts=order.round_start_ts, **meta)
+        except Exception as exc:  # noqa: BLE001
+            # Never let dashboard persistence break the trading path.
+            log.warning("order_manager.db_persist_round_failed", error=str(exc))
 
     def _persist_order(self, order: TrackedOrder) -> None:
         """Mirror a freshly created TrackedOrder into SQLite (best effort)."""
@@ -169,6 +235,9 @@ class OrderManager:
         db = getattr(self, "_db", None)
         if db is None or delta_size <= 0:
             return
+        # The first fill of the round creates its history row — see
+        # `_ensure_round_row` for why rounds are not written at window open.
+        self._ensure_round_row(order)
         try:
             db.insert_fill(
                 # Cumulative matched size makes the id stable across the

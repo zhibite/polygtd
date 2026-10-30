@@ -120,9 +120,13 @@ function renderRounds(rounds) {
   }
   body.innerHTML = rounds.map(r => {
     const pnl = r.pnl_usd;
+    // "未平仓" only when a BUY actually filled. A round whose orders were
+    // all rejected / never filled has no position — label it 未成交.
     const status = r.closed
       ? '<span class="pill filled">已结算</span>'
-      : '<span class="pill watching">未平仓</span>';
+      : (r.fill_count > 0
+          ? '<span class="pill watching">未平仓</span>'
+          : '<span class="pill idle">未成交</span>');
     return `<tr>
       <td class="mono">${iso(r.started_at) === '--' ? utc(r.round_start_ts) : iso(r.started_at)}</td>
       <td class="mono muted">${r.slug || r.round_start_ts}</td>
