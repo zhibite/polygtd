@@ -134,3 +134,68 @@ async def test_tp_drift_gate_can_be_opted_into() -> None:
     actions = await _run(eng)
 
     assert actions == []
+
+
+# ---------------------------------------------------------------------------
+# Order-status promotion on the final-reconcile path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_final_reconcile_promotes_fully_filled_order() -> None:
+    """A fill discovered only by the final reconcile must mark the order.
+
+    Production 2026-10-30 15:00 round: T1 filled via the watcher's
+    spawn-time fast path; the final reconcile recorded the fill but never
+    called `mark_filled`, so OrderManager kept the order as `live` and the
+    GTD invariant warned every 5 s for the rest of the round.
+    """
+    from src.main import ActionRouter
+    from src.strategy.round_state import Position
+
+    class _OM:
+        def __init__(self) -> None:
+            self.applied: list[tuple] = []
+            self.marked: list[str] = []
+
+        def by_server_id(self, sid):  # noqa: ANN001
+            return SimpleNamespace(
+                side="BUY", token_id="tok", price=0.40,
+                size_matched=0.0, placed_size=5.0, size=5.0,
+            )
+
+        def apply_fill_event(
+            self, sid, size_matched, fill_price=None, trader_side=None,
+        ) -> None:
+            self.applied.append((sid, size_matched, fill_price))
+
+        def mark_filled(self, sid) -> bool:  # noqa: ANN001
+            self.marked.append(sid)
+            return True
+
+    class _Clob:
+        async def get_order_fill_state(self, sid):  # noqa: ANN001
+            return {"size_matched": 5.0, "avg_price": 0.40}
+
+    class _Eng:
+        def __init__(self) -> None:
+            self._round = SimpleNamespace(position=Position(), round_start_ts=123)
+            self.fills: list[tuple] = []
+
+        def on_order_filled(self, token, sid, price, size) -> None:  # noqa: ANN001
+            self.fills.append((token, sid, price, size))
+
+    om, eng = _OM(), _Eng()
+    state = SimpleNamespace(
+        engine=eng, order_manager=om, clob=_Clob(),
+        round_start_ts=123, _bg_tasks=set(),
+    )
+    router = ActionRouter(state)
+
+    await router._final_reconcile_before_close("s1")
+
+    assert om.applied == [("s1", 5.0, 0.40)]
+    assert om.marked == ["s1"], (
+        "a fully matched order discovered by the final reconcile must be "
+        "promoted from 'live' to 'filled'"
+    )

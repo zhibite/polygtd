@@ -580,6 +580,12 @@ class ActionRouter:
                         size_matched=float(result.filled_qty),
                         fill_price=float(forward_price),
                     )
+                    # Promote status too: the fast-fill path can be the ONLY
+                    # observation of a fully matched order (the WS TRADE and
+                    # balance-poll paths may both miss it). Leaving it as
+                    # "live" made the 5-second GTD invariant report a
+                    # phantom live order for the rest of the round.
+                    om.mark_filled(result.server_order_id)
                     # Step 2: feed engine position state with the DELTA
                     # above whatever the WS path already credited
                     # (effective_delta, NOT the watcher's full
@@ -873,6 +879,13 @@ class ActionRouter:
         om.apply_fill_event(
             server_order_id, size_matched=cumulative, fill_price=fill_px
         )
+        # Promote the tracked order to `filled` once the cumulative reaches
+        # its expected size. Without this, an order whose last fill is
+        # discovered here (e.g. a cancel racing a fill, or the watcher's
+        # spawn-time fast-fill) keeps status='live' forever, which makes the
+        # GTD invariant report a phantom live order every 5 s (production
+        # 2026-10-30 15:00 round: T1 fully filled but status stayed live).
+        om.mark_filled(server_order_id)
         if tracked.side == "SELL":
             pos = eng._round.position
             if (
