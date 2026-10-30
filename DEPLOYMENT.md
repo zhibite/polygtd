@@ -164,7 +164,7 @@ volumes:
 ### 4. 运行检查
 
 - 本服务**没有 HTTP 服务/健康检查端点**，不要配置 HTTP 探针
-- 容器端口：8034（仅用于与外部系统对齐，程序本身不监听端口）
+- 容器端口：8010（仅用于与外部系统对齐，程序本身不监听端口）
 - 启动命令：`python -m src.main`
 - 存活判断：`docker logs` 中每 5 秒输出一行 `STATUS ...`
 
@@ -277,7 +277,7 @@ python -m src.main
 - [ ] 环境变量已填入 API Key
 - [ ] `GAMMA_API`、`POLYMARKET_HOST`、`POLYGON_RPC_URL` 已配置
 - [ ] 马丁格尔参数已调优
-- [ ] 端口 8034 已暴露（无 HTTP 服务，仅供编排系统占位）
+- [ ] 端口 8010 已暴露（无 HTTP 服务，仅供编排系统占位）
 - [ ] 数据目录 `/app/data` 已持久化（数据库路径 `/app/data/polymarket.db`）
 - [ ] 日志正常输出（无 ERROR）
 - [ ] 看到 `engine.trigger_t1` 或等待 baseline 的日志
