@@ -87,8 +87,8 @@ STARTUP_RECONCILE_CANCEL_ALL=true  # 启动时取消账户全部挂单；共享�
 pip install -r requirements.txt
 
 # 2. 复制并编辑环境变量（项目根目录的 .env 会被自动读取）
-cp .env.docker .env
-# 编辑 .env 填入 API Key
+cp .env.example .env
+# 编辑 .env 填入 API Key / 策略参数
 
 # 3. 启动（必须先设置 .env）
 python -m src.main

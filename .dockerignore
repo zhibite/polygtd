@@ -3,10 +3,19 @@
 __pycache__
 *.pyc
 *.pyo
-__pycache__
 *.db
+*.db-shm
+*.db-wal
 *.log
 .vscode
 .idea
 *.md
 .pytest_cache
+
+# Secrets & runtime data — must never be baked into the image.
+# docker-compose reads .env.docker on the HOST via `env_file`; it is not
+# needed inside the build context.
+.env
+.env.local
+.env.docker
+data/

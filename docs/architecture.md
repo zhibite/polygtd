@@ -425,7 +425,7 @@ OrderManager 与策略引擎；TierWatcher 作为 REST 兜底对账。
 pip install -r requirements.txt
 
 # 2. 配置环境变量（项目根目录 .env 会被自动读取）
-cp .env.docker .env
+cp .env.example .env
 # 编辑 .env 填入 Polymarket API 凭证
 
 # 3. 按需调整 config.toml / .env
