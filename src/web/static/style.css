@@ -103,3 +103,38 @@ button.btn:disabled { opacity: .45; cursor: default; filter: none; }
 .login-field input:focus { outline: none; border-color: #7c3aed; }
 .login-btn { width: 100%; margin-top: 6px; }
 .login-foot { text-align: center; margin-top: 16px; font-size: 12px; }
+
+/* ── Config page v2: wallet card, page head, group cards ─────────────── */
+.page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
+.page-head h1 { font-size: 22px; font-weight: 700; letter-spacing: -.01em; }
+.page-sub { font-size: 12px; color: #6b7280; margin-top: 4px; }
+.head-meta { font-size: 12px; color: #6b7280; text-align: right; }
+.head-meta b { color: #a78bfa; font-weight: 600; }
+
+.wallet-card { display: flex; align-items: stretch; justify-content: space-between; gap: 28px; flex-wrap: wrap; background: linear-gradient(135deg, #1a1a3d 0%, #12122a 55%, #101024 100%); border: 1px solid #2a2a4a; border-radius: 14px; padding: 22px 24px; margin-bottom: 20px; position: relative; overflow: hidden; }
+.wallet-card::after { content: ''; position: absolute; right: -60px; top: -80px; width: 240px; height: 240px; border-radius: 50%; background: radial-gradient(circle, rgba(124,58,237,.22), transparent 70%); pointer-events: none; }
+.wallet-main { display: flex; flex-direction: column; gap: 6px; min-width: 220px; }
+.wallet-label { font-size: 11px; color: #6b7280; text-transform: uppercase; letter-spacing: .09em; }
+.wallet-value { font-size: 40px; font-weight: 800; color: #c4b5fd; line-height: 1.05; font-variant-numeric: tabular-nums; }
+.wallet-value .unit { font-size: 14px; color: #6b7280; font-weight: 600; margin-left: 4px; }
+.wallet-sub { font-size: 12px; color: #6b7280; }
+.wallet-sub.warn { color: #fb923c; }
+.wallet-sub.err { color: #f87171; }
+.wallet-side { display: flex; flex-direction: column; gap: 9px; min-width: 280px; justify-content: center; }
+.wallet-row { display: flex; justify-content: space-between; align-items: center; gap: 18px; font-size: 12px; color: #6b7280; }
+.wallet-row b { color: #c9c9d6; font-weight: 600; font-variant-numeric: tabular-nums; }
+.wallet-row b.mono { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 11px; }
+.wallet-refresh { align-self: flex-end; margin-top: 4px; }
+.btn-sm { padding: 6px 12px; font-size: 12px; }
+
+.config-group { background: #12122a; border: 1px solid #1e1e3a; border-radius: 12px; padding: 18px 20px 20px; margin-bottom: 18px; }
+.config-group h2 { display: flex; align-items: center; gap: 9px; font-size: 14px; font-weight: 600; color: #d1d5db; margin-bottom: 14px; }
+.config-group h2 .dot { width: 8px; height: 8px; border-radius: 50%; background: linear-gradient(135deg, #a78bfa, #7c3aed); box-shadow: 0 0 10px rgba(124,58,237,.5); }
+.config-group h2 .count { margin-left: auto; font-size: 11px; color: #4b5563; font-weight: 500; }
+.field { transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease; }
+.field:hover { border-color: #2a2a4a; }
+.field input[type=number] { transition: border-color .15s ease, box-shadow .15s ease; }
+.field input[type=number]:focus { box-shadow: 0 0 0 3px rgba(124,58,237,.16); }
+.field.changed { border-color: #7c3aed; box-shadow: 0 0 0 1px rgba(124,58,237,.35), 0 0 20px rgba(124,58,237,.12); }
+.save-bar { position: sticky; bottom: 14px; z-index: 10; display: flex; align-items: center; gap: 14px; padding: 14px 18px; background: rgba(10,10,20,.92); backdrop-filter: blur(10px); border: 1px solid #2a2a4a; border-radius: 12px; box-shadow: 0 12px 40px rgba(0,0,0,.5); }
+.save-bar .save-msg { flex: 1; }

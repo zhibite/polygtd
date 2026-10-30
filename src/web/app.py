@@ -30,6 +30,7 @@ Routes:
            GET  /api/config          strategy config (login only)
            PUT  /api/config          update strategy config (login only)
            POST /api/config/reset    reset strategy config (login only)
+           GET  /api/wallet          funder balance snapshot (login only)
 """
 from __future__ import annotations
 
@@ -323,3 +324,14 @@ async def api_reset_config(
     from src.web import runtime_config as rc
 
     return {"ok": True, "values": rc.reset(), "overrides": {}}
+
+
+@app.get("/api/wallet")
+async def api_wallet(
+    refresh: bool = False,
+    _: str = Depends(_require_config_auth),
+) -> dict[str, Any]:
+    """Funder wallet balance for the config page (login required)."""
+    from src.web import wallet as wallet_mod
+
+    return await wallet_mod.wallet_snapshot(_state(), force=refresh)

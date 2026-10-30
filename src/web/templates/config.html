@@ -20,10 +20,38 @@
 </nav>
 
 <div class="container">
+  <div class="page-head">
+    <div>
+      <h1>策略配置</h1>
+      <div class="page-sub">在线调整实盘参数 · 保存后按标记的时机生效</div>
+    </div>
+    <div class="head-meta">
+      已保存覆盖：<b id="overrides-count">0</b> 项<br>
+      配置文件：<span class="mono" id="config-path">--</span>
+    </div>
+  </div>
+
+  <!-- Wallet -->
+  <div class="wallet-card">
+    <div class="wallet-main">
+      <div class="wallet-label">钱包可用余额</div>
+      <div class="wallet-value"><span id="wallet-balance">--</span><span class="unit">USDC</span></div>
+      <div class="wallet-sub" id="wallet-sub">查询中...</div>
+    </div>
+    <div class="wallet-side">
+      <div class="wallet-row"><span>授权额度</span><b id="wallet-allowance">--</b></div>
+      <div class="wallet-row"><span>钱包地址</span><b class="mono" id="wallet-funder">--</b></div>
+      <div class="wallet-row"><span>签名类型</span><b id="wallet-sig">--</b></div>
+      <div class="wallet-row"><span>当前持仓</span><b id="wallet-shares">--</b></div>
+      <button class="btn btn-ghost btn-sm wallet-refresh" id="wallet-refresh"
+              onclick="refreshWallet(true)">刷新</button>
+    </div>
+  </div>
+
   <div id="alert-box"></div>
 
   <div class="alert info">
-    配置保存在 <span class="mono" id="config-path">--</span>（挂在 <code>/app/data</code> 卷上，重启和重新部署都不会丢）。
+    配置保存在 <span class="mono" id="config-path-note">/app/data/runtime_config.json</span>（持久化卷，重启和重新部署都不会丢）。
     带 <span class="scope next_round">下一轮生效</span> 的参数会在下个 15 分钟窗口开始时读取；
     带 <span class="scope restart">重启后生效</span> 的参数只在进程启动时判定；
     其余参数保存后立即生效。密钥类配置（API Key、RPC、Web 密码）不在此页，需改环境变量并重启。
@@ -32,9 +60,9 @@
   <div id="groups"><div class="no-data">加载中...</div></div>
 
   <div class="save-bar">
-    <button class="btn btn-primary" id="save-btn" disabled onclick="saveConfig()">保存配置</button>
+    <span class="save-msg muted" id="save-msg">没有待保存的修改</span>
     <button class="btn btn-ghost" id="reset-btn" onclick="resetConfig()">恢复默认</button>
-    <span class="save-msg" id="save-msg"></span>
+    <button class="btn btn-primary" id="save-btn" disabled onclick="saveConfig()">保存配置</button>
   </div>
 </div>
 
@@ -44,6 +72,7 @@
 const $ = (id) => document.getElementById(id);
 const scopeLabel = (s) =>
   s === 'next_round' ? '下一轮生效' : s === 'restart' ? '重启后生效' : '立即生效';
+const SIG_NAMES = { 0: 'EOA', 1: 'Proxy', 2: 'Safe', 3: 'EIP-1271' };
 
 let DATA = null;
 let INITIAL = {};
@@ -51,6 +80,28 @@ let INITIAL = {};
 function setLive(ok) {
   $('live-dot').className = 'live-dot' + (ok ? '' : ' offline');
   $('live-label').textContent = ok ? '在线' : '离线';
+}
+
+function fmtMoney(n, d = 2) {
+  if (n === null || n === undefined || isNaN(n)) return '--';
+  return Number(n).toLocaleString('en-US', {
+    minimumFractionDigits: d, maximumFractionDigits: d,
+  });
+}
+
+function fmtNum(n, d = 2) {
+  if (n === null || n === undefined || isNaN(n)) return '--';
+  return Number(n).toFixed(d);
+}
+
+function shortAddr(a) {
+  return a ? a.slice(0, 6) + '…' + a.slice(-4) : '--';
+}
+
+function maxNotional() {
+  if (!DATA || !DATA.values) return null;
+  return ['TIER1_NOTIONAL', 'TIER2_NOTIONAL', 'TIER3_NOTIONAL', 'TIER4_NOTIONAL']
+    .reduce((sum, k) => sum + Number(DATA.values[k] || 0), 0);
 }
 
 async function getJSON(path) {
@@ -67,13 +118,64 @@ function showAlert(html, cls) {
   $('alert-box').innerHTML = html ? `<div class="alert ${cls}">${html}</div>` : '';
 }
 
+/* ── Wallet ─────────────────────────────────────────────────────────── */
+function renderWallet(w) {
+  const bal = w.balance_usd;
+  $('wallet-balance').textContent = (bal === null || bal === undefined) ? '--' : fmtMoney(bal);
+
+  const allow = w.allowance_usd;
+  $('wallet-allowance').textContent =
+    (allow === null || allow === undefined) ? '--' : (allow > 1e9 ? '无限' : '$' + fmtMoney(allow));
+
+  $('wallet-funder').textContent = shortAddr(w.funder);
+  $('wallet-funder').title = w.funder || '';
+  $('wallet-sig').textContent = SIG_NAMES[w.signature_type] ?? ('类型 ' + w.signature_type);
+  $('wallet-shares').textContent =
+    (w.position_shares === null || w.position_shares === undefined)
+      ? '无持仓' : fmtNum(w.position_shares, 2) + ' 份';
+
+  const sub = $('wallet-sub');
+  if (w.error) {
+    sub.textContent = w.error;
+    sub.className = 'wallet-sub err';
+    return;
+  }
+  const ts = w.updated_at
+    ? new Date(w.updated_at * 1000).toLocaleTimeString('zh-CN', { hour12: false })
+    : '--';
+  let text = `更新于 ${ts} · 缓存 15 秒`;
+  const need = maxNotional();
+  if (bal !== null && bal !== undefined && need !== null && bal < need) {
+    text += ` · ⚠️ 低于单轮最大名义金额 $${fmtMoney(need, 0)}`;
+    sub.className = 'wallet-sub warn';
+  } else {
+    sub.className = 'wallet-sub';
+  }
+  sub.textContent = text;
+}
+
+async function refreshWallet(force) {
+  const btn = $('wallet-refresh');
+  if (btn) { btn.disabled = true; btn.textContent = '刷新中...'; }
+  try {
+    const w = await getJSON('/api/wallet' + (force ? '?refresh=1' : ''));
+    renderWallet(w);
+  } catch (e) {
+    renderWallet({ error: '钱包查询失败：' + e.message });
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '刷新'; }
+  }
+}
+
+/* ── Config form ────────────────────────────────────────────────────── */
 function render() {
+  $('overrides-count').textContent = Object.keys(DATA.overrides || {}).length;
   $('config-path').textContent = DATA.spec.config_path;
+  $('config-path-note').textContent = DATA.spec.config_path;
 
   if (!DATA.auth_enabled) {
     showAlert(
-      '<b>⚠️ 看板未设置密码。</b>任何能访问该域名的人都可以修改下面的策略参数。' +
-      '请在 Coolify 环境变量中设置 <code>WEB_PASSWORD</code> 后重新部署。',
+      '<b>⚠️ 看板未设置密码。</b>请在 Coolify 环境变量中设置 <code>WEB_PASSWORD</code> 后重新部署。',
       'warn'
     );
   } else {
@@ -85,12 +187,14 @@ function render() {
     (byGroup[p.group] = byGroup[p.group] || []).push(p);
   }
 
-  $('groups').innerHTML = DATA.spec.groups.map((g) => `
-    <div class="config-group">
-      <h2>${g}</h2>
-      <div class="config-grid">${(byGroup[g] || []).map(fieldHtml).join('')}</div>
-    </div>
-  `).join('');
+  $('groups').innerHTML = DATA.spec.groups.map((g) => {
+    const items = byGroup[g] || [];
+    return `
+      <div class="config-group">
+        <h2><span class="dot"></span>${g}<span class="count">${items.length} 项</span></h2>
+        <div class="config-grid">${items.map(fieldHtml).join('')}</div>
+      </div>`;
+  }).join('');
 
   updateSaveState();
 }
@@ -159,7 +263,14 @@ function updateSaveState() {
   let n = 0;
   try { n = Object.keys(buildPatch()).length; } catch (e) { n = 1; }
   $('save-btn').disabled = n === 0;
-  if (n > 0) $('save-msg').textContent = `${n} 项待保存`;
+  const msg = $('save-msg');
+  if (n > 0) {
+    msg.textContent = `${n} 项待保存`;
+    msg.className = 'save-msg orange';
+  } else if (!msg.classList.contains('green') && !msg.classList.contains('red')) {
+    msg.textContent = '没有待保存的修改';
+    msg.className = 'save-msg muted';
+  }
 }
 
 async function saveConfig() {
@@ -233,6 +344,8 @@ async function load() {
 }
 
 load();
+refreshWallet(false);
+setInterval(() => refreshWallet(false), 30000);
 </script>
 <script src="/static/auth-nav.js"></script>
 </body>

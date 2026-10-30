@@ -253,6 +253,9 @@ class CLOBClient:
         # verbatim, otherwise we fall back to the EOA at first init and
         # patch it in once the address is derived (see _init_client).
         self._funder_address = funder_address
+        # Resolved at init: FUNDER_ADDRESS when supplied, otherwise the EOA
+        # derived from the private key. Surfaced to the dashboard.
+        self._resolved_funder = ""
         self._client: Optional[ClobClient] = None
 
         # fill_callback signature (B-3 fix):
@@ -310,6 +313,7 @@ class CLOBClient:
             except Exception:
                 eoa_addr = ""
             funder = self._funder_address or eoa_addr
+            self._resolved_funder = funder
             self._client = ClobClient(
                 host=self._host,
                 chain_id=self.POLYGON_CHAIN_ID,
@@ -330,9 +334,49 @@ class CLOBClient:
     def is_configured(self) -> bool:
         return self._client is not None
 
+    @property
+    def funder_address(self) -> str:
+        """Wallet that holds the funds (FUNDER_ADDRESS or derived EOA)."""
+        return self._resolved_funder or self._funder_address
+
+    @property
+    def signature_type(self) -> int:
+        return self._signature_type
+
     # ------------------------------------------------------------------
     # Balance
     # ------------------------------------------------------------------
+
+    async def get_collateral(self) -> dict | None:
+        """Collateral (pUSD) balance AND allowance in human units.
+
+        Same REST call as `get_balance`, but keeps both fields so the
+        dashboard can show whether the wallet is funded and whether the
+        CLOB is approved to spend it. Returns None on any failure — an
+        API error must never be rendered as a zero balance.
+        """
+        if not self._client:
+            return None
+        try:
+            from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
+
+            resp = await self._run(
+                self._client.get_balance_allowance,
+                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL),
+            )
+            if not isinstance(resp, dict) or resp.get("balance") is None:
+                return None
+            balance = float(resp["balance"]) / self._CLOB_BASE_UNITS
+            raw_allowance = resp.get("allowance")
+            allowance = (
+                float(raw_allowance) / self._CLOB_BASE_UNITS
+                if raw_allowance is not None
+                else None
+            )
+            return {"balance": balance, "allowance": allowance}
+        except Exception as exc:
+            log.debug("clob.get_collateral.error", error=str(exc))
+            return None
 
     async def get_balance(self) -> float | None:
         """USDC (pUSD) collateral balance in human units, or None on error.
