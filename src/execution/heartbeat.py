@@ -5,10 +5,19 @@ Per Polymarket rules:
   - If no heartbeat is received for 10s, all open GTD orders are cancelled.
   - This runs as an independent asyncio Task so it is not blocked by other loops.
 
+Bootstrap: the first call sends a null id and the server answers 400
+"Invalid Heartbeat ID" **with the session id in the body**. `CLOBClient`
+surfaces that as `suggested_heartbeat_id`; this loop adopts it immediately so
+the next tick (5 s later) is a valid heartbeat instead of another blind
+bootstrap. Before this, production took 4 attempts (~20 s) to reach
+`session_ready` — dangerous mid-round, because Polymarket cancels open GTDs
+after 10 s without a heartbeat.
+
 Logging policy: the happy path is silent (this loop runs every 5 seconds and
 would otherwise flood logs). We only emit:
   - INFO on start / stop / first successful session id (one-shot each)
   - WARNING when we lose an established session (had a heartbeat_id, then error)
+  - WARNING if the server keeps handing us new ids for 4+ ticks
   - DEBUG for the expected first-call bootstrap failure (empty id → 400)
 """
 from __future__ import annotations
@@ -31,11 +40,21 @@ class HeartbeatLoop:
         self._heartbeat_id: str = ""
         self._session_announced: bool = False
         self._consecutive_errors: int = 0
+        # Post cadence — overridable in tests.
+        self._interval: float = 5.0
+        # Consecutive "server handed us a new id" responses. Normally 1,
+        # because the next tick succeeds; a long streak means the server
+        # keeps rejecting our id and deserves a WARNING.
+        self._hint_streak: int = 0
 
     async def start(self) -> None:
         self._running = True
         self._task = asyncio.create_task(self._run())
-        log.info("heartbeat.started", interval_sec=5.0, server_window_sec=10.0)
+        log.info(
+            "heartbeat.started",
+            interval_sec=self._interval,
+            server_window_sec=10.0,
+        )
 
     async def stop(self) -> None:
         self._running = False
@@ -48,10 +67,8 @@ class HeartbeatLoop:
         log.info("heartbeat.stopped")
 
     async def _run(self) -> None:
-        interval = 5.0  # post every 5s — well within the 10s mandatory window
-
         while self._running:
-            await asyncio.sleep(interval)
+            await asyncio.sleep(self._interval)
 
             if not self._clob.is_configured():
                 continue
@@ -61,18 +78,42 @@ class HeartbeatLoop:
                 self._consecutive_errors = 0
                 if resp and resp.get("heartbeat_id"):
                     self._heartbeat_id = resp["heartbeat_id"]
+                    self._hint_streak = 0
                     if not self._session_announced:
                         self._session_announced = True
                         log.info("heartbeat.session_ready")
                 elif not resp.get("success", True):
                     err = resp.get("error", "")
-                    if self._is_invalid_id_error(err):
+                    hint = resp.get("suggested_heartbeat_id")
+                    if hint:
+                        # Server rejected our id but returned the session id
+                        # to use (bootstrap / session re-issue). Adopt it now
+                        # so the NEXT tick — 5 s later — is a valid
+                        # heartbeat instead of another blind bootstrap. This
+                        # is what turns the ~20 s startup gap into ~5 s.
+                        self._heartbeat_id = str(hint)
+                        self._session_announced = False
+                        self._hint_streak += 1
+                        if self._hint_streak == 4:
+                            # Log ONCE per stuck streak — not every 5 s.
+                            log.warning(
+                                "heartbeat.bootstrap_stuck",
+                                attempts=self._hint_streak,
+                                hint=str(hint)[:12],
+                            )
+                        else:
+                            log.debug(
+                                "heartbeat.id_reassigned",
+                                new_id=str(hint)[:12],
+                            )
+                    elif self._is_invalid_id_error(err):
                         # Server forgot our id (session expiry). Drop it and
                         # re-bootstrap on next tick by sending heartbeat_id=None.
                         log.debug("heartbeat.id_rejected",
                                   old_id=self._heartbeat_id[:12])
                         self._heartbeat_id = ""
                         self._session_announced = False
+                        self._hint_streak = 0
                     else:
                         self._handle_error("error", err[:100])
             except Exception as exc:

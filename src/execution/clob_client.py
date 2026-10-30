@@ -922,7 +922,22 @@ class CLOBClient:
             resp = await self._run(self._client.post_heartbeat, sdk_arg)
             return resp if resp else {"success": True}
         except Exception as exc:
-            return {"success": False, "error": str(exc), "exception": True}
+            result = {"success": False, "error": str(exc), "exception": True}
+            # Bootstrap / re-bootstrap: the server rejects the null id with
+            # HTTP 400 but hands back the session id to use, e.g.
+            #   {"heartbeat_id": "6d04dd4b-...", "error_msg": "Invalid Heartbeat ID"}
+            # The SDK raises instead of returning that body, so the caller
+            # never saw the id and kept re-sending null — production
+            # 2026-10-30 took 4 attempts (~20 s) to reach `session_ready`.
+            # Polymarket cancels open GTDs after 10 s without a heartbeat,
+            # so that gap is dangerous mid-round. Surface the id here and
+            # `HeartbeatLoop` adopts it on the next tick.
+            err = getattr(exc, "error_msg", None)
+            if isinstance(err, dict):
+                hint = err.get("heartbeat_id")
+                if hint:
+                    result["suggested_heartbeat_id"] = str(hint)
+            return result
 
     # ------------------------------------------------------------------
     # Queries
