@@ -53,11 +53,20 @@ class GateKeeper:
 
     def __init__(self, binance_baseline: float) -> None:
         self._baseline = binance_baseline
-        self._drift_limit = _s().BASELINE_DRIFT_LIMIT
 
     @property
     def baseline(self) -> float:
         return self._baseline
+
+    @property
+    def drift_limit(self) -> float:
+        """Read live from config so dashboard edits apply immediately.
+
+        The gate is created once per round; caching the limit in __init__
+        (as this class used to) meant a runtime-config change did not take
+        effect until the next round.
+        """
+        return _s().BASELINE_DRIFT_LIMIT
 
     def drift(self, binance_now: float) -> float:
         if binance_now <= 0 or self._baseline <= 0:
@@ -70,7 +79,7 @@ class GateKeeper:
             binance_baseline=self._baseline,
             binance_now=binance_now,
             drift=d,
-            within_limit=d <= self._drift_limit,
+            within_limit=d <= self.drift_limit,
         )
 
     def can_act(self, binance_now: float) -> bool:

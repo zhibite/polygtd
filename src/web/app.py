@@ -5,33 +5,45 @@ loop, so `/api/status` reads live engine state without locks. History comes
 from the SQLite file the bot already writes.
 
 Start-up:  `uvicorn.Server(...).serve()` is scheduled from `main()`.
-Auth:      optional HTTP Basic. Set WEB_PASSWORD (and optionally WEB_USERNAME)
-           in the environment / Coolify panel to lock the dashboard. When
-           WEB_PASSWORD is empty the dashboard is public — the `web.auth_disabled`
-           warning is logged at start-up.
+Auth:      cookie sessions (see `src/web/auth.py`). Set WEB_PASSWORD (and
+           optionally WEB_USERNAME) in the environment / Coolify panel.
+
+           * WEB_PASSWORD set   → every page/API except /login, /api/auth/*
+             and /api/health requires a login.
+           * WEB_PASSWORD empty → the read-only dashboard stays public, but
+             /config and /api/config are always locked and the login page
+             explains that WEB_PASSWORD must be configured.
+
 Routes:
-           GET /               dashboard page
-           GET /trades         trade history page
-           GET /api/health     liveness probe (never authenticated)
-           GET /api/status     live snapshot
-           GET /api/rounds     rounds + derived PnL
-           GET /api/fills      recent fills
-           GET /api/trades     rounds + fills + aggregate stats
+           GET  /                    dashboard page
+           GET  /trades              trade history page
+           GET  /config              strategy config page (login only)
+           GET  /login               login page
+           POST /api/auth/login      authenticate, sets session cookie
+           POST /api/auth/logout     clear session cookie
+           GET  /api/auth/me         current session state
+           GET  /api/health          liveness probe (never authenticated)
+           GET  /api/status          live snapshot
+           GET  /api/rounds          rounds + derived PnL
+           GET  /api/fills           recent fills
+           GET  /api/trades          rounds + fills + aggregate stats
+           GET  /api/config          strategy config (login only)
+           PUT  /api/config          update strategy config (login only)
+           POST /api/config/reset    reset strategy config (login only)
 """
 from __future__ import annotations
 
-import secrets
 import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
-from src.config import strategy as _strategy
 from src.infra.logging import get_logger
+from src.web import auth
 from src.web import status as status_mod
 
 log = get_logger(__name__)
@@ -47,35 +59,46 @@ app = FastAPI(
 )
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-_security = HTTPBasic(auto_error=False)
 
 
 # ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
 
-def _authorized(creds: HTTPBasicCredentials | None) -> bool:
-    cfg = _strategy()
-    if not cfg.WEB_PASSWORD:
-        return True
-    if creds is None:
-        return False
-    expected_user = cfg.WEB_USERNAME or "admin"
-    return (
-        secrets.compare_digest(creds.username, expected_user)
-        and secrets.compare_digest(creds.password, cfg.WEB_PASSWORD)
-    )
+class LoginPayload(BaseModel):
+    username: str = ""
+    password: str = ""
 
 
-async def _require_auth(
-    creds: HTTPBasicCredentials | None = Depends(_security),
-) -> None:
-    if not _authorized(creds):
-        raise HTTPException(
-            status_code=401,
-            detail="Unauthorized",
-            headers={"WWW-Authenticate": 'Basic realm="polygtd"'},
+def _safe_next(value: str | None) -> str:
+    """Only allow same-site relative redirects (no open redirect)."""
+    if value and value.startswith("/") and not value.startswith("//"):
+        return value
+    return "/"
+
+
+def _login_redirect(request: Request) -> RedirectResponse | None:
+    if auth.auth_required() and auth.current_session(request) is None:
+        return RedirectResponse(
+            f"/login?next={request.url.path}", status_code=302
         )
+    return None
+
+
+async def _require_auth(request: Request) -> None:
+    """Protect read APIs when a password is configured."""
+    if not auth.auth_required():
+        return
+    if auth.current_session(request) is None:
+        raise HTTPException(status_code=401, detail="需要登录")
+
+
+async def _require_config_auth(request: Request) -> str:
+    """The config surface ALWAYS needs a session, password or not."""
+    user = auth.current_user(request)
+    if user is None:
+        raise HTTPException(status_code=401, detail="需要登录后才能访问策略配置")
+    return user
 
 
 # ---------------------------------------------------------------------------
@@ -119,17 +142,90 @@ def _render(name: str) -> HTMLResponse:
 
 
 # ---------------------------------------------------------------------------
+# Auth routes
+# ---------------------------------------------------------------------------
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request) -> Any:
+    if auth.current_session(request) is not None:
+        return RedirectResponse(
+            _safe_next(request.query_params.get("next")), status_code=302
+        )
+    return _render("login.html")
+
+
+@app.get("/api/auth/me")
+async def api_auth_me(request: Request) -> dict[str, Any]:
+    session = auth.current_session(request)
+    return {
+        "authenticated": session is not None,
+        "user": session.user if session else None,
+        "auth_required": auth.auth_required(),
+        "credentials_configured": auth.credentials_configured(),
+    }
+
+
+@app.post("/api/auth/login")
+async def api_auth_login(
+    payload: LoginPayload, request: Request, response: Response
+) -> dict[str, Any]:
+    ip = auth.client_ip(request)
+    if not auth.credentials_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="管理员尚未设置 WEB_PASSWORD，无法登录。请在部署环境变量中设置后重启。",
+        )
+    if auth.login_blocked(ip):
+        raise HTTPException(
+            status_code=429, detail="登录失败次数过多，请 5 分钟后再试"
+        )
+    if not auth.verify_credentials(payload.username, payload.password):
+        auth.record_login_failure(ip)
+        log.warning("web.login_failed", user=payload.username, ip=ip)
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+
+    token = auth.create_session(payload.username)
+    auth.set_session_cookie(response, token, request)
+    auth.reset_login_failures(ip)
+    log.info("web.login_ok", user=payload.username, ip=ip)
+    return {"ok": True, "user": payload.username}
+
+
+@app.post("/api/auth/logout")
+async def api_auth_logout(
+    request: Request, response: Response
+) -> dict[str, Any]:
+    auth.delete_session(request.cookies.get(auth.SESSION_COOKIE))
+    auth.clear_session_cookie(response)
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
 # Pages
 # ---------------------------------------------------------------------------
 
 @app.get("/", response_class=HTMLResponse)
-async def dashboard_page(_: None = Depends(_require_auth)) -> HTMLResponse:
+async def dashboard_page(request: Request) -> Any:
+    redirect = _login_redirect(request)
+    if redirect is not None:
+        return redirect
     return _render("dashboard.html")
 
 
 @app.get("/trades", response_class=HTMLResponse)
-async def trades_page(_: None = Depends(_require_auth)) -> HTMLResponse:
+async def trades_page(request: Request) -> Any:
+    redirect = _login_redirect(request)
+    if redirect is not None:
+        return redirect
     return _render("trades.html")
+
+
+@app.get("/config", response_class=HTMLResponse)
+async def config_page(request: Request) -> Any:
+    # Never public — even when the rest of the dashboard is.
+    if auth.current_session(request) is None:
+        return RedirectResponse("/login?next=/config", status_code=302)
+    return _render("config.html")
 
 
 # ---------------------------------------------------------------------------
@@ -186,3 +282,44 @@ async def api_round_fills(
         "round_start_ts": round_start_ts,
         "fills": status_mod.fills_for_round(_conn(), round_start_ts),
     }
+
+
+# ---------------------------------------------------------------------------
+# Runtime strategy config (login required, always)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/config")
+async def api_get_config(
+    _: str = Depends(_require_config_auth),
+) -> dict[str, Any]:
+    from src.web import runtime_config as rc
+
+    return {
+        "values": rc.current_values(),
+        "overrides": rc.load_overrides(),
+        "spec": rc.spec_payload(),
+        "auth_enabled": bool(auth.credentials_configured()),
+    }
+
+
+@app.put("/api/config")
+async def api_update_config(
+    patch: dict[str, Any],
+    _: str = Depends(_require_config_auth),
+) -> dict[str, Any]:
+    from src.web import runtime_config as rc
+
+    try:
+        values = rc.update(patch)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    return {"ok": True, "values": values, "overrides": rc.load_overrides()}
+
+
+@app.post("/api/config/reset")
+async def api_reset_config(
+    _: str = Depends(_require_config_auth),
+) -> dict[str, Any]:
+    from src.web import runtime_config as rc
+
+    return {"ok": True, "values": rc.reset(), "overrides": {}}

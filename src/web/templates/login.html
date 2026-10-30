@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>登录 - PolyGTD</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="login-body">
+<div class="login-wrap">
+  <div class="login-card">
+    <div class="login-brand">PolyGTD</div>
+    <div class="login-sub">策略控制台登录</div>
+    <div id="alert-box"></div>
+    <form id="login-form" autocomplete="on">
+      <label class="login-field">用户名
+        <input id="username" name="username" autocomplete="username" value="admin" required>
+      </label>
+      <label class="login-field">密码
+        <input id="password" name="password" type="password" autocomplete="current-password" required>
+      </label>
+      <button class="btn btn-primary login-btn" type="submit" id="login-btn">登录</button>
+    </form>
+    <div class="login-foot muted">策略配置页登录后才可访问</div>
+  </div>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+
+function safeNext(value) {
+  return (value && value.startsWith('/') && !value.startsWith('//')) ? value : '/config';
+}
+const NEXT = safeNext(params.get('next'));
+
+function showAlert(html, cls) {
+  $('alert-box').innerHTML = html ? `<div class="alert ${cls}">${html}</div>` : '';
+}
+
+async function init() {
+  try {
+    const r = await fetch('/api/auth/me', { cache: 'no-store' });
+    const me = await r.json();
+    if (me.authenticated) {
+      location.href = NEXT;
+      return;
+    }
+    if (!me.credentials_configured) {
+      showAlert(
+        '管理员尚未设置 <code>WEB_PASSWORD</code>，无法登录。' +
+        '请到 Coolify 的环境变量中设置密码并重新部署。',
+        'warn'
+      );
+      $('login-btn').disabled = true;
+      $('username').disabled = true;
+      $('password').disabled = true;
+    }
+  } catch (e) { /* form still works if /me is unreachable */ }
+}
+
+$('login-form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  showAlert('', '');
+  $('login-btn').disabled = true;
+  $('login-btn').textContent = '登录中...';
+  try {
+    const r = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: $('username').value,
+        password: $('password').value,
+      }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(body.detail || ('HTTP ' + r.status));
+    location.href = NEXT;
+  } catch (e) {
+    showAlert(e.message, 'warn');
+    $('login-btn').disabled = false;
+    $('login-btn').textContent = '登录';
+    $('password').focus();
+  }
+});
+
+init();
+</script>
+</body>
+</html>

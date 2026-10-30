@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>策略配置 - PolyGTD</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<nav>
+  <span class="brand">PolyGTD</span>
+  <a href="/">控制台</a>
+  <a href="/trades">交易记录</a>
+  <a href="/config" class="active">策略配置</a>
+  <div class="nav-right">
+    <span id="auth-area" class="nav-auth"></span>
+    <span class="live-dot" id="live-dot"></span>
+    <span id="live-label">连接中</span>
+  </div>
+</nav>
+
+<div class="container">
+  <div id="alert-box"></div>
+
+  <div class="alert info">
+    配置保存在 <span class="mono" id="config-path">--</span>（挂在 <code>/app/data</code> 卷上，重启和重新部署都不会丢）。
+    带 <span class="scope next_round">下一轮生效</span> 的参数会在下个 15 分钟窗口开始时读取；
+    带 <span class="scope restart">重启后生效</span> 的参数只在进程启动时判定；
+    其余参数保存后立即生效。密钥类配置（API Key、RPC、Web 密码）不在此页，需改环境变量并重启。
+  </div>
+
+  <div id="groups"><div class="no-data">加载中...</div></div>
+
+  <div class="save-bar">
+    <button class="btn btn-primary" id="save-btn" disabled onclick="saveConfig()">保存配置</button>
+    <button class="btn btn-ghost" id="reset-btn" onclick="resetConfig()">恢复默认</button>
+    <span class="save-msg" id="save-msg"></span>
+  </div>
+</div>
+
+<footer>PolyGTD · 修改策略参数会影响实盘下单，请谨慎操作</footer>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const scopeLabel = (s) =>
+  s === 'next_round' ? '下一轮生效' : s === 'restart' ? '重启后生效' : '立即生效';
+
+let DATA = null;
+let INITIAL = {};
+
+function setLive(ok) {
+  $('live-dot').className = 'live-dot' + (ok ? '' : ' offline');
+  $('live-label').textContent = ok ? '在线' : '离线';
+}
+
+async function getJSON(path) {
+  const r = await fetch(path, { cache: 'no-store' });
+  if (r.status === 401) {
+    location.href = '/login?next=/config';
+    throw new Error('需要登录');
+  }
+  if (!r.ok) throw new Error(path + ' ' + r.status);
+  return await r.json();
+}
+
+function showAlert(html, cls) {
+  $('alert-box').innerHTML = html ? `<div class="alert ${cls}">${html}</div>` : '';
+}
+
+function render() {
+  $('config-path').textContent = DATA.spec.config_path;
+
+  if (!DATA.auth_enabled) {
+    showAlert(
+      '<b>⚠️ 看板未设置密码。</b>任何能访问该域名的人都可以修改下面的策略参数。' +
+      '请在 Coolify 环境变量中设置 <code>WEB_PASSWORD</code> 后重新部署。',
+      'warn'
+    );
+  } else {
+    showAlert('', '');
+  }
+
+  const byGroup = {};
+  for (const p of DATA.spec.params) {
+    (byGroup[p.group] = byGroup[p.group] || []).push(p);
+  }
+
+  $('groups').innerHTML = DATA.spec.groups.map((g) => `
+    <div class="config-group">
+      <h2>${g}</h2>
+      <div class="config-grid">${(byGroup[g] || []).map(fieldHtml).join('')}</div>
+    </div>
+  `).join('');
+
+  updateSaveState();
+}
+
+function fieldHtml(p) {
+  const v = DATA.values[p.key];
+  const changed = isChanged(p);
+  if (p.kind === 'bool') {
+    return `<div class="field ${changed ? 'changed' : ''}" data-key="${p.key}">
+      <label>${p.label} <span class="scope ${p.scope}">${scopeLabel(p.scope)}</span></label>
+      <div class="switch-row">
+        <input type="checkbox" id="f_${p.key}" ${v ? 'checked' : ''} onchange="onInput('${p.key}')">
+        <span class="key">${p.key}</span>
+      </div>
+      ${p.help ? `<div class="help">${p.help}</div>` : ''}
+    </div>`;
+  }
+  return `<div class="field ${changed ? 'changed' : ''}" data-key="${p.key}">
+    <label>${p.label} <span class="scope ${p.scope}">${scopeLabel(p.scope)}</span></label>
+    <input type="number" id="f_${p.key}" value="${v}" step="${p.step}"
+           min="${p.min}" max="${p.max}" oninput="onInput('${p.key}')">
+    <span class="key">${p.key}</span>
+    ${p.help ? `<div class="help">${p.help}</div>` : ''}
+  </div>`;
+}
+
+function readInput(p) {
+  const el = $('f_' + p.key);
+  if (!el) return undefined;
+  if (p.kind === 'bool') return el.checked;
+  if (el.value === '') return NaN;
+  return Number(el.value);
+}
+
+function isChanged(p) {
+  const cur = readInput(p);
+  if (cur === undefined) return false;
+  if (p.kind === 'bool') return cur !== !!INITIAL[p.key];
+  if (Number.isNaN(cur)) return true;
+  return Math.abs(cur - Number(INITIAL[p.key])) > 1e-12;
+}
+
+function onInput(key) {
+  const p = DATA.spec.params.find((x) => x.key === key);
+  const box = document.querySelector(`.field[data-key="${key}"]`);
+  if (p && box) box.classList.toggle('changed', isChanged(p));
+  updateSaveState();
+}
+
+function buildPatch() {
+  const patch = {};
+  for (const p of DATA.spec.params) {
+    if (!isChanged(p)) continue;
+    const val = readInput(p);
+    if (p.kind !== 'bool') {
+      if (Number.isNaN(val)) throw new Error(`${p.label} 不是有效数字`);
+      if (p.min !== null && val < p.min) throw new Error(`${p.label} 不能小于 ${p.min}`);
+      if (p.max !== null && val > p.max) throw new Error(`${p.label} 不能大于 ${p.max}`);
+    }
+    patch[p.key] = p.kind === 'int' ? Math.round(val) : val;
+  }
+  return patch;
+}
+
+function updateSaveState() {
+  let n = 0;
+  try { n = Object.keys(buildPatch()).length; } catch (e) { n = 1; }
+  $('save-btn').disabled = n === 0;
+  if (n > 0) $('save-msg').textContent = `${n} 项待保存`;
+}
+
+async function saveConfig() {
+  let patch;
+  try {
+    patch = buildPatch();
+  } catch (e) {
+    $('save-msg').textContent = '⚠️ ' + e.message;
+    $('save-msg').className = 'save-msg red';
+    return;
+  }
+  if (Object.keys(patch).length === 0) return;
+
+  $('save-btn').disabled = true;
+  $('save-msg').textContent = '保存中...';
+  $('save-msg').className = 'save-msg muted';
+  try {
+    const r = await fetch('/api/config', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (r.status === 401) { location.href = '/login?next=/config'; return; }
+    if (!r.ok) throw new Error(body.detail || ('HTTP ' + r.status));
+
+    DATA.values = body.values;
+    DATA.overrides = body.overrides || {};
+    INITIAL = { ...body.values };
+    render();
+    $('save-msg').textContent = '✅ 已保存 ' + Object.keys(patch).length + ' 项';
+    $('save-msg').className = 'save-msg green';
+  } catch (e) {
+    $('save-msg').textContent = '⚠️ ' + e.message;
+    $('save-msg').className = 'save-msg red';
+    $('save-btn').disabled = false;
+  }
+}
+
+async function resetConfig() {
+  if (!confirm('确定恢复为 .env / 代码默认值？\n通过本页面保存的所有覆盖都会被删除。')) return;
+  $('save-msg').textContent = '恢复中...';
+  $('save-msg').className = 'save-msg muted';
+  try {
+    const r = await fetch('/api/config/reset', { method: 'POST' });
+    const body = await r.json().catch(() => ({}));
+    if (r.status === 401) { location.href = '/login?next=/config'; return; }
+    if (!r.ok) throw new Error(body.detail || ('HTTP ' + r.status));
+    DATA.values = body.values;
+    DATA.overrides = {};
+    INITIAL = { ...body.values };
+    render();
+    $('save-msg').textContent = '✅ 已恢复默认值';
+    $('save-msg').className = 'save-msg green';
+  } catch (e) {
+    $('save-msg').textContent = '⚠️ ' + e.message;
+    $('save-msg').className = 'save-msg red';
+  }
+}
+
+async function load() {
+  try {
+    DATA = await getJSON('/api/config');
+    INITIAL = { ...DATA.values };
+    render();
+    setLive(true);
+  } catch (e) {
+    $('groups').innerHTML = '<div class="no-data">加载配置失败：' + e.message + '</div>';
+    setLive(false);
+  }
+}
+
+load();
+</script>
+<script src="/static/auth-nav.js"></script>
+</body>
+</html>

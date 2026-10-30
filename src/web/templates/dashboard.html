@@ -11,7 +11,9 @@
   <span class="brand">PolyGTD</span>
   <a href="/" class="active">控制台</a>
   <a href="/trades">交易记录</a>
+  <a href="/config">策略配置</a>
   <div class="nav-right">
+    <span id="auth-area" class="nav-auth"></span>
     <span class="live-dot" id="live-dot"></span>
     <span id="live-label">连接中</span>
     <span id="clock" class="mono"></span>
@@ -143,6 +145,10 @@ function setLive(ok) {
 
 async function getJSON(path) {
   const r = await fetch(path, { cache: 'no-store' });
+  if (r.status === 401) {
+    location.href = '/login?next=' + encodeURIComponent(location.pathname);
+    throw new Error('需要登录');
+  }
   if (!r.ok) throw new Error(path + ' ' + r.status);
   return await r.json();
 }
@@ -290,5 +296,6 @@ refreshTrades();
 setInterval(refreshStatus, 3000);
 setInterval(refreshTrades, 10000);
 </script>
+<script src="/static/auth-nav.js"></script>
 </body>
 </html>

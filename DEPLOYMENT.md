@@ -165,7 +165,7 @@ volumes:
 
 - 内置 Web 看板（FastAPI），监听容器端口 **8010**
 - 健康检查端点：`GET /api/health`（无需鉴权，可用于 Coolify HTTP 探针）
-- 看板页面：`/`（控制台）、`/trades`（交易记录）
+- 看板页面：`/`（控制台）、`/trades`（交易记录）、`/config`（策略配置）
 - 启动命令：`python -m src.main`
 - 日志存活判断：`docker logs` 中每 5 秒输出一行 `STATUS ...`
 - 启动日志应出现 `web.started port=8010 auth=True/False`
@@ -177,8 +177,19 @@ volumes:
 | `WEB_ENABLED` | `true` | 设为 `false` 关闭 HTTP 服务 |
 | `WEB_HOST` | `0.0.0.0` | 监听地址 |
 | `WEB_PORT` | `8010` | 监听端口（需与 Coolify 域名映射的端口一致） |
-| `WEB_USERNAME` | `admin` | HTTP Basic 用户名 |
-| `WEB_PASSWORD` | 空 | HTTP Basic 密码；**留空 = 无鉴权** |
+| `WEB_USERNAME` | `admin` | 登录用户名 |
+| `WEB_PASSWORD` | 空 | 登录密码；设置后看板所有页面/API 都需要登录 |
+| `WEB_SESSION_TTL_S` | `604800` | 登录会话有效期（秒），默认 7 天 |
+
+登录说明：
+
+- 访问 `/login` 输入用户名密码，成功后写入 `HttpOnly` + `SameSite=Lax`
+  的会话 Cookie（HTTPS 下自动加 `Secure`）
+- 会话保存在进程内存里，**重启/重新部署后需要重新登录**
+- 连续输错 10 次密码，该 IP 会被锁定 5 分钟
+- **`WEB_PASSWORD` 为空时**：只读看板保持公开（兼容旧行为），但
+  `/config` 和 `/api/config` 永远要求登录；没有密码就登录不了，页面会提示
+  去 Coolify 配置
 
 `WEB_PASSWORD` 属于密钥，请放在 Coolify 面板的环境变量里，不要写进
 `.env.docker`。看板数据来源：
@@ -189,6 +200,23 @@ volumes:
 
 Coolify 中将 `polygtd.bquant.com` 指向本服务的 **8010** 端口即可；
 若仍出现 502，请检查 `docker logs` 是否有 `web.started`。
+
+### 6. 策略配置页
+
+`/config` 可以在线修改常用策略参数（入场价、分层金额/跌幅、止盈、风控、GTD 等），
+保存后写入 `/app/data/runtime_config.json`（持久化卷），重启和重新部署后仍然生效。
+
+| 标记 | 生效时机 |
+|------|----------|
+| 立即生效 | 下一次决策 tick 读取（入场价、预挂幅度、漂移上限、T1 时间窗、止盈参数、GTD 有效期等） |
+| 下一轮生效 | 下个 15 分钟窗口开始时读取（分层金额、跨窗跳空阈值、晚启动宽限期） |
+| 重启后生效 | 只在进程启动后的第一个窗口判定（晚启动跳过开关） |
+
+- 「恢复默认」删除覆盖文件，回到 `.env` / `.env.docker` / 代码默认值
+- 参数校验在前端和后端都做（范围 + 交叉校验：TP 下限 ≤ 止盈、T2<T3<T4 跌幅）
+- **配置页必须登录**：即使 `WEB_PASSWORD` 为空，`/config` 和 `/api/config`
+  也要求登录会话（无密码时无法登录，页面会提示先配置 `WEB_PASSWORD`）
+- 登录入口：`/login`；导航栏右上角会显示当前用户和「退出」
 
 ---
 

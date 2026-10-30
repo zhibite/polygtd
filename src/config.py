@@ -210,6 +210,9 @@ class StrategySettings(BaseSettings):
     WEB_LOG_LEVEL: str = "warning"
     WEB_USERNAME: str = "admin"
     WEB_PASSWORD: str = ""
+    # Dashboard login session lifetime (seconds). Sessions are kept in
+    # memory, so a restart/redeploy forces a fresh login.
+    WEB_SESSION_TTL_S: int = 7 * 24 * 3600
 
     # ── Derived helpers ───────────────────────────────────────────────────
 

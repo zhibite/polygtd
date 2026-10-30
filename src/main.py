@@ -1924,6 +1924,16 @@ async def main() -> None:
     s = STATE
     log.info("bot.starting", version="0.1.0")
 
+    # Apply strategy overrides saved from the dashboard /config page before
+    # any component captures config values. Stored on the /app/data volume so
+    # they survive restarts and redeploys.
+    try:
+        from src.web.runtime_config import apply_persisted_overrides
+
+        apply_persisted_overrides()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("config.runtime_overrides_failed", error=str(exc))
+
     cfg_strategy = strategy()
 
     # ── CLOB credentials ─────────────────────────────────────────────────
