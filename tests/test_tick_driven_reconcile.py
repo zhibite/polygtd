@@ -603,3 +603,50 @@ async def test_tp_fire_cancel_respects_hysteresis_band() -> None:
         "mid inside the TP hysteresis band must not cancel BUY GTDs; "
         f"got {[(a.tier, a.reason) for a in emitted]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Post-TP re-entry guard
+# ---------------------------------------------------------------------------
+
+
+async def test_averaging_does_not_reenter_after_full_tp_exit() -> None:
+    """After TP sells the entire position, T2..T4 must not re-enter.
+
+    T1 re-entry is blocked by `entry_token` (kept until the next round),
+    but `_check_average_down` used to only inspect tier state. With a flat
+    position (total_qty=0) a mid drop back into the next-tier zone would
+    open a fresh position with no T1 base in the same window.
+    """
+    tiers = [
+        _FakeTier(
+            tier=1, placed=False, watching=False, is_complete=True,
+            filled=True, size_filled=5.0, size_expected=5.0,
+        ),
+        _FakeTier(tier=2),
+        _FakeTier(tier=3),
+        _FakeTier(tier=4),
+    ]
+    pos = _FakePos(
+        tiers=tiers,
+        avg_cost=0.0,
+        total_qty=0.0,
+        total_cost=0.0,
+        baseline_realized_price=0.37,
+        baseline_target_price=0.37,
+        tp_target=None,
+    )
+    eng = _make_engine(pos, mid=0.20)  # far below every next-tier fire line
+
+    emitted: list = []
+
+    async def handler(action) -> None:  # noqa: ANN001
+        emitted.append(action)
+
+    eng._handler = handler
+    await eng._check_average_down(100_000.0)
+
+    assert emitted == [], (
+        "averaging must not re-open a position after a full TP exit; "
+        f"got {[(type(a).__name__, getattr(a, 'tier', None)) for a in emitted]}"
+    )

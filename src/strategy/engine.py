@@ -203,6 +203,20 @@ class StrategyEngine:
             return 0.0
         return max(0.0, min(0.5, value))
 
+    def _get_tp_require_drift_gate(self) -> bool:
+        """Whether TP exits must also pass the BTC drift gate.
+
+        Default False: exits should not be blocked by spot drift (the gate
+        exists to filter entries). A MagicMock `_s` stub is treated as
+        unset and the process config is consulted instead.
+        """
+        value = None
+        if hasattr(self, "_s") and self._s is not None:
+            value = getattr(self._s, "TP_REQUIRE_DRIFT_GATE", None)
+        if not isinstance(value, bool):
+            value = getattr(_s(), "TP_REQUIRE_DRIFT_GATE", False)
+        return bool(value)
+
     def _t1_skip_log(self, reason: str, *, side: str, **fields) -> None:
         """Log a T1 skip event with per-(reason,side) throttle.
 
@@ -1262,6 +1276,15 @@ class StrategyEngine:
         if snap.tp_inflight:
             return
 
+        # A fully closed position (take-profit sold everything) must not
+        # re-enter through the averaging path. T1 re-entry is already
+        # blocked by `entry_token` (kept until the next round), but T2..T4
+        # only inspect their own tier state — without this guard a mid
+        # drop back into the next-tier zone AFTER a TP exit would open a
+        # fresh position with no T1 base in the same window.
+        if snap.total_qty <= 1e-9:
+            return
+
         mid_price = self._pc.get_midpoint(pos.entry_token)
         if mid_price <= 0:
             return
@@ -1558,12 +1581,24 @@ class StrategyEngine:
             )
             return
         qty_slack = max(1e-6 * max(snap.total_qty, 1.0), 1e-9)
-        if sum_tier_qty - snap.total_qty > qty_slack:
+        # `record_tp_fill` reduces total_qty but deliberately keeps
+        # tier.size_filled intact, so shares already sold by an earlier
+        # (partial) TP must be added back before declaring the tiers
+        # unreconciled. Production 2026-10-30: T1's 5-share TP sale left
+        # sum(tier fills)=37.65 vs total_qty=32.65; the old check read the
+        # 5-share difference as "watcher lag" and blocked every later TP
+        # for the rest of the round.
+        # getattr: older test snapshots (SimpleNamespace stubs) predate the
+        # field; a missing value means "nothing sold yet".
+        tp_sold_qty = float(getattr(snap, "tp_sold_qty", 0.0) or 0.0)
+        expected_qty = snap.total_qty + tp_sold_qty
+        if sum_tier_qty - expected_qty > qty_slack:
             log.warning(
                 "engine.tp_blocked_avg_cost_unreconciled",
                 total_qty=snap.total_qty,
+                tp_sold_qty=tp_sold_qty,
                 sum_tier_qty=sum_tier_qty,
-                qty_gap=sum_tier_qty - snap.total_qty,
+                qty_gap=sum_tier_qty - expected_qty,
                 tiers_qty={
                     f"T{t.tier}": {
                         "placed_qty": t.placed_qty,
@@ -1725,7 +1760,24 @@ class StrategyEngine:
         if mid_price < fire_line:
             return
 
-        if not self._gate.can_act(bc_now):
+        # The BTC drift gate is an ENTRY risk filter. Applying it to an
+        # exit blocks profit-taking exactly when BTC has moved — production
+        # 2026-10-30: mid crossed the TP fire line while drift was FAIL, the
+        # SELL was never posted, and the token then collapsed ~60%. Default
+        # off; `TP_REQUIRE_DRIFT_GATE=true` restores the old behaviour.
+        if self._get_tp_require_drift_gate() and not self._gate.can_act(bc_now):
+            round_ts = getattr(self._round, "round_start_ts", 0)
+            if getattr(self, "_tp_drift_skip_round_ts", None) != round_ts:
+                self._tp_drift_skip_round_ts = round_ts
+                gs = self._gate.state(bc_now)
+                log.info(
+                    "engine.tp_skip_drift_gate",
+                    drift=gs.drift,
+                    mid=mid_price,
+                    fire_line=fire_line,
+                    note="TP suppressed by BTC drift gate "
+                         "(TP_REQUIRE_DRIFT_GATE=true)",
+                )
             return
 
         # Set mutex BEFORE emitting the action so re-entrant _evaluate()

@@ -21,7 +21,7 @@ from decimal import Decimal
 from typing import Literal
 
 from src.config import strategy as _s
-from src.execution.clob_client import CLOBClient, FillResult, _round_down, _round_up
+from src.execution.clob_client import CLOBClient, FillResult, _round_down
 from src.infra.logging import get_logger
 from src.market.market_ws import PriceCache
 from src.market.pm_client import PolymarketClient
@@ -973,15 +973,19 @@ class OrderManager:
             # at the engine's exact tp/target price. The legacy
             # `_adjust_sell_price` orderbook fetch has been removed.
             #
-            # Quantize UP to the tick: the TP target is avg_cost*(1+tp_pct)
-            # and is rarely tick-aligned (e.g. 0.2698). Rounding down (the
-            # old behaviour) posted at 0.26 and silently gave away ~3.6%
-            # of the profit target. CLOBClient applies the same rounding,
-            # so TrackedOrder.price now matches the posted order exactly.
+            # Quantize DOWN to the tick (FILL-PRIORITY policy, operator
+            # decision 2026-10-30). The TP target is avg_cost*(1+tp_pct)
+            # and is rarely tick-aligned (e.g. 0.2382). Posting the floor
+            # (0.23) means the order crosses and fills at the prevailing
+            # bid as soon as the market reaches it; posting the ceiling
+            # (0.24) demands a full extra tick and can miss the exit
+            # entirely (production: mid topped at 0.235, never filled,
+            # then collapsed). CLOBClient applies the same rounding, so
+            # TrackedOrder.price matches the posted order exactly.
             adjusted_price = float(price)
             if tick_size and tick_size > 0:
                 adjusted_price = min(
-                    0.99, _round_up(adjusted_price, Decimal(str(tick_size)))
+                    0.99, _round_down(adjusted_price, Decimal(str(tick_size)))
                 )
             # CLOBClient rounds SELL size to 0.0001 shares. Quantize here
             # too so the watcher's expected_size matches the real order.

@@ -101,6 +101,8 @@ PARAMS: tuple[Param, ...] = (
           help="只在进程启动后的第一个窗口判定，修改后需重启才生效"),
     Param("ENTRY_OPEN_OFFSET_GRACE_SEC", "晚启动宽限期 (秒)", "风控", "int", 0, 900, 10,
           "next_round", "启动时窗口已开启超过该秒数则跳过"),
+    Param("TP_REQUIRE_DRIFT_GATE", "止盈也受 BTC 漂移门限制", "风控", "bool",
+          help="关闭时止盈只看价格触发线，不受 BTC 漂移影响（推荐关闭）"),
 
     # ── 订单 ────────────────────────────────────────────────────────────
     Param("GTD_LIFETIME_S", "GTD 有效期 (秒)", "订单", "int", 181, 3600, 10,

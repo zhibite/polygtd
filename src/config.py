@@ -199,6 +199,12 @@ class StrategySettings(BaseSettings):
     #   下一层撤单 : mid <= next_fire_line * (1 - h)
     CANCEL_HYSTERESIS_PCT: float = 0.02
 
+    # 止盈是否也受 BTC 漂移门限制。默认 False：漂移门用于过滤"入场"，
+    # 不应挡住减仓/离场。生产 2026-10-30：mid 已越过止盈触发线，但 BTC
+    # 漂移 FAIL 导致卖单一直没挂出，随后价格回落约 60%。
+    # 设为 True 恢复旧行为（TP 也要求 drift 在限内）。
+    TP_REQUIRE_DRIFT_GATE: bool = False
+
     # TierWatcher WS-event 兜底超时（秒）。
     # Watcher 主路径是等 `order.UPDATE` 推过来（~50ms 唤醒），但当 WS
     # 失联 / 漏事件时，必须有一个上限——超过这个时间就必须主动查 REST

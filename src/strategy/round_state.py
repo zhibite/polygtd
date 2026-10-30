@@ -244,6 +244,9 @@ class PositionSnapshot:
     has_inflight_tier: bool
     entry_token: str | None
     entry_side: str | None
+    # Shares already sold by TP this round. Tier fills keep their original
+    # size, so `sum(tier_size_filled)` == total_qty + tp_sold_qty.
+    tp_sold_qty: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +310,12 @@ class Position:
     _total_qty: float = 0.0
     _total_cost: float = 0.0
     _avg_cost: float = 0.0
+    # Shares already sold by take-profit orders this round. `record_tp_fill`
+    # reduces `_total_qty` but deliberately leaves each tier's `size_filled`
+    # untouched, so `sum(tier.size_filled)` exceeds `_total_qty` by exactly
+    # this amount. The TP avg-cost reconciliation guard must add it back or
+    # a partial TP would block every later TP ("unreconciled shares").
+    _tp_sold_qty: float = 0.0
 
     # TP in-flight mutex — prevents the engine from issuing a new TP
     # action while a previous TP sell is still being processed by the
@@ -421,6 +430,7 @@ class Position:
             has_inflight_tier=self.has_inflight_tier,
             entry_token=self.entry_token,
             entry_side=self.entry_side,
+            tp_sold_qty=self._tp_sold_qty,
         )
 
     def _resolve_inflight_tp_server_id(self) -> str | None:
@@ -551,6 +561,7 @@ class Position:
         self._total_qty = 0.0
         self._total_cost = 0.0
         self._avg_cost = 0.0
+        self._tp_sold_qty = 0.0
         self._tp_inflight = False
         self._last_qty_signature = 0.0
         self._tp_snapshots.clear()
@@ -640,6 +651,10 @@ class Position:
         prev_qty = self._total_qty
         prev_cost = self._total_cost
         sold = min(size, prev_qty)
+        # Track shares disposed of by TP: tier.size_filled is intentionally
+        # preserved, so the reconciliation guard needs this to distinguish
+        # "already sold" from "watcher has not caught up yet".
+        self._tp_sold_qty += max(0.0, sold)
         if sold <= 0:
             # No inventory to reduce. Don't touch avg_cost.
             self._tp_inflight = False

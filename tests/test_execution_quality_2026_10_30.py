@@ -36,8 +36,14 @@ class _OrderSdk:
 
 
 @pytest.mark.asyncio
-async def test_gtd_sell_rounds_price_up_to_tick() -> None:
-    """0.2698 (avg_cost * 1.14) must post at 0.27, not 0.26."""
+async def test_gtd_sell_floors_price_to_tick_for_fill_priority() -> None:
+    """0.2698 must post at 0.26 (floor), not 0.27.
+
+    Fill-priority policy (2026-10-30): the limit sits at the nearest tick
+    AT OR BELOW the target so the order crosses and fills at the
+    prevailing bid once the market reaches it. Posting the ceiling can
+    miss the exit by one full tick.
+    """
     sdk = _OrderSdk()
     client = CLOBClient.__new__(CLOBClient)
     client._client = sdk
@@ -50,7 +56,7 @@ async def test_gtd_sell_rounds_price_up_to_tick() -> None:
     )
     assert result.success is True
     assert sdk.last_args is not None
-    assert float(sdk.last_args.price) == pytest.approx(0.27)
+    assert float(sdk.last_args.price) == pytest.approx(0.26)
 
 
 class _SellClob:
@@ -73,7 +79,7 @@ class _SellClob:
 
 
 @pytest.mark.asyncio
-async def test_order_manager_tracks_rounded_up_sell_price() -> None:
+async def test_order_manager_tracks_floored_sell_price() -> None:
     clob = _SellClob()
     om = OrderManager(clob=clob)  # type: ignore[arg-type]
 
@@ -84,8 +90,8 @@ async def test_order_manager_tracks_rounded_up_sell_price() -> None:
 
     assert order is not None
     assert clob.kwargs is not None
-    assert clob.kwargs["price"] == pytest.approx(0.27)
-    assert order.price == pytest.approx(0.27)
+    assert clob.kwargs["price"] == pytest.approx(0.26)
+    assert order.price == pytest.approx(0.26)
 
 
 @pytest.mark.asyncio
