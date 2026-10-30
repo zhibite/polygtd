@@ -255,9 +255,16 @@ STATE = AppState()
 # ---------------------------------------------------------------------------
 
 
-async def _maybe_realize_closed(token_id: str, eng, pos) -> None:
+async def _maybe_realize_closed(token_id: str, clob, pos) -> None:
     """If the CLOB reports zero token balance for `token_id`, instruct
     `Position.realize_position_closed()` to drop the phantom inventory.
+
+    `clob` is the CLOBClient itself. The old signature took the engine and
+    read `eng._state.clob` — but StrategyEngine has no `_state` attribute
+    (the router owns it), so every call site was gated on
+    `hasattr(eng, "_state")` and the helper NEVER RAN. Production
+    2026-10-30 15:21: after the TP sold the whole position the engine still
+    reported a 20.83-share phantom and kept retrying doomed sells.
 
     H-NEW-2026-07-11 (audit v6-12 production revisit): the bot used to
     re-fire trigger_tp into a hot retry loop when the user's wallet had
@@ -272,7 +279,7 @@ async def _maybe_realize_closed(token_id: str, eng, pos) -> None:
     only act on a definitive balance==0.
     """
     try:
-        bal = await eng._state.clob.get_token_balance(token_id)
+        bal = await clob.get_token_balance(token_id)
     except Exception as exc:
         log.debug(
             "router.realize_check.failed",
@@ -299,7 +306,7 @@ async def _maybe_realize_closed(token_id: str, eng, pos) -> None:
         # evidence that the wallet really is empty.
         await asyncio.sleep(0.5)
         try:
-            bal2 = await eng._state.clob.get_token_balance(token_id)
+            bal2 = await clob.get_token_balance(token_id)
         except Exception:
             bal2 = None
         if bal2 is None or bal2 > 0.5:
@@ -723,6 +730,30 @@ class ActionRouter:
             tier_snap.watching = True
         return watcher
 
+    def _mirror_tp_terminal_fill(self, result: "WatcherResult") -> None:
+        """Mirror a terminated TP SELL's cumulative fill into OrderManager.
+
+        The TP watcher's on_done only updated the Position — the tracked
+        order stayed at status='live' / size_matched=0, so the dashboard
+        kept showing the TP as an open order and the fills table never got
+        the SELL row (production 2026-10-30 15:21: the TP sold the whole
+        35.19-share position but the UI showed it hanging).
+
+        `apply_fill_event` is monotonic and idempotent against the WS /
+        polling-resync paths; `mark_filled` promotes the status once the
+        cumulative reaches the expected size.
+        """
+        om = getattr(self._state, "order_manager", None)
+        sid = getattr(result, "server_order_id", "") or ""
+        filled = float(getattr(result, "filled_qty", 0.0) or 0.0)
+        if om is None or not sid or filled <= 0:
+            return
+        fill_px = getattr(result, "avg_fill_price", 0.0) or 0.0
+        if fill_px <= 0:
+            fill_px = getattr(result, "strategy_price", 0.0) or 0.0
+        om.apply_fill_event(sid, size_matched=filled, fill_price=float(fill_px))
+        om.mark_filled(sid)
+
     def _spawn_tp_watcher(
         self,
         round_start_ts: int,
@@ -741,6 +772,11 @@ class ActionRouter:
                 return
             pos = eng._round.position
             sid = result.server_order_id
+            # Mirror the terminal cumulative into OrderManager FIRST: this
+            # promotes the order to `filled` and persists the SELL fill row
+            # (the engine-only update below left the dashboard showing a
+            # live TP order after it had already sold).
+            self._mirror_tp_terminal_fill(result)
             # `filled_qty` is the watcher's AUTHORITATIVE per-order cumulative
             # matched size. Apply only the part not already booked by the WS
             # TRADE path / an earlier partial-resync callback.
@@ -853,26 +889,34 @@ class ActionRouter:
         tracked = om.by_server_id(server_order_id)
         if tracked is None:
             return
-        prev = tracked.size_matched or 0.0
-        cumulative = prev
         fill_px = tracked.price
+        rest_cumulative = 0.0
         try:
             fill_state = await clob.get_order_fill_state(server_order_id)
         except Exception:
             fill_state = None
         if fill_state:
             try:
-                cumulative = max(
-                    cumulative, float(fill_state.get("size_matched", 0) or 0)
-                )
+                rest_cumulative = float(fill_state.get("size_matched", 0) or 0)
             except (TypeError, ValueError):
-                pass
+                rest_cumulative = 0.0
             try:
                 avg_px = float(fill_state.get("avg_price", 0) or 0)
                 if avg_px > 0:
                     fill_px = avg_px
             except (TypeError, ValueError):
                 pass
+        # Re-read `prev` AFTER the await. The watcher's terminal on_done (or
+        # a WS fill) may have booked the same cumulative while this REST call
+        # was in flight; the old code captured `prev` before the await and
+        # then credited the engine with the full delta a second time.
+        # Production 2026-10-30 15:17: T3 filled 20.83 exactly as the strategy
+        # cancelled the tier — the watcher booked the fill, then this path
+        # added it again and the position read 56.02 while the wallet held
+        # 35.19. OrderManager's monotonic max kept ITS value correct, which is
+        # why only the engine drifted.
+        prev = tracked.size_matched or 0.0
+        cumulative = max(prev, rest_cumulative)
         delta = cumulative - prev
         if delta <= 1e-9:
             return
@@ -1150,10 +1194,11 @@ class ActionRouter:
                                 )
                             except Exception:
                                 pass
-                        if hasattr(eng, "_state"):
+                        clob = getattr(self._state, "clob", None)
+                        if clob is not None:
                             try:
                                 await _maybe_realize_closed(
-                                    action.token, eng, pos
+                                    action.token, clob, pos
                                 )
                             except Exception:
                                 pass
@@ -1214,10 +1259,11 @@ class ActionRouter:
                                 note="notify_tp_post_error raised; "
                                      "continuing with mutex already cleared",
                             )
-                    if eng._round and hasattr(eng, "_state"):
+                    clob = getattr(self._state, "clob", None)
+                    if eng._round and clob is not None:
                         try:
                             await _maybe_realize_closed(
-                                action.token, eng, eng._round.position
+                                action.token, clob, eng._round.position
                             )
                         except Exception:
                             log.debug(

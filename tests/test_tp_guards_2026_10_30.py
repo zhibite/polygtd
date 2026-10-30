@@ -199,3 +199,146 @@ async def test_final_reconcile_promotes_fully_filled_order() -> None:
         "a fully matched order discovered by the final reconcile must be "
         "promoted from 'live' to 'filled'"
     )
+
+
+@pytest.mark.asyncio
+async def test_final_reconcile_rechecks_cumulative_after_await() -> None:
+    """A fill booked while the reconcile REST call is in flight must not be
+    credited to the engine twice.
+
+    Production 2026-10-30 15:17: T3 filled 20.83 exactly as the strategy
+    cancelled the tier. The watcher's on_done booked the fill, then the
+    final reconcile credited it AGAIN because `prev` had been captured
+    before its `await`; the position read 56.02 while the wallet held
+    35.19. OrderManager's monotonic max kept its own value correct, so
+    only the engine drifted.
+    """
+    from src.main import ActionRouter
+
+    class _OM:
+        def __init__(self) -> None:
+            self.tracked = SimpleNamespace(
+                side="BUY", token_id="tok", price=0.24,
+                size_matched=0.0, placed_size=20.83, size=20.83,
+            )
+            self.applied: list[float] = []
+
+        def by_server_id(self, sid):  # noqa: ANN001
+            return self.tracked
+
+        def apply_fill_event(
+            self, sid, size_matched, fill_price=None, trader_side=None,
+        ) -> None:
+            self.applied.append(size_matched)
+            self.tracked.size_matched = max(
+                self.tracked.size_matched, size_matched
+            )
+
+        def mark_filled(self, sid) -> bool:  # noqa: ANN001
+            return True
+
+    class _Clob:
+        def __init__(self, om: "_OM") -> None:
+            self.om = om
+
+        async def get_order_fill_state(self, sid):  # noqa: ANN001
+            # The watcher's terminal callback books the fill while this
+            # REST call is in flight.
+            self.om.tracked.size_matched = 20.83
+            return {"size_matched": 20.83, "avg_price": 0.24}
+
+    class _Eng:
+        def __init__(self) -> None:
+            self._round = SimpleNamespace(position=Position(), round_start_ts=123)
+            self.fills: list[float] = []
+
+        def on_order_filled(self, token, sid, price, size) -> None:  # noqa: ANN001
+            self.fills.append(size)
+
+    om, eng = _OM(), _Eng()
+    state = SimpleNamespace(
+        engine=eng, order_manager=om, clob=_Clob(om),
+        round_start_ts=123, _bg_tasks=set(),
+    )
+    router = ActionRouter(state)
+
+    await router._final_reconcile_before_close("s1")
+
+    assert om.applied == [], "no new cumulative was observed after the await"
+    assert eng.fills == [], (
+        "the engine was credited twice for one fill (stale `prev` across await)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# TP terminal fill mirroring / zero-balance reconciliation
+# ---------------------------------------------------------------------------
+
+
+def test_tp_terminal_fill_mirrors_into_order_manager() -> None:
+    """A TP that sold must not stay 'live' in OrderManager.
+
+    Production 2026-10-30 15:21: the TP sold the whole 35.19-share
+    position; the watcher's on_done only updated the Position, so the
+    dashboard still listed the order as open and the fills table had no
+    SELL row.
+    """
+    from src.main import ActionRouter
+
+    class _OM:
+        def __init__(self) -> None:
+            self.applied: list[tuple] = []
+            self.marked: list[str] = []
+
+        def apply_fill_event(
+            self, sid, size_matched, fill_price=None, trader_side=None,
+        ) -> None:
+            self.applied.append((sid, size_matched, fill_price))
+
+        def mark_filled(self, sid) -> bool:  # noqa: ANN001
+            self.marked.append(sid)
+            return True
+
+    om = _OM()
+    router = ActionRouter.__new__(ActionRouter)
+    router._state = SimpleNamespace(order_manager=om)
+    result = SimpleNamespace(
+        server_order_id="s1", filled_qty=35.19,
+        avg_fill_price=0.30, strategy_price=0.305,
+    )
+
+    router._mirror_tp_terminal_fill(result)
+
+    assert om.applied == [("s1", 35.19, pytest.approx(0.30))]
+    assert om.marked == ["s1"]
+
+
+@pytest.mark.asyncio
+async def test_maybe_realize_closed_clears_phantom_with_clob_argument() -> None:
+    """The helper must be reachable now that it takes the clob directly.
+
+    The old signature read `eng._state.clob`; StrategyEngine has no
+    `_state`, so every call was gated out and a fully-drained wallet left
+    a phantom position that kept retrying doomed sells.
+    """
+    from src.main import _maybe_realize_closed
+
+    class _Clob:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def get_token_balance(self, token_id):  # noqa: ANN001
+            self.calls += 1
+            return 0.0
+
+    pos = Position()
+    pos.entry_token = "tok"
+    pos._total_qty = 20.83
+    pos._total_cost = 5.58
+    pos._avg_cost = 0.2676
+    clob = _Clob()
+
+    await _maybe_realize_closed("tok", clob, pos)
+
+    assert clob.calls == 2, "zero balance must be confirmed on a re-read"
+    assert pos.total_qty == 0.0
