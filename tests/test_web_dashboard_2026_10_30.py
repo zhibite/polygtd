@@ -199,11 +199,13 @@ def test_round_with_order_but_no_fill_is_unfilled(conn) -> None:
         side="BUY", token_id="tok", tier_name="T1", price=0.40, size=5.0,
         lifetime_s=300, expires_at=4_300, placed_at=4_000,
     )
+    db.update_order_status("c4", "cancelled")
 
     rounds = status_mod.rounds_with_pnl(conn)
     assert len(rounds) == 1
     assert rounds[0]["status"] == "unfilled"
     assert rounds[0]["order_count"] == 1
+    assert rounds[0]["cancel_count"] == 1
     assert rounds[0]["fill_count"] == 0
     assert rounds[0]["closed"] is False
     stats = status_mod.compute_stats(rounds)

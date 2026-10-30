@@ -71,7 +71,8 @@ class _FakeOrderManager:
         return self.tracked.get(server_id)
 
     def apply_fill_event(
-        self, server_id: str, size_matched: float, fill_price: float
+        self, server_id: str, size_matched: float, fill_price: float,
+        trader_side: str | None = None,
     ) -> None:
         self.apply_log.append((server_id, size_matched, fill_price))
         t = self.tracked.get(server_id)
@@ -183,8 +184,10 @@ def test_maker_fill_callback_with_rest_delta_does_not_raise() -> None:
         size=1.333332,
         status="MATCHED",
     )
-    # chosen[4] = rest_delta for THIS trade alone
-    candidates = [("0xabc", "9858694723781260", 0.0, 0.75, 6.76)]
+    # user_ws REST-fallback candidate shape:
+    #   (oid, asset, CUMULATIVE size_matched, price, delta vs its baseline)
+    # cumulative 1.333332 + 6.76 = 8.093332 for this trade.
+    candidates = [("0xabc", "9858694723781260", 8.093332, 0.75, 6.76)]
 
     cb(fill, candidates=candidates)  # type: ignore[call-arg]
 
@@ -193,3 +196,55 @@ def test_maker_fill_callback_with_rest_delta_does_not_raise() -> None:
     # The bug would NOT reach this assertion because the NameError fires
     # before the engine call. With the fix, delta is the REST delta.
     assert delta == pytest.approx(6.76)
+
+
+def test_rest_delta_does_not_double_count_after_polling_resync() -> None:
+    """Production 2026-10-30: TierWatcher resync + user_ws REST delta.
+
+    Sequence:
+      1. WS trade #1 matched 3.34 → OM cumulative 3.34.
+      2. TierWatcher polling resync observed 9.36 → OM cumulative 9.36.
+      3. user_ws REST fallback (baseline still 3.34) offered
+         cumulative=9.36 / delta=6.02 for the same shares.
+    Step 3 must be a no-op, not 9.36 + 6.02 = 15.38.
+    """
+    cb, om, eng, tracked = _build_callback_and_state()
+    tracked.size_matched = 9.36  # step 2 already applied
+
+    fill = SimpleNamespace(
+        asset_id="2479945053069227",
+        price=0.32,
+        size=211.02,
+        status="MATCHED",
+    )
+    cb(
+        fill,
+        candidates=[("0xabc", "2479945053069227", 9.36, 0.32, 6.02)],
+    )  # type: ignore[call-arg]
+
+    assert tracked.size_matched == pytest.approx(9.36), (
+        "REST delta was added on top of an already-reconciled cumulative"
+    )
+    assert _FakeEngine.on_order_filled_log == []
+
+
+def test_rest_cumulative_catches_up_when_order_manager_is_behind() -> None:
+    """The REST fallback still applies the missing delta when OM lags."""
+    cb, om, eng, tracked = _build_callback_and_state()
+    tracked.size_matched = 3.34  # only trade #1 applied so far
+
+    fill = SimpleNamespace(
+        asset_id="2479945053069227",
+        price=0.32,
+        size=211.02,
+        status="MATCHED",
+    )
+    cb(
+        fill,
+        candidates=[("0xabc", "2479945053069227", 9.36, 0.32, 6.02)],
+    )  # type: ignore[call-arg]
+
+    assert tracked.size_matched == pytest.approx(9.36)
+    assert _FakeEngine.on_order_filled_log
+    _, _, _, delta = _FakeEngine.on_order_filled_log[0]
+    assert delta == pytest.approx(6.02)

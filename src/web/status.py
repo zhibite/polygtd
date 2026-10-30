@@ -204,7 +204,10 @@ SELECT r.round_start_ts,
        COALESCE(SUM(CASE WHEN f.side = 'SELL' THEN f.price * f.size END), 0.0) AS sell_proceeds,
        COUNT(f.fill_id) AS fill_count,
        (SELECT COUNT(*) FROM orders o
-         WHERE o.round_start_ts = r.round_start_ts) AS order_count
+         WHERE o.round_start_ts = r.round_start_ts) AS order_count,
+       (SELECT COUNT(*) FROM orders o3
+         WHERE o3.round_start_ts = r.round_start_ts
+           AND o3.status = 'cancelled') AS cancel_count
 FROM rounds r
 LEFT JOIN fills f ON f.round_start_ts = r.round_start_ts
 WHERE EXISTS (SELECT 1 FROM orders o2 WHERE o2.round_start_ts = r.round_start_ts)
@@ -233,7 +236,8 @@ def rounds_with_pnl(conn: Any, limit: int = 100) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for row in rows:
         (round_ts, slug, started_at, finished_at,
-         buy_cost, sell_proceeds, fill_count, order_count) = row
+         buy_cost, sell_proceeds, fill_count, order_count,
+         cancel_count) = row
         buy_cost = float(buy_cost or 0.0)
         sell_proceeds = float(sell_proceeds or 0.0)
         fill_count = int(fill_count or 0)
@@ -254,6 +258,7 @@ def rounds_with_pnl(conn: Any, limit: int = 100) -> list[dict[str, Any]]:
             "sell_proceeds": sell_proceeds,
             "fill_count": fill_count,
             "order_count": int(order_count or 0),
+            "cancel_count": int(cancel_count or 0),
             "status": round_status,
             "closed": closed,
             "pnl_usd": pnl,
@@ -306,7 +311,9 @@ SELECT f.fill_id,
        f.size,
        f.ts_ms,
        COALESCE(o.tier_name, '') AS tier_name,
-       COALESCE(r.slug, '') AS slug
+       COALESCE(r.slug, '') AS slug,
+       COALESCE(o.price, 0.0) AS limit_price,
+       COALESCE(f.trader_side, '') AS trader_side
 FROM fills f
 LEFT JOIN orders o ON o.client_order_id = f.order_id
 LEFT JOIN rounds r ON r.round_start_ts = f.round_start_ts
@@ -315,23 +322,136 @@ LIMIT ?
 """
 
 
+def _improvement_bps(side: str, price: float, limit_price: float) -> float | None:
+    """Signed price improvement vs the posted limit, in basis points.
+
+    Positive means the fill beat the limit: a BUY filled below its limit
+    price, or a SELL above it. Maker fills land exactly on the limit
+    (0 bps); crossing (taker) fills usually show positive improvement.
+    """
+    if price <= 0 or limit_price <= 0:
+        return None
+    side_u = str(side or "").upper()
+    if side_u == "BUY":
+        return (limit_price - price) / limit_price * 10000.0
+    if side_u == "SELL":
+        return (price - limit_price) / limit_price * 10000.0
+    return None
+
+
 def recent_fills(conn: Any, limit: int = 200) -> list[dict[str, Any]]:
     rows = conn.execute(_FILLS_SQL, (int(limit),)).fetchall()
     out = []
-    for fill_id, round_ts, side, price, size, ts_ms, tier_name, slug in rows:
-        notional = float(price or 0.0) * float(size or 0.0)
+    for (fill_id, round_ts, side, price, size, ts_ms,
+         tier_name, slug, limit_price, trader_side) in rows:
+        price = float(price or 0.0)
+        size = float(size or 0.0)
+        limit_price = float(limit_price or 0.0)
+        notional = price * size
         out.append({
             "fill_id": fill_id,
             "round_start_ts": round_ts,
             "side": side,
-            "price": float(price or 0.0),
-            "size": float(size or 0.0),
+            "price": price,
+            "size": size,
             "notional": notional,
             "ts_ms": ts_ms,
             "tier": tier_name,
             "slug": slug,
+            "limit_price": limit_price,
+            "trader_side": str(trader_side or "").upper(),
+            "improvement_bps": _improvement_bps(side, price, limit_price),
         })
     return out
+
+
+def execution_quality(conn: Any, limit: int = 500) -> dict[str, Any]:
+    """Execution-quality stats for the dashboard.
+
+    Covers the four levers we tune when adjusting the order logic:
+      * maker vs taker mix (WS `trader_side`; REST-only observations are
+        counted as unknown),
+      * realised price improvement vs the posted limit (SELL premium and
+        BUY discount, in bps),
+      * cancel rate (cancelled orders / all orders),
+      * average time from placement to first fill.
+    """
+    rows = conn.execute(
+        """
+        SELECT f.side, f.price, COALESCE(o.price, 0.0), f.trader_side
+        FROM fills f
+        LEFT JOIN orders o ON o.client_order_id = f.order_id
+        ORDER BY f.ts_ms DESC
+        LIMIT ?
+        """,
+        (int(limit),),
+    ).fetchall()
+
+    maker = taker = unknown = 0
+    buy_improvements: list[float] = []
+    sell_improvements: list[float] = []
+    for side, price, limit_price, trader_side in rows:
+        role = str(trader_side or "").upper()
+        if role == "MAKER":
+            maker += 1
+        elif role == "TAKER":
+            taker += 1
+        else:
+            unknown += 1
+        bps = _improvement_bps(side, float(price or 0.0), float(limit_price or 0.0))
+        if bps is None:
+            continue
+        if str(side or "").upper() == "BUY":
+            buy_improvements.append(bps)
+        elif str(side or "").upper() == "SELL":
+            sell_improvements.append(bps)
+
+    order_row = conn.execute(
+        "SELECT COUNT(*), "
+        "COALESCE(SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END), 0) "
+        "FROM orders"
+    ).fetchone()
+    total_orders = int(order_row[0] or 0) if order_row else 0
+    cancelled_orders = int(order_row[1] or 0) if order_row else 0
+
+    latency_row = conn.execute(
+        """
+        SELECT AVG((ff.first_ts - o.placed_at * 1000.0) / 1000.0)
+        FROM orders o
+        JOIN (
+            SELECT order_id, MIN(ts_ms) AS first_ts
+            FROM fills GROUP BY order_id
+        ) ff ON ff.order_id = o.client_order_id
+        WHERE o.placed_at > 0
+          AND ff.first_ts >= o.placed_at * 1000.0
+          AND ff.first_ts - o.placed_at * 1000.0 < 900000.0
+        """
+    ).fetchone()
+    avg_fill_time = (
+        float(latency_row[0])
+        if latency_row and latency_row[0] is not None
+        else None
+    )
+
+    known = maker + taker
+    return {
+        "maker_fills": maker,
+        "taker_fills": taker,
+        "unknown_fills": unknown,
+        "maker_ratio": (maker / known) if known else None,
+        "buy_improvement_bps": (
+            sum(buy_improvements) / len(buy_improvements)
+            if buy_improvements else None
+        ),
+        "sell_improvement_bps": (
+            sum(sell_improvements) / len(sell_improvements)
+            if sell_improvements else None
+        ),
+        "total_orders": total_orders,
+        "cancelled_orders": cancelled_orders,
+        "cancel_ratio": (cancelled_orders / total_orders) if total_orders else None,
+        "avg_time_to_fill_s": avg_fill_time,
+    }
 
 
 def fills_for_round(conn: Any, round_start_ts: int) -> list[dict[str, Any]]:

@@ -83,6 +83,7 @@ class _FakeOrderManager:
         server_order_id: str,
         size_matched: float,
         fill_price: float | None = None,
+        trader_side: str | None = None,
     ) -> None:
         t = self.tracked_by_server.get(server_order_id)
         if t is None:

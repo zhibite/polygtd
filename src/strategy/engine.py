@@ -178,6 +178,31 @@ class StrategyEngine:
         # Fallback to config directly for test stubs.
         return float(getattr(_s(), "PRICE_PRE_MARGIN", 0.0) or 0.0)
 
+    def _get_cancel_hysteresis(self) -> float:
+        """Trigger→cancel buffer, as a fraction of the trigger line.
+
+        Without it every cancel condition reuses the exact line that armed
+        the order, so a mid oscillating around the boundary produces a
+        post/cancel loop (each cycle costs a CLOB round-trip and burns
+        maker allowance). Clamped to a sane range. A MagicMock `_s` stub
+        is treated as unset and the process config is consulted instead.
+        """
+        def _as_float(value: object) -> float | None:
+            # MagicMock stubs (older tests) answer any attribute with a
+            # Mock, which is not a number — treat that as "unset".
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return None
+            return float(value)
+
+        value = None
+        if hasattr(self, "_s") and self._s is not None:
+            value = _as_float(getattr(self._s, "CANCEL_HYSTERESIS_PCT", None))
+        if value is None:
+            value = _as_float(getattr(_s(), "CANCEL_HYSTERESIS_PCT", 0.0))
+        if value is None:
+            return 0.0
+        return max(0.0, min(0.5, value))
+
     def _t1_skip_log(self, reason: str, *, side: str, **fields) -> None:
         """Log a T1 skip event with per-(reason,side) throttle.
 
@@ -857,6 +882,7 @@ class StrategyEngine:
         if mid_price <= 0:
             return
         margin = self._get_price_pre_margin()
+        hysteresis = self._get_cancel_hysteresis()
         cfg = self._s
 
         # Compute TP fire line once. None if no TP target yet.
@@ -866,8 +892,17 @@ class StrategyEngine:
             if (tp_target is not None and tp_target > 0)
             else None
         )
+        # Hysteresis (CANCEL_HYSTERESIS_PCT): buys are armed while mid is
+        # BELOW this line, so cancelling them only once mid is a bit ABOVE
+        # it stops a mid oscillating at the boundary from cancelling and
+        # re-arming the same tier orders every tick.
+        tp_cancel_line = (
+            tp_fire_line * (1.0 + hysteresis)
+            if tp_fire_line is not None
+            else None
+        )
         # TP path: mid crossed the TP fire line. Cancel every BUY GTD.
-        if tp_fire_line is not None and mid_price >= tp_fire_line:
+        if tp_cancel_line is not None and mid_price >= tp_cancel_line:
             for tier_idx in range(1, 4):  # T2, T3, T4 — averaging tiers
                 tier = pos.tiers[tier_idx]
                 if not tier.placed or tier.is_complete:
@@ -949,7 +984,12 @@ class StrategyEngine:
                 continue  # last tier, no next-tier to fire
             next_strategy_price = t1_entry * (1.0 - next_drop)
             next_fire_line = next_strategy_price * (1.0 + margin)
-            if mid_price <= next_fire_line:
+            # Hysteresis: the current tier is cancelled a little deeper
+            # into the next-tier zone than where that tier would arm, so a
+            # mid hovering at the boundary does not cancel/re-arm every
+            # tick (the zone is entered once, decisively).
+            next_cancel_line = next_fire_line * (1.0 - hysteresis)
+            if mid_price <= next_cancel_line:
                 tier.cancel_pending = True
                 log.info(
                     "engine.reconcile.cancel_for_next_tier",
@@ -957,6 +997,7 @@ class StrategyEngine:
                     server_id=sid[:16],
                     mid=mid_price,
                     next_fire_line=next_fire_line,
+                    next_cancel_line=next_cancel_line,
                     next_strategy_price=next_strategy_price,
                     size_filled=tier.size_filled,
                 )
@@ -1565,8 +1606,13 @@ class StrategyEngine:
                 tp_target_pre = snap.tp_target
                 if tp_target_pre is not None:
                     margin_pre = self._get_price_pre_margin()
+                    hysteresis_pre = self._get_cancel_hysteresis()
                     fire_line_pre = tp_target_pre * (1.0 - margin_pre)
-                    if cur_mid_pre < fire_line_pre:
+                    # Cancel only once mid is hysteresis-deeper below the
+                    # fire line: posting and cancelling on the same line
+                    # made a mid hovering around it flap the TP GTD.
+                    cancel_line_pre = fire_line_pre * (1.0 - hysteresis_pre)
+                    if cur_mid_pre < cancel_line_pre:
                         # Opportunity retreated — clear backoff and bail.
                         #
                         # H-NEW-2026-07-15 (audit follow-up): release the
@@ -1598,6 +1644,7 @@ class StrategyEngine:
                                 ),
                                 mid=cur_mid_pre,
                                 fire_line=fire_line_pre,
+                                cancel_line=cancel_line_pre,
                                 note="mid retreated below fire-line during TP-backoff window; "
                                      "no point retrying with progressive backoff",
                             )

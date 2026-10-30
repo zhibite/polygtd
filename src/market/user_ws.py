@@ -80,6 +80,10 @@ class MakerFill:
     trade_id: str
     status: str             # "MATCHED" | "MINED" | "CONFIRMED"
     ts_ms: int
+    # Which role WE played in the trade: "MAKER" / "TAKER" / "UNKNOWN".
+    # Sourced from the top-level `trader_side`; the dashboard uses it for
+    # the maker/taker execution-quality stats.
+    trader_side: str = "UNKNOWN"
 
 
 @dataclass
@@ -669,6 +673,7 @@ class UserWS:
             trade_id=trade_id,
             status=status,
             ts_ms=ts_ms,
+            trader_side=trader_side_hint or "UNKNOWN",
         )
 
         log.info(

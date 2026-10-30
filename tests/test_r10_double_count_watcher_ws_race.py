@@ -43,6 +43,7 @@ class _TrackingOrderManager:
         server_order_id: str,
         size_matched: float,
         fill_price: float | None = None,
+        trader_side: str | None = None,
     ) -> None:
         order = self.by_id.get(server_order_id)
         if order is None:

@@ -44,16 +44,39 @@
     </div>
   </div>
 
+  <div class="stats-row">
+    <div class="stat-card">
+      <div class="stat-label">Maker 成交占比</div>
+      <div class="stat-value purple" id="q-maker">--</div>
+      <div class="stat-sub" id="q-maker-sub">--</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">卖价 vs 挂价</div>
+      <div class="stat-value" id="q-sell-bps">--</div>
+      <div class="stat-sub" id="q-buy-bps">--</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">撤单率</div>
+      <div class="stat-value" id="q-cancel">--</div>
+      <div class="stat-sub" id="q-cancel-sub">--</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">平均成交耗时</div>
+      <div class="stat-value" id="q-fill-time">--</div>
+      <div class="stat-sub">挂单 → 首笔成交</div>
+    </div>
+  </div>
+
   <div class="section">
     <h2>轮次记录 <span class="pill" id="round-count">0</span></h2>
     <table>
       <thead>
         <tr>
           <th>开始 (UTC)</th><th>轮次</th><th>买入成本</th><th>卖出收入</th>
-          <th>盈亏</th><th>盈亏 %</th><th>成交笔数</th><th>状态</th>
+          <th>盈亏</th><th>盈亏 %</th><th>成交笔数</th><th>撤单</th><th>状态</th>
         </tr>
       </thead>
-      <tbody id="rounds-tbody"><tr><td colspan="8" class="no-data">加载中...</td></tr></tbody>
+      <tbody id="rounds-tbody"><tr><td colspan="9" class="no-data">加载中...</td></tr></tbody>
     </table>
   </div>
 
@@ -61,9 +84,9 @@
     <h2>成交明细 <span class="pill" id="fill-count">0</span></h2>
     <table>
       <thead>
-        <tr><th>时间 (UTC)</th><th>轮次</th><th>层</th><th>方向</th><th>价格</th><th>数量</th><th>金额</th></tr>
+        <tr><th>时间 (UTC)</th><th>轮次</th><th>层</th><th>方向</th><th>价格</th><th>挂价</th><th>价差</th><th>数量</th><th>金额</th><th>方式</th></tr>
       </thead>
-      <tbody id="fills-tbody"><tr><td colspan="7" class="no-data">加载中...</td></tr></tbody>
+      <tbody id="fills-tbody"><tr><td colspan="10" class="no-data">加载中...</td></tr></tbody>
     </table>
   </div>
 </div>
@@ -111,11 +134,29 @@ function renderStats(stats) {
   $('avg-win-loss').textContent = `均赢 ${money(stats.avg_win_usd || 0)} · 均亏 ${money(stats.avg_loss_usd || 0)}`;
 }
 
+function renderQuality(q) {
+  if (!q) return;
+  $('q-maker').textContent = q.maker_ratio === null ? '--' : (q.maker_ratio * 100).toFixed(0) + '%';
+  $('q-maker-sub').textContent =
+    (q.maker_fills || 0) + ' maker · ' + (q.taker_fills || 0) + ' taker' +
+    (q.unknown_fills ? ' · ' + q.unknown_fills + ' 未知' : '');
+
+  const sell = q.sell_improvement_bps;
+  $('q-sell-bps').textContent = sell === null ? '--' : (sell >= 0 ? '+' : '') + sell.toFixed(0) + ' bps';
+  $('q-sell-bps').className = 'stat-value ' + (sell === null ? '' : cls(sell));
+  const buy = q.buy_improvement_bps;
+  $('q-buy-bps').textContent = '买入：' + (buy === null ? '--' : (buy >= 0 ? '+' : '') + buy.toFixed(0) + ' bps');
+
+  $('q-cancel').textContent = q.cancel_ratio === null ? '--' : (q.cancel_ratio * 100).toFixed(0) + '%';
+  $('q-cancel-sub').textContent = (q.cancelled_orders || 0) + ' / ' + (q.total_orders || 0) + ' 笔订单';
+  $('q-fill-time').textContent = q.avg_time_to_fill_s === null ? '--' : q.avg_time_to_fill_s.toFixed(1) + 's';
+}
+
 function renderRounds(rounds) {
   $('round-count').textContent = rounds.length;
   const body = $('rounds-tbody');
   if (!rounds.length) {
-    body.innerHTML = '<tr><td colspan="8" class="no-data">暂无记录（下单成交后会出现在这里）</td></tr>';
+    body.innerHTML = '<tr><td colspan="9" class="no-data">暂无记录（下单成交后会出现在这里）</td></tr>';
     return;
   }
   body.innerHTML = rounds.map(r => {
@@ -135,6 +176,7 @@ function renderRounds(rounds) {
       <td class="mono ${pnl === null ? '' : cls(pnl)}">${pnl === null ? '--' : money(pnl)}</td>
       <td class="mono ${pnl === null ? '' : cls(pnl)}">${r.pnl_pct === null ? '--' : fmt(r.pnl_pct * 100, 2) + '%'}</td>
       <td class="mono">${r.fill_count}</td>
+      <td class="mono muted">${r.cancel_count || 0}</td>
       <td>${status}</td>
     </tr>`;
   }).join('');
@@ -144,24 +186,37 @@ function renderFills(fills) {
   $('fill-count').textContent = fills.length;
   const body = $('fills-tbody');
   if (!fills.length) {
-    body.innerHTML = '<tr><td colspan="7" class="no-data">暂无成交</td></tr>';
+    body.innerHTML = '<tr><td colspan="10" class="no-data">暂无成交</td></tr>';
     return;
   }
-  body.innerHTML = fills.map(f => `<tr>
-    <td class="mono">${f.ts_ms ? new Date(f.ts_ms).toISOString().replace('T', ' ').slice(0, 19) : '--'}</td>
-    <td class="mono">${utc(f.round_start_ts)}</td>
-    <td>${f.tier || '--'}</td>
-    <td><span class="pill ${f.side === 'BUY' ? 'buy' : 'sell'}">${f.side}</span></td>
-    <td class="mono">${fmt(f.price, 4)}</td>
-    <td class="mono">${fmt(f.size, 2)}</td>
-    <td class="mono">$${fmt(f.notional, 2)}</td>
-  </tr>`).join('');
+  body.innerHTML = fills.map(f => {
+    const imp = f.improvement_bps;
+    const impTxt = imp === null || imp === undefined
+      ? '--'
+      : (imp >= 0 ? '+' : '') + imp.toFixed(0) + ' bps';
+    const role = (f.trader_side || '').toUpperCase();
+    const roleLbl = role === 'MAKER' ? 'maker' : role === 'TAKER' ? 'taker' : '--';
+    const roleCls = role === 'MAKER' ? 'watching' : role === 'TAKER' ? 'placed' : 'idle';
+    return `<tr>
+      <td class="mono">${f.ts_ms ? new Date(f.ts_ms).toISOString().replace('T', ' ').slice(0, 19) : '--'}</td>
+      <td class="mono">${utc(f.round_start_ts)}</td>
+      <td>${f.tier || '--'}</td>
+      <td><span class="pill ${f.side === 'BUY' ? 'buy' : 'sell'}">${f.side}</span></td>
+      <td class="mono">${fmt(f.price, 4)}</td>
+      <td class="mono muted">${f.limit_price > 0 ? fmt(f.limit_price, 4) : '--'}</td>
+      <td class="mono ${imp === null || imp === undefined ? '' : cls(imp)}">${impTxt}</td>
+      <td class="mono">${fmt(f.size, 2)}</td>
+      <td class="mono">$${fmt(f.notional, 2)}</td>
+      <td><span class="pill ${roleCls}">${roleLbl}</span></td>
+    </tr>`;
+  }).join('');
 }
 
 async function refresh() {
   try {
     const d = await getJSON('/api/trades?limit=300');
     renderStats(d.stats);
+    renderQuality(d.quality);
     renderRounds(d.rounds || []);
     renderFills(d.fills || []);
     setLive(true);

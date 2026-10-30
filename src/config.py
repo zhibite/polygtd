@@ -191,6 +191,14 @@ class StrategySettings(BaseSettings):
     # 挂单价 = strategy_price（不变），价格提前量只用于触发判断。
     PRICE_PRE_MARGIN: float = 0.10
 
+    # 挂单/撤单之间的滞回缓冲（hysteresis），按触发线的比例计算。
+    # 同一 tick 里挂单和撤单用同一条线时，mid 在阈值附近抖动会导致
+    # 「挂 3 秒 → 撤 → 再挂」的循环。撤单需要比挂单线多走这么多才执行：
+    #   TP 撤单   : mid < fire_line * (1 - h)
+    #   TP 区撤买单: mid >= tp_fire_line * (1 + h)
+    #   下一层撤单 : mid <= next_fire_line * (1 - h)
+    CANCEL_HYSTERESIS_PCT: float = 0.02
+
     # TierWatcher WS-event 兜底超时（秒）。
     # Watcher 主路径是等 `order.UPDATE` 推过来（~50ms 唤醒），但当 WS
     # 失联 / 漏事件时，必须有一个上限——超过这个时间就必须主动查 REST

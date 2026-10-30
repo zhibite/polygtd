@@ -524,3 +524,82 @@ async def test_last_tier_does_not_attempt_next_tier_cancel() -> None:
         "last tier (T4) has no next tier ->no cancel should fire even "
         f"at very low mid. got {emitted}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Hysteresis (CANCEL_HYSTERESIS_PCT, default 2%)
+# ---------------------------------------------------------------------------
+
+
+async def test_next_tier_cancel_respects_hysteresis_band() -> None:
+    """mid inside the band (cancel line < mid <= fire line) must NOT cancel.
+
+    baseline 0.40 -> T2 strategy price 0.32, fire line 0.352.
+    With 2% hysteresis the cancel line is 0.34496, so mid=0.348 is in
+    the new dead band: the T1 GTD stays on the book (no cancel/re-arm
+    churn) until mid goes deeper into the T2 zone.
+    """
+    tiers = [
+        _FakeTier(tier=1, placed=True, server_order_id="0xT1srv"),
+        _FakeTier(tier=2),
+        _FakeTier(tier=3),
+        _FakeTier(tier=4),
+    ]
+    pos = _FakePos(
+        tiers=tiers,
+        baseline_realized_price=0.40,
+        baseline_target_price=0.40,
+        tp_target=None,
+    )
+    eng = _make_engine(pos, mid=0.348)
+
+    emitted: list[ActionCancelTier] = []
+
+    async def handler(action: ActionCancelTier) -> None:
+        emitted.append(action)
+
+    eng._handler = handler
+    await eng._reconcile_inflight_buys(bc_now=100_000.0)
+
+    assert emitted == [], (
+        "mid inside the hysteresis band must not cancel the current "
+        f"tier; got {[(a.tier, a.reason) for a in emitted]}"
+    )
+
+
+async def test_tp_fire_cancel_respects_hysteresis_band() -> None:
+    """mid just above the TP fire line must NOT cancel buys yet.
+
+    avg_cost=0.40 -> tp_target=0.48, fire line=0.432. With 2%
+    hysteresis the cancel line is 0.44064, so mid=0.436 stays inside
+    the dead band and the BUY GTDs remain on the book.
+    """
+    tiers = [
+        _FakeTier(
+            tier=1, placed=True, server_order_id="0xT1srv", size_filled=2.0,
+        ),
+        _FakeTier(tier=2, placed=True, server_order_id="0xT2srv"),
+        _FakeTier(tier=3),
+        _FakeTier(tier=4),
+    ]
+    pos = _FakePos(
+        tiers=tiers, avg_cost=0.40, total_qty=2.0,
+        total_cost=2.0 * 0.40,
+        baseline_realized_price=0.40,
+        baseline_target_price=0.40,
+        tp_target=0.48,
+    )
+    eng = _make_engine(pos, mid=0.436)
+
+    emitted: list[ActionCancelTier] = []
+
+    async def handler(action: ActionCancelTier) -> None:
+        emitted.append(action)
+
+    eng._handler = handler
+    await eng._reconcile_inflight_buys(bc_now=100_000.0)
+
+    assert emitted == [], (
+        "mid inside the TP hysteresis band must not cancel BUY GTDs; "
+        f"got {[(a.tier, a.reason) for a in emitted]}"
+    )

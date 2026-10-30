@@ -70,7 +70,8 @@ CREATE TABLE IF NOT EXISTS fills (
   size           REAL,
   ts_ms          INTEGER,
   confirmed      INTEGER DEFAULT 0,
-  recorded_at     TEXT
+  recorded_at     TEXT,
+  trader_side    TEXT
 );
 
 -- The dashboard filters rounds by activity. These keep that lookup cheap
@@ -94,6 +95,16 @@ def init_db(db_path: Path = _DB_PATH) -> sqlite3.Connection:
         stmt = stmt.strip()
         if stmt:
             conn.execute(stmt)
+    # Lightweight migrations for databases created by older builds.
+    # `CREATE TABLE IF NOT EXISTS` never adds columns, so apply the
+    # additive changes explicitly.
+    try:
+        fill_cols = {row[1] for row in conn.execute("PRAGMA table_info(fills)")}
+        if "trader_side" not in fill_cols:
+            conn.execute("ALTER TABLE fills ADD COLUMN trader_side TEXT")
+            log.info("db.migrate.fills_trader_side")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("db.migrate.failed", error=str(exc))
     conn.commit()
     log.info("db.init", path=str(db_path))
     return conn
@@ -197,14 +208,16 @@ class DB:
         size: float,
         ts_ms: int,
         confirmed: int = 0,
+        trader_side: str | None = None,
     ) -> None:
         self._c.execute("""
             INSERT OR IGNORE INTO fills
               (fill_id, order_id, round_start_ts, token_id, side,
-               price, size, ts_ms, confirmed, recorded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               price, size, ts_ms, confirmed, recorded_at, trader_side)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (fill_id, order_id, round_start_ts, token_id, side,
-              price, size, ts_ms, confirmed, datetime.now(timezone.utc).isoformat()))
+              price, size, ts_ms, confirmed,
+              datetime.now(timezone.utc).isoformat(), trader_side))
         self._c.commit()
 
     def confirm_fill(self, fill_id: str) -> None:

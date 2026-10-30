@@ -21,7 +21,7 @@ from decimal import Decimal
 from typing import Literal
 
 from src.config import strategy as _s
-from src.execution.clob_client import CLOBClient, FillResult, _round_down
+from src.execution.clob_client import CLOBClient, FillResult, _round_down, _round_up
 from src.infra.logging import get_logger
 from src.market.market_ws import PriceCache
 from src.market.pm_client import PolymarketClient
@@ -125,6 +125,19 @@ class OrderManager:
         # in {LIVE, INVALID, UNKNOWN}). Idempotent and safe to call
         # repeatedly; logging-only on cancellation failure.
         self._startup_reconciled: bool = False
+        # Collateral balance pre-check (fail-open). The CLOB rejects a BUY
+        # with `not enough balance / allowance` when the wallet is short;
+        # without a local check the strategy re-POSTs every backoff cycle
+        # (~hundreds of rejects per round with an empty wallet). Cache the
+        # balance for a short TTL so this costs ~1 REST call per 30 s.
+        self._balance_cache: float | None = None
+        self._balance_cache_ts: float = 0.0
+        self._balance_warn_ts: float = 0.0
+        # Reason for the last rejected BUY, read by ActionRouter to pick a
+        # longer retry backoff when the wallet is empty.
+        self._last_buy_reject_reason: str = ""
+        self._BALANCE_CACHE_TTL_S: float = 30.0
+        self._BALANCE_WARN_INTERVAL_S: float = 60.0
 
     # ------------------------------------------------------------------
     # Persistence hooks (optional — see `db` in __init__)
@@ -229,7 +242,11 @@ class OrderManager:
             log.warning("order_manager.db_persist_status_failed", error=str(exc))
 
     def _persist_fill(
-        self, order: TrackedOrder, delta_size: float, fill_price: float
+        self,
+        order: TrackedOrder,
+        delta_size: float,
+        fill_price: float,
+        trader_side: str | None = None,
     ) -> None:
         """Record an incremental fill (best effort, idempotent by fill_id)."""
         db = getattr(self, "_db", None)
@@ -251,6 +268,7 @@ class OrderManager:
                 price=fill_price,
                 size=delta_size,
                 ts_ms=int(time.time() * 1000),
+                trader_side=trader_side,
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("order_manager.db_persist_fill_failed", error=str(exc))
@@ -271,6 +289,109 @@ class OrderManager:
             )
             return True
         return False
+
+    @property
+    def last_buy_reject_reason(self) -> str:
+        """Why the most recent BUY placement was refused ("" if not)."""
+        return getattr(self, "_last_buy_reject_reason", "")
+
+    async def _cached_collateral_balance(self) -> float | None:
+        """Collateral balance in USDC, cached for `_BALANCE_CACHE_TTL_S`.
+
+        Returns None when the client cannot report it (no `get_balance`
+        method — test doubles — query error, or a non-numeric response).
+        Callers treat None as "unknown" and FAIL OPEN: a balance query
+        hiccup must never block trading.
+        """
+        getter = getattr(self._clob, "get_balance", None)
+        if getter is None:
+            return None
+        now = time.time()
+        if now - getattr(self, "_balance_cache_ts", 0.0) < self._BALANCE_CACHE_TTL_S:
+            return getattr(self, "_balance_cache", None)
+        try:
+            value = await getter()
+            balance = float(value) if isinstance(value, (int, float)) else None
+        except Exception as exc:  # noqa: BLE001
+            log.debug("order_manager.balance_query_failed", error=str(exc))
+            balance = None
+        self._balance_cache = balance
+        self._balance_cache_ts = now
+        return balance
+
+    async def _balance_allows(self, required_usd: float) -> bool:
+        """Pre-flight check: can the wallet cover `required_usd`?
+
+        The CLOB is the final authority (funds may be reserved by open
+        orders, so this is deliberately optimistic); the point is to stop
+        hammering the API with doomed POSTs when the wallet is empty.
+        """
+        if required_usd <= 0:
+            return True
+        balance = await self._cached_collateral_balance()
+        if balance is None:
+            return True  # fail-open
+        if balance + 1e-9 >= required_usd:
+            return True
+        now = time.time()
+        if now - getattr(self, "_balance_warn_ts", 0.0) >= self._BALANCE_WARN_INTERVAL_S:
+            self._balance_warn_ts = now
+            log.warning(
+                "order_manager.buy.insufficient_balance",
+                balance=round(balance, 4),
+                required=round(required_usd, 4),
+                note="skipping BUY; the CLOB would reject it",
+            )
+        return False
+
+    async def _cap_sell_to_token_balance(self, token_id: str, size: float) -> float:
+        """Never try to sell more shares than the wallet actually holds.
+
+        The in-memory position can drift above the real token balance
+        (missed/over-counted fill, manual sale through the UI). The CLOB
+        then rejects the TP GTD with "not enough balance / allowance" and
+        the position can never be exited (production 2026-10-30: the bot
+        believed 20.38 shares while the wallet held 14.36, so every TP
+        retry failed until the operator stopped the bot and sold manually).
+
+        Returns the (possibly capped) size. 0 means nothing sellable.
+        Fail-open when the balance cannot be queried.
+        """
+        getter = getattr(self._clob, "get_token_balance", None)
+        if getter is None or size <= 0:
+            return size
+        try:
+            value = await getter(token_id)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("order_manager.token_balance_query_failed", error=str(exc))
+            return size
+        if not isinstance(value, (int, float)):
+            return size
+        balance = float(value)
+        if balance + 1e-9 >= size:
+            return size
+        capped = _round_down(balance, Decimal("0.0001"))
+        if capped < 5.0:
+            # CLOB minimum order size is 5 shares — nothing can be sold.
+            # Returning 0 fails the attempt; the TP failure path then
+            # reconciles a fully-empty wallet into a flat position.
+            log.warning(
+                "order_manager.gtd_sell.no_sellable_balance",
+                token=token_id[:16],
+                balance=round(balance, 4),
+                requested=round(size, 4),
+                note="wallet holds less than the CLOB 5-share minimum",
+            )
+            return 0.0
+        log.warning(
+            "order_manager.gtd_sell.size_capped_to_balance",
+            token=token_id[:16],
+            requested=round(size, 4),
+            balance=round(balance, 4),
+            capped=round(capped, 4),
+            note="in-memory position exceeds wallet balance; selling what is held",
+        )
+        return capped
 
     # ------------------------------------------------------------------
     # Public read access
@@ -522,6 +643,9 @@ class OrderManager:
         """
         if self._blocked("place_buy_by_strategy_price"):
             return None
+        # Clear the reason from the previous attempt so ActionRouter never
+        # reads a stale "insufficient_balance" after a different failure.
+        self._last_buy_reject_reason = ""
         from src.execution.clob_client import CLOBClient as _CC
         lifetime = max(int(lifetime_s or self._s.GTD_LIFETIME_S), _CC.GTD_MIN_SEC + 1)
 
@@ -720,6 +844,13 @@ class OrderManager:
                 )
                 return None
 
+            # Balance pre-check (fail-open). With an empty wallet the CLOB
+            # would reject the POST anyway; skipping here keeps the strategy
+            # from re-POSTing a doomed order every retry cycle.
+            if not await self._balance_allows(float(adjusted_price) * float(size_q)):
+                self._last_buy_reject_reason = "insufficient_balance"
+                return None
+
             result: FillResult = await self._clob.place_gtd_buy(
                 token_id=token_id,
                 price=adjusted_price,
@@ -841,10 +972,25 @@ class OrderManager:
             # `price_lock=True` via `place_gtd_sell_at_price`, so we post
             # at the engine's exact tp/target price. The legacy
             # `_adjust_sell_price` orderbook fetch has been removed.
-            adjusted_price = float(price) if price_lock else float(price)
+            #
+            # Quantize UP to the tick: the TP target is avg_cost*(1+tp_pct)
+            # and is rarely tick-aligned (e.g. 0.2698). Rounding down (the
+            # old behaviour) posted at 0.26 and silently gave away ~3.6%
+            # of the profit target. CLOBClient applies the same rounding,
+            # so TrackedOrder.price now matches the posted order exactly.
+            adjusted_price = float(price)
+            if tick_size and tick_size > 0:
+                adjusted_price = min(
+                    0.99, _round_up(adjusted_price, Decimal(str(tick_size)))
+                )
             # CLOBClient rounds SELL size to 0.0001 shares. Quantize here
             # too so the watcher's expected_size matches the real order.
             size_q = _round_down(size, Decimal("0.0001"))
+            # Never sell more than the wallet holds — a drifted position
+            # otherwise makes the CLOB reject every TP attempt.
+            size_q = await self._cap_sell_to_token_balance(token_id, size_q)
+            if size_q <= 0:
+                return None
 
             # Orphan guard for the TP side: a lost POST response can leave a
             # live SELL at this exact price while the local bookkeeping
@@ -1605,6 +1751,7 @@ class OrderManager:
         server_order_id: str,
         size_matched: float,
         fill_price: float | None = None,
+        trader_side: str | None = None,
     ) -> None:
         """Update matched size for a GTD order and report any newly-completed status.
 
@@ -1672,6 +1819,7 @@ class OrderManager:
                     fill_price if fill_price is not None and fill_price > 0
                     else order.price
                 ),
+                trader_side=trader_side,
             )
             self._persist_status(order)
             # H-V6-2 fix: log every incremental fill so operators can see

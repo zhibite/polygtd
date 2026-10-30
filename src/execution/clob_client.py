@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
-from decimal import ROUND_DOWN, Decimal
+from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from typing import Callable, Optional
 
 from src.infra.logging import get_logger
@@ -32,6 +32,20 @@ log = get_logger(__name__)
 
 def _round_down(value: float, prec: Decimal) -> float:
     d = Decimal(str(value)).quantize(prec, rounding=ROUND_DOWN)
+    return float(d)
+
+
+def _round_up(value: float, prec: Decimal) -> float:
+    """Round UP to the tick — used for SELL prices.
+
+    A take-profit target is `avg_cost * (1 + tp_pct)` and is almost never
+    tick-aligned (e.g. 0.2698 with tick 0.01). Rounding a SELL *down* posts
+    at 0.26 and silently gives away ~3.6% of the target on every maker fill.
+    Rounding up keeps the realised price at or above the configured target
+    (0.2698 → 0.27); BUY keeps rounding down so the budget can never be
+    overspent.
+    """
+    d = Decimal(str(value)).quantize(prec, rounding=ROUND_UP)
     return float(d)
 
 
@@ -716,7 +730,9 @@ class CLOBClient:
 
         tick_d = Decimal(str(tick_size))
         size_q = _round_down(size, Decimal("0.0001"))
-        price_q = _round_down(price, tick_d)
+        # SELL rounds UP: the price is a profit target, so rounding down
+        # would systematically undershoot it (see `_round_up`).
+        price_q = min(0.99, _round_up(price, tick_d))
 
         if size_q < 5.0:
             return FillResult("", 0, 0, price_q, False, "tokens below CLOB 5-shares minimum", expiration_ts)

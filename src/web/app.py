@@ -304,11 +304,13 @@ async def api_trades(
     limit: int = Query(100, ge=1, le=500),
     _: None = Depends(_require_auth),
 ) -> dict[str, Any]:
-    rounds = status_mod.rounds_with_pnl(_conn(), limit)
+    conn = _conn()
+    rounds = status_mod.rounds_with_pnl(conn, limit)
     return {
         "rounds": rounds,
-        "fills": status_mod.recent_fills(_conn(), limit * 2),
+        "fills": status_mod.recent_fills(conn, limit * 2),
         "stats": status_mod.compute_stats(rounds),
+        "quality": status_mod.execution_quality(conn),
     }
 
 

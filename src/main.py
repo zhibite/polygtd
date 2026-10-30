@@ -978,19 +978,27 @@ class ActionRouter:
                     watcher=True,
                 )
             else:
+                reject_reason = (
+                    getattr(om, "last_buy_reject_reason", "")
+                    or "om.place_buy_by_strategy_price returned None"
+                )
                 log.error(
                     "router.t1_failed",
                     side=action.side,
                     token=action.token[:16],
                     strategy_price=action.price,
                     notional=action.notional,
-                    reason="om.place_buy_by_strategy_price returned None",
+                    reason=reject_reason,
                 )
                 eng._round.position.entry_side = None
                 eng._round.position.entry_token = None
                 # Backoff before the next T1 attempt (2 s) so a rejected
-                # POST is not retried on every 250 ms tick.
-                eng._round.position.t1_retry_after_ts = time.time() + 2.0
+                # POST is not retried on every 250 ms tick. An empty wallet
+                # is not fixed by retrying — back off much longer and let
+                # the balance cache expire in the meantime.
+                eng._round.position.t1_retry_after_ts = time.time() + (
+                    15.0 if reject_reason == "insufficient_balance" else 2.0
+                )
 
         elif isinstance(action, ActionOpenTN):
             order = await om.place_buy_by_strategy_price(
@@ -1037,13 +1045,17 @@ class ActionRouter:
                     watcher=True,
                 )
             else:
+                reject_reason = (
+                    getattr(om, "last_buy_reject_reason", "")
+                    or "om.place_buy_by_strategy_price returned None"
+                )
                 log.error(
                     "router.tN_failed",
                     tier=action.tier,
                     token=action.token[:16],
                     strategy_price=action.price,
                     notional=action.notional,
-                    reason="om.place_buy_by_strategy_price returned None",
+                    reason=reject_reason,
                 )
                 tier_snap = getattr(eng._round.position, f"tier{action.tier}", None)
                 if tier_snap is not None:
@@ -1051,8 +1063,11 @@ class ActionRouter:
                     tier_snap.watching = False
                     tier_snap.server_order_id = None
                     tier_snap.expires_at = 0.0
-                    # Backoff before retrying this tier (2 s).
-                    tier_snap.retry_after_ts = time.time() + 2.0
+                    # Backoff before retrying this tier (2 s; 15 s when the
+                    # wallet is empty — retrying cannot fix that).
+                    tier_snap.retry_after_ts = time.time() + (
+                        15.0 if reject_reason == "insufficient_balance" else 2.0
+                    )
 
         elif isinstance(action, ActionTakeProfit):
             # H-NEW-2026-07-11: a single GTD SELL at tp_target, monitored
@@ -1131,17 +1146,25 @@ class ActionRouter:
                                 pass
                         return
                     eng.notify_tp_recovered()
+                    # Sell qty actually posted: OrderManager caps the size to
+                    # the wallet's token balance when the in-memory position
+                    # drifted above it, so track THAT number (not
+                    # action.qty) or the watcher would wait for shares that
+                    # never existed.
+                    sold_qty = (
+                        order.placed_size if order.placed_size > 0 else order.size
+                    )
                     pos.register_tp(
                         server_order_id=order.server_order_id or "",
                         token_id=action.token,
-                        target_qty=action.qty,
+                        target_qty=sold_qty,
                     )
                     self._spawn_tp_watcher(
                         round_start_ts=round_ts,
                         server_order_id=order.server_order_id or "",
                         token_id=action.token,
                         tp_price=order.price,
-                        size=action.qty,
+                        size=sold_qty,
                         expires_at=order.expires_at,
                     )
                     log.info(
@@ -2416,10 +2439,19 @@ def _make_maker_fill_callback(state: AppState):
         prev_cumulative = tracked.size_matched or 0.0
         rest_delta = chosen[4]
         if rest_delta > 0:
-            # The REST fallback is AUTHORITATIVE (it is the order's own
-            # `size_matched` delta). Do not clamp it against the local
-            # expected size — the server is the source of truth.
-            new_cumulative = prev_cumulative + rest_delta
+            # REST fallback candidate shape: (oid, asset, CUMULATIVE, price,
+            # delta). `chosen[2]` is the order's cumulative size_matched and
+            # `rest_delta` was computed against user_ws's OWN baseline — NOT
+            # against OrderManager's cumulative. Adding the delta to our
+            # cumulative double-counts whenever another feed already advanced
+            # it. Production 2026-10-30: the TierWatcher polling resync moved
+            # T2 3.34 → 9.36, then the trade event's REST delta (6.02, based
+            # on user_ws's stale 3.34 baseline) was added again → 15.38; the
+            # position read 20.38 while the wallet held 14.36 and the TP SELL
+            # was rejected by the CLOB ("balance: 14360000, order amount:
+            # 20380000"). Treat the REST value as the authoritative absolute
+            # cumulative and never move backwards.
+            new_cumulative = max(prev_cumulative, float(chosen[2]))
         else:
             inc = max(0.0, float(chosen[2]))
             # Cap the cumulative at the order's expected size. This absorbs
@@ -2445,6 +2477,9 @@ def _make_maker_fill_callback(state: AppState):
             order_id,
             size_matched=new_cumulative,
             fill_price=fill_price,
+            # MAKER/TAKER hint from the WS TRADE event, stored for the
+            # dashboard execution-quality stats (Unknown for REST resyncs).
+            trader_side=getattr(fill, "trader_side", None),
         )
         om.mark_filled(order_id)
 

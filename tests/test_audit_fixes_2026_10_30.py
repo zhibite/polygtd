@@ -292,7 +292,10 @@ class _FillOM:
     def by_server_id(self, server_id: str):
         return self.tracked if server_id == "0xabc" else None
 
-    def apply_fill_event(self, server_id: str, size_matched: float, fill_price: float | None = None) -> None:
+    def apply_fill_event(
+        self, server_id: str, size_matched: float,
+        fill_price: float | None = None, trader_side: str | None = None,
+    ) -> None:
         self.tracked.size_matched = max(self.tracked.size_matched, size_matched)
 
     def mark_filled(self, server_id: str) -> bool:
