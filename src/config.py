@@ -154,6 +154,18 @@ class StrategySettings(BaseSettings):
     # 0 disables the guard.
     CROSS_WINDOW_DRIFT_SKIP_PCT: float = 0.5
 
+    # ── BTC feed health / short-term volatility guards ────────────────────
+    # Data freshness: if the Binance WS trade feed has not updated for this
+    # many seconds, pause NEW entries/averaging (TP exits stay enabled).
+    # 0 disables the guard.
+    BTC_STALE_MAX_AGE_S: float = 5.0
+    # Volatility blackout: when (max-min)/min over the window exceeds this
+    # percentage (a sharp rise or drop), pause new entries/averaging and
+    # cancel resting BUY GTDs for a cooldown period. 0 disables.
+    BTC_VOL_WINDOW_S: float = 60.0
+    BTC_VOL_MAX_MOVE_PCT: float = 0.3
+    BTC_VOL_COOLDOWN_S: float = 60.0
+
     # ── Order settings ────────────────────────────────────────────────────
     # GTD lifetime in seconds. CLOB enforces a 180-second hard floor
     # (`CLOBClient.GTD_MIN_SEC = 180`); values below that are clamped to

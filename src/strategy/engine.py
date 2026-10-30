@@ -169,6 +169,16 @@ class StrategyEngine:
         # mid had crashed to 0.155 but `_check_average_down` never fired.
         self._t2_diag_last_log_ts: dict[tuple[int, str], float] = {}
         self._t2_diag_last_fingerprint: dict[tuple[int, str], str] = {}
+        # ── BTC feed health / short-term volatility blackout ──────────────
+        # `(monotonic_wall_ts, price)` samples of the Binance spot cache,
+        # pruned to BTC_VOL_WINDOW_S. The range over the window is the
+        # sharp-move detector; a breach blocks new entries/averaging for
+        # BTC_VOL_COOLDOWN_S and cancels resting BUY GTDs.
+        self._btc_samples: list[tuple[float, float]] = []
+        self._btc_vol_block_until: float = 0.0
+        self._btc_vol_last_log_ts: float = 0.0
+        self._btc_stale_last_log_ts: float = 0.0
+        self._btc_guard_last_log_ts: dict[tuple[str, str], float] = {}
 
     # H-NEW-2026-07-11: helper that reads PRICE_PRE_MARGIN safely even for
     # tests that construct engine via __new__ (bypassing __init__).
@@ -177,6 +187,147 @@ class StrategyEngine:
             return float(getattr(self._s, "PRICE_PRE_MARGIN", 0.0) or 0.0)
         # Fallback to config directly for test stubs.
         return float(getattr(_s(), "PRICE_PRE_MARGIN", 0.0) or 0.0)
+
+    # ── BTC feed health / volatility guards (2026-10-30) ─────────────────
+
+    def _cfg_float(self, name: str, default: float) -> float:
+        """Read a float setting safely for __new__-constructed test engines."""
+        value = None
+        if getattr(self, "_s", None) is not None:
+            value = getattr(self._s, name, None)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            value = getattr(_s(), name, default)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return float(default)
+        return float(value)
+
+    def _btc_age_s(self) -> float | None:
+        """Seconds since the Binance cache last saw a trade (None = unknown)."""
+        ts_ms = getattr(getattr(self, "_bc", None), "ts_ms", None)
+        if (
+            isinstance(ts_ms, bool)
+            or not isinstance(ts_ms, (int, float))
+            or ts_ms <= 0
+        ):
+            return None
+        return max(0.0, time.time() - float(ts_ms) / 1000.0)
+
+    def _btc_feed_stale(self) -> bool:
+        """True when the BTC spot feed has not updated within the limit.
+
+        A stale feed makes both the drift gate and the volatility detector
+        meaningless, so new entries/averaging are paused (fail-closed).
+        TP exits are deliberately NOT blocked. Missing `ts_ms` (test stubs)
+        counts as unknown → fail-open.
+        """
+        max_age = self._cfg_float("BTC_STALE_MAX_AGE_S", 5.0)
+        if max_age <= 0:
+            return False
+        age = self._btc_age_s()
+        if age is None or age <= max_age:
+            return False
+        now = time.time()
+        if now - getattr(self, "_btc_stale_last_log_ts", 0.0) >= 30.0:
+            self._btc_stale_last_log_ts = now
+            log.warning(
+                "engine.btc_feed_stale",
+                age_s=round(age, 1),
+                max_age_s=max_age,
+                note="pausing new entries/averaging (TP still active)",
+            )
+        return True
+
+    def _update_btc_volatility(self, price: float) -> None:
+        """Track the rolling BTC range and arm the blackout after a spike.
+
+        (max-min)/min over `BTC_VOL_WINDOW_S` is a cheap sharp-move
+        detector: it fires on both a flash crash and a vertical rally, and
+        it is immune to the slow drift the existing gate already covers.
+        """
+        window_s = self._cfg_float("BTC_VOL_WINDOW_S", 60.0)
+        threshold_pct = self._cfg_float("BTC_VOL_MAX_MOVE_PCT", 0.3)
+        if window_s <= 0 or threshold_pct <= 0 or price <= 0:
+            return
+        now = time.time()
+        samples = getattr(self, "_btc_samples", None)
+        if samples is None:
+            self._btc_samples = samples = []
+        samples.append((now, float(price)))
+        cutoff = now - window_s
+        while samples and samples[0][0] < cutoff:
+            samples.pop(0)
+        if len(samples) < 2:
+            return
+        low = min(p for _, p in samples)
+        high = max(p for _, p in samples)
+        if low <= 0:
+            return
+        move_pct = (high - low) / low * 100.0
+        if move_pct <= threshold_pct:
+            return
+        cooldown_s = max(0.0, self._cfg_float("BTC_VOL_COOLDOWN_S", 60.0))
+        self._btc_vol_block_until = max(
+            getattr(self, "_btc_vol_block_until", 0.0), now + cooldown_s
+        )
+        if now - getattr(self, "_btc_vol_last_log_ts", 0.0) >= 30.0:
+            self._btc_vol_last_log_ts = now
+            log.warning(
+                "engine.btc_vol_spike",
+                move_pct=round(move_pct, 3),
+                threshold_pct=threshold_pct,
+                window_s=window_s,
+                low=round(low, 2),
+                high=round(high, 2),
+                block_s=round(self._btc_vol_block_until - now, 1),
+                note="pausing new entries/averaging and cancelling BUY GTDs",
+            )
+
+    def _btc_vol_blocked(self) -> bool:
+        return time.time() < getattr(self, "_btc_vol_block_until", 0.0)
+
+    def _btc_guard_skip(self, scope: str, reason: str) -> None:
+        """Throttled breadcrumb when a feed/volatility guard blocks an action."""
+        now = time.time()
+        key = (scope, reason)
+        table = getattr(self, "_btc_guard_last_log_ts", None)
+        if table is None:
+            self._btc_guard_last_log_ts = table = {}
+        if now - table.get(key, 0.0) < 30.0:
+            return
+        table[key] = now
+        log.info("engine.btc_guard_skip", scope=scope, reason=reason)
+
+    async def _cancel_placed_buys(self, reason: str) -> None:
+        """Cancel every resting BUY GTD (T1..T4) during a volatility blackout.
+
+        New-order suppression alone is not enough: the pre-armed GTDs are
+        already on the book and a flash move can fill them mid-spike.
+        """
+        if not self._round:
+            return
+        pos = self._round.position
+        for tier in pos.tiers:
+            if not tier.placed or tier.is_complete:
+                continue
+            if tier.cancel_pending:
+                continue
+            # Respect the router's cancel-failure backoff so a CLOB that
+            # keeps rejecting the cancel is not hammered every 250 ms.
+            if time.time() < _ts(getattr(tier, "cancel_retry_after_ts", 0.0)):
+                continue
+            sid = tier.server_order_id
+            if not sid:
+                continue
+            tier.cancel_pending = True
+            log.warning(
+                "engine.vol_blackout.cancel_buy",
+                tier=tier.tier,
+                server_id=sid[:16],
+                reason=reason,
+            )
+            await self._handler(ActionCancelTier(
+                tier=tier.tier, server_order_id=sid, reason=reason,
+            ))
 
     def _get_cancel_hysteresis(self) -> float:
         """Trigger→cancel buffer, as a fraction of the trigger line.
@@ -812,6 +963,12 @@ class StrategyEngine:
             if bc_now <= 0:
                 return
 
+            # Feed health + short-term volatility state. A stale feed is not
+            # sampled (the price is old); the guards in the check_* helpers
+            # decide whether to pause new actions.
+            if not self._btc_feed_stale():
+                self._update_btc_volatility(bc_now)
+
             gate_state = self._gate.state(bc_now)
 
             new_state = "PASS" if gate_state.within_limit else "FAIL"
@@ -835,6 +992,12 @@ class StrategyEngine:
             # All four `_check_*` / `_reconcile_*` helpers consume this
             # snapshot instead of re-deriving their own view of position.
             snap = pos.snapshot()
+
+            # ── Volatility blackout: cancel resting BUY GTDs ──────────────
+            # A flash move must not fill pre-armed entries/averaging orders;
+            # TP SELLs are left alone (exits stay enabled).
+            if self._btc_vol_blocked():
+                await self._cancel_placed_buys("btc_vol_spike")
 
             # ── Tick-driven cancel sweep — MUST run before any new place ───
             # Reconcile any BUY GTDs that are still on the book but no
@@ -1057,6 +1220,15 @@ class StrategyEngine:
         if not self._round or not self._gate or not self._round.up_token:
             return
 
+        # Feed-health / volatility guards: never open during a data outage
+        # or a flash move.
+        if self._btc_feed_stale():
+            self._btc_guard_skip("t1", "btc_stale")
+            return
+        if self._btc_vol_blocked():
+            self._btc_guard_skip("t1", "btc_vol_spike")
+            return
+
         pos = self._round.position
         if snap is None:
             snap = pos.snapshot()
@@ -1259,6 +1431,16 @@ class StrategyEngine:
             snap = pos.snapshot()
         if snap.entry_token is None:
             return
+
+        # Feed-health / volatility guards: no averaging into a data outage
+        # or a flash move (T2/T3's momentum bypass must not fight this).
+        if self._btc_feed_stale():
+            self._btc_guard_skip("tier", "btc_stale")
+            return
+        if self._btc_vol_blocked():
+            self._btc_guard_skip("tier", "btc_vol_spike")
+            return
+
         # NOTE: legacy `Position.baseline_set` / `Position.baseline_price`
         # fields removed entirely (H-NEW-2026-07-15). Previously the
         # `baseline_set` flag was only flipped in `record_fill` (the WS
