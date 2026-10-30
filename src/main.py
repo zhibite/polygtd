@@ -1773,13 +1773,14 @@ async def _midpoint_poll_loop() -> None:
 
 
 def _audit_gtd_invariants(s: AppState) -> None:
-    """Audit the three GTD invariants every STATUS tick (5 s).
+    """Audit the GTD invariants every STATUS tick (5 s).
 
     Emits ERROR (not just a debug line) when one is violated so an operator
     can act immediately:
       1. at most ONE live order per (round, tier)
-      2. a tier never spends more than its configured notional
-      3. total committed exposure never exceeds the configured cap
+      2. every live GTD has a TierWatcher attached
+      3. a tier never spends more than its configured notional
+      4. total committed exposure never exceeds the configured cap
     """
     eng = s.engine
     om = s.order_manager
@@ -1797,6 +1798,19 @@ def _audit_gtd_invariants(s: AppState) -> None:
             note="round exposure exceeds total_max_notional",
         )
 
+    # Live GTDs by tier — the authoritative source for "there is still an
+    # order that needs a watcher". `tier.placed` is NOT that signal: it is
+    # set on placement AND again on the first fill, and only cleared on
+    # cancel/expire. So the old `placed and not watching` check flagged
+    # every COMPLETED tier for the rest of the round (production
+    # 2026-10-30: T1/T3 filled normally but warned every 5 s until the
+    # window ended).
+    live_by_tier: dict[str, list[str]] = {}
+    for order in om.open_orders_for_round(s.round_start_ts):
+        live_by_tier.setdefault(order.tier_name, []).append(
+            order.client_order_id
+        )
+
     for tier in pos.tiers:
         if tier.cost_filled > tier.notional + 0.01:
             log.error(
@@ -1806,20 +1820,16 @@ def _audit_gtd_invariants(s: AppState) -> None:
                 notional=tier.notional,
                 note="tier spent more than its configured notional",
             )
-        if tier.placed and not tier.watching:
+        live_ids = live_by_tier.get(f"T{tier.tier}")
+        if live_ids and not tier.watching:
             log.warning(
                 "invariant.tier_placed_without_watcher",
                 tier=tier.tier,
-                server_id=(tier.server_order_id or "")[:16],
-                note="placed tier has no watcher; terminal fills may be "
-                     "missed unless a WS event arrives",
+                live_client_ids=live_ids[:4],
+                note="a live GTD for this tier has no TierWatcher; terminal "
+                     "fills may be missed unless a WS event arrives",
             )
 
-    live_by_tier: dict[str, list[str]] = {}
-    for order in om.open_orders_for_round(s.round_start_ts):
-        live_by_tier.setdefault(order.tier_name, []).append(
-            order.client_order_id
-        )
     for tier_name, client_ids in live_by_tier.items():
         if len(client_ids) > 1:
             log.error(
