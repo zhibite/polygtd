@@ -144,6 +144,24 @@
 
 <footer>PolyGTD · 数据每 3 秒刷新 · 时间均为 UTC</footer>
 
+<!-- In-page confirm dialog (native <dialog>, styled to the dashboard theme) -->
+<dialog class="modal" id="confirm-dialog">
+  <form method="dialog">
+    <div class="modal-head">
+      <span class="modal-icon" id="confirm-icon">!</span>
+      <h3 id="confirm-title">确认操作</h3>
+    </div>
+    <div class="modal-body" id="confirm-body"></div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" value="cancel">取消</button>
+      <button class="btn btn-danger" id="confirm-ok" value="ok">确定</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- Transient result notifications -->
+<div class="toast-wrap" id="toast-wrap"></div>
+
 <script>
 const $ = (id) => document.getElementById(id);
 const fmt = (n, d = 2) => (n === null || n === undefined || isNaN(n)) ? '--' : Number(n).toFixed(d);
@@ -215,6 +233,43 @@ async function loadAuth() {
   updateControlAvailability();
 }
 
+function confirmDialog(opts) {
+  const dlg = $('confirm-dialog');
+  const danger = opts.danger !== false;
+  $('confirm-title').textContent = opts.title || '确认操作';
+  const icon = $('confirm-icon');
+  icon.textContent = danger ? '!' : '✓';
+  icon.className = 'modal-icon' + (danger ? '' : ' ok');
+  const body = $('confirm-body');
+  body.innerHTML = '';
+  (opts.lines || []).forEach((line) => {
+    const p = document.createElement('p');
+    const text = (line && typeof line === 'object') ? line.text : String(line);
+    const tone = (line && typeof line === 'object') ? line.tone : '';
+    p.textContent = text;
+    if (tone) p.className = tone;
+    body.appendChild(p);
+  });
+  const ok = $('confirm-ok');
+  ok.textContent = opts.okText || '确定';
+  ok.className = 'btn ' + (danger ? 'btn-danger' : 'btn-primary');
+  dlg.returnValue = 'cancel';
+  dlg.showModal();
+  return new Promise((resolve) => {
+    dlg.addEventListener('close', () => resolve(dlg.returnValue === 'ok'), { once: true });
+  });
+}
+
+function showToast(text, kind) {
+  const wrap = $('toast-wrap');
+  const el = document.createElement('div');
+  el.className = 'toast' + (kind === 'err' ? ' err' : '');
+  el.textContent = text;
+  wrap.appendChild(el);
+  setTimeout(() => el.classList.add('out'), 2800);
+  setTimeout(() => el.remove(), 3200);
+}
+
 async function controlCall(path, body) {
   try {
     const r = await fetch(path, {
@@ -230,28 +285,37 @@ async function controlCall(path, body) {
     if (!r.ok) throw new Error(data.detail || ('HTTP ' + r.status));
     await refreshStatus();
     if (path.endsWith('/stop')) {
-      alert('已紧急停止，撤销挂单 ' + (data.cancelled_orders || 0) + ' 笔。');
+      showToast('已紧急停止，撤销挂单 ' + (data.cancelled_orders || 0) + ' 笔。');
     } else {
-      alert('已恢复运行。');
+      showToast('已恢复运行。');
     }
   } catch (e) {
-    alert('操作失败：' + e.message);
+    showToast('操作失败：' + e.message, 'err');
   }
 }
 
 async function stopStrategy() {
-  if (!confirm(
-    '确定紧急停止策略？\n\n' +
-    '· 立即冻结开仓 / 补仓 / 止盈动作\n' +
-    '· 撤销所有未成交挂单\n' +
-    '· 不会自动卖出已有持仓\n\n' +
-    '停止状态会写入磁盘，重启后仍保持停止。'
-  )) return;
+  const ok = await confirmDialog({
+    title: '紧急停止策略？',
+    okText: '紧急停止',
+    danger: true,
+    lines: [
+      '停止开仓 / 补仓 / 止盈，撤销未成交挂单；已有持仓不会自动卖出。',
+      { text: '重新部署容器后停止状态会丢失（data 目录未挂持久卷）。', tone: 'warn' },
+    ],
+  });
+  if (!ok) return;
   await controlCall('/api/control/stop', { reason: 'dashboard' });
 }
 
 async function startStrategy() {
-  if (!confirm('确定恢复运行？\n策略会重新开始寻找入场和止盈机会。')) return;
+  const ok = await confirmDialog({
+    title: '恢复运行？',
+    okText: '恢复运行',
+    danger: false,
+    lines: ['策略会重新开始寻找入场和止盈机会。'],
+  });
+  if (!ok) return;
   await controlCall('/api/control/start', {});
 }
 

@@ -366,6 +366,10 @@ def test_http_routes_serve_pages_and_health() -> None:
     r = client.get("/")
     assert r.status_code == 200
     assert "PolyGTD" in r.text
+    # Emergency-stop prompts use the in-page <dialog>, not window.confirm.
+    assert 'id="confirm-dialog"' in r.text
+    assert 'id="toast-wrap"' in r.text
+    assert 'class="modal"' in r.text
 
     r = client.get("/trades")
     assert r.status_code == 200

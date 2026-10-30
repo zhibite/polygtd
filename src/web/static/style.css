@@ -152,3 +152,24 @@ button.btn:disabled { opacity: .45; cursor: default; filter: none; }
 .control-actions { display: flex; gap: 10px; }
 .btn-danger { background: #dc2626; color: #fff; }
 .btn-danger:hover { background: #ef4444; }
+
+/* ── In-page confirm dialog + toasts ─────────────────────────────────── */
+dialog.modal { background: #12122a; color: #e0e0e0; border: 1px solid #2a2a4a; border-radius: 14px; padding: 0; width: min(470px, calc(100vw - 32px)); max-height: calc(100vh - 64px); box-shadow: 0 30px 90px rgba(0, 0, 0, .7); }
+dialog.modal::backdrop { background: rgba(4, 4, 10, .7); backdrop-filter: blur(3px); }
+dialog.modal[open] { animation: modal-in .18s ease-out; }
+@keyframes modal-in { from { opacity: 0; transform: translateY(10px) scale(.98); } to { opacity: 1; transform: none; } }
+.modal-head { display: flex; align-items: center; gap: 10px; padding: 20px 22px 0; }
+.modal-icon { width: 26px; height: 26px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 14px; font-weight: 800; background: #450a0a; color: #f87171; flex: none; }
+.modal-icon.ok { background: #064e3b; color: #34d399; }
+.modal-head h3 { font-size: 16px; font-weight: 700; }
+.modal-body { padding: 12px 22px 2px; font-size: 13px; line-height: 1.7; color: #9ca3af; }
+.modal-body p { margin: 0 0 7px; }
+.modal-body p.warn { color: #fdba74; }
+.modal-body p.dim { color: #6b7280; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 10px; padding: 16px 22px 20px; }
+
+.toast-wrap { position: fixed; right: 20px; bottom: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 60; }
+.toast { max-width: 360px; background: #12122a; border: 1px solid #2a2a4a; border-left: 3px solid #10b981; border-radius: 8px; padding: 11px 16px; font-size: 13px; color: #d1d5db; box-shadow: 0 12px 34px rgba(0, 0, 0, .5); animation: toast-in .18s ease-out; }
+.toast.err { border-left-color: #ef4444; color: #fca5a5; }
+.toast.out { opacity: 0; transform: translateY(6px); transition: opacity .25s, transform .25s; }
+@keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
