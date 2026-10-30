@@ -89,6 +89,13 @@ class WindowManager:
         }
         self._prev_condition_id: Dict[str, str] = {}
         self._first_seen: Dict[str, bool] = {s: False for s in symbols}
+        # Separate from `_first_seen` (which controls discovery): this flag
+        # makes the boot-time window-age guard run exactly once per asset.
+        # Previously the guard read `_first_seen`, but `tick()` set that to
+        # True before `_on_new_window()` ran, so the guard was dead code.
+        self._boot_grace_done: Dict[str, bool] = {s: False for s in symbols}
+        # Retry cadence for a market that was not available at the boundary.
+        self._retry_interval_s = 5.0
 
     # ── Lifecycle (15-min boundary polling) ─────────────────────────────────────
 
@@ -192,12 +199,53 @@ class WindowManager:
         await self._on_round_start(self._last_round_start)
 
         # ── Steady state: deterministic boundary switching ─────────────────────
+        #
+        # The sleep is sliced every `_retry_interval_s` so a market that was
+        # not yet listed at the boundary (Gamma lag / transient 5xx) can be
+        # retried within the SAME round. Previously the only retry point was
+        # the next 15-minute boundary — a single failed discovery left the
+        # bot idle (and potentially trading a stale market) for a full round.
         while self._running:
             next_boundary = self._last_round_start + self._round_period
             secs_to_boundary = next_boundary - time.time()
-            # Sleep until 0.5 s after the boundary so we're past any race
-            # with the 15-min clock on the server.
-            sleep_for = max(0.0, secs_to_boundary + 0.5)
+
+            if secs_to_boundary <= 0:
+                # Sample the BTC spot at the closing boundary for the
+                # cross-window drift guard. `ctx.market.btc_spot_now` is only
+                # refreshed at discovery, so it holds the PREVIOUS window's
+                # open, not its close — using it made the guard compare
+                # 15-minute-apart opens.
+                if self._binance_spot is not None:
+                    try:
+                        # Cap the sample so a slow REST call cannot delay the
+                        # round transition by the full HTTP timeout.
+                        close_px = await asyncio.wait_for(
+                            self._binance_spot.fetch_price(), timeout=2.0
+                        )
+                    except Exception:
+                        close_px = None
+                    if close_px is not None and close_px > 0:
+                        for asset in self._symbols:
+                            ctx = self._ctxs.get(asset)
+                            if ctx is not None and ctx.market is not None:
+                                ctx.prev_window_btc_close = float(close_px)
+
+                prev = self._last_round_start
+                self._last_round_start = next_boundary
+                log.info(
+                    "window_mgr.round_transition",
+                    prev_start=prev,
+                    new_start=self._last_round_start,
+                )
+                await self._on_round_start(self._last_round_start)
+                continue
+
+            # Sleep until 0.5 s after the boundary (past any server clock
+            # race), but never longer than the retry cadence.
+            sleep_for = min(
+                max(0.0, secs_to_boundary + 0.5),
+                self._retry_interval_s,
+            )
             try:
                 await asyncio.sleep(sleep_for)
             except asyncio.CancelledError:
@@ -205,14 +253,45 @@ class WindowManager:
             if not self._running:
                 return
 
-            prev = self._last_round_start
-            self._last_round_start = next_boundary
-            log.info(
-                "window_mgr.round_transition",
-                prev_start=prev,
-                new_start=self._last_round_start,
+            if time.time() < next_boundary + 0.5:
+                await self._retry_missing_markets()
+
+    async def _retry_missing_markets(self) -> None:
+        """Retry discovery for assets whose current-round market is missing.
+
+        Runs every `_retry_interval_s` inside `_run`. A stale market from a
+        previous round is cleared first so consumers can never trade it.
+        """
+        missing: list[str] = []
+        for asset in self._symbols:
+            ctx = self._ctxs.get(asset)
+            mkt = ctx.market if ctx else None
+            if ctx is not None and mkt is not None:
+                if mkt.round_start_ts and mkt.round_start_ts != self._last_round_start:
+                    log.warning(
+                        "window_mgr.stale_market_cleared",
+                        asset=asset,
+                        market_round_ts=mkt.round_start_ts,
+                        expected_round_ts=self._last_round_start,
+                    )
+                    ctx.market = None
+                    mkt = None
+            if mkt is None:
+                missing.append(asset)
+        if not missing:
+            return
+        log.info(
+            "window_mgr.retry_discovery",
+            assets=missing,
+            round_start_ts=self._last_round_start,
+        )
+        try:
+            await self.tick(missing, force_discovery=True)
+        except Exception:
+            log.exception(
+                "window_mgr.retry_discovery_failed",
+                assets=missing,
             )
-            await self._on_round_start(self._last_round_start)
 
     async def _on_round_start(self, round_start_ts: int) -> None:
         """
@@ -289,10 +368,30 @@ class WindowManager:
 
                 if result is None:
                     log.debug("discover_market returned None (no active window)", asset=asset)
+                    # Drop a market from a previous round so no consumer can
+                    # trade an expired window while discovery is retried.
+                    ctx = self._ctxs.get(asset)
+                    if ctx is not None and ctx.market is not None:
+                        if (
+                            ctx.market.round_start_ts
+                            and ctx.market.round_start_ts != self._last_round_start
+                        ):
+                            log.warning(
+                                "window_mgr.stale_market_cleared",
+                                asset=asset,
+                                market_round_ts=ctx.market.round_start_ts,
+                                expected_round_ts=self._last_round_start,
+                            )
+                            ctx.market = None
                     continue
 
                 mkt = result  # MarketInfo
                 ctx = self._ctxs[asset]
+                # Capture the PREVIOUS market object before overwriting it —
+                # the old code read `ctx.market.btc_spot_now` after assigning
+                # the new market, so `prev_close` was always the new (usually
+                # zero) value and the cross-window drift guard never fired.
+                prev_market = ctx.market
 
                 # Always update ctx.market on discovery (refreshes token IDs, prices, etc.)
                 ctx.market = mkt
@@ -300,15 +399,21 @@ class WindowManager:
                 # Detect window switch by condition_id change (more reliable than window_end)
                 cid_changed = ctx.condition_id and ctx.condition_id != mkt.condition_id
 
-                # Snapshot prev window BTC close for cross-window drift guard
+                # Previous window's closing price, sampled by `_run` at the
+                # boundary (`prev_window_btc_close`). Fall back to the old
+                # market's last known spot only if the boundary sample was
+                # unavailable.
                 prev_close: Optional[float] = None
-                if cid_changed and ctx.market is not None:
+                if cid_changed:
                     try:
-                        prev_close = float(getattr(ctx.market, "btc_spot_now", 0.0) or 0.0)
-                        if prev_close > 0:
-                            ctx.prev_window_btc_close = prev_close
+                        if ctx.prev_window_btc_close and ctx.prev_window_btc_close > 0:
+                            prev_close = float(ctx.prev_window_btc_close)
+                        elif prev_market is not None:
+                            prev_close = float(
+                                getattr(prev_market, "btc_spot_now", 0.0) or 0.0
+                            )
                     except Exception:
-                        pass
+                        prev_close = None
 
                 if cid_changed:
                     log.info(
@@ -367,8 +472,12 @@ class WindowManager:
                         )
 
                 # Cross-window BTC drift guard
+                cfg_obj = self._entry_cfg
+                if cfg_obj is None:
+                    from src.config import strategy as _strategy
+                    cfg_obj = _strategy()
                 drift_pct_cfg = float(
-                    getattr(self._entry_cfg, "cross_window_drift_skip_pct", 0.5)
+                    getattr(cfg_obj, "CROSS_WINDOW_DRIFT_SKIP_PCT", 0.5)
                 )
                 if (
                     drift_pct_cfg > 0
@@ -515,14 +624,21 @@ class WindowManager:
             window_open_down=mkt.window_open_down,
         )
 
-        # Boot-time window age guard: skip if window already open > grace_sec
-        first_seen = self._first_seen.get(ctx.asset, False)
-        if not first_seen:
-            self._first_seen[ctx.asset] = True
-            if self._entry_cfg is not None and getattr(
-                self._entry_cfg, "skip_if_late_window_at_boot", True
-            ):
-                grace_sec = float(getattr(self._entry_cfg, "entry_open_offset_grace_sec", 180.0))
+        # Boot-time window age guard: skip if the window is already older
+        # than the configured grace period. Uses `_boot_grace_done` (NOT
+        # `_first_seen`) because tick() marks `_first_seen=True` before this
+        # method runs — the old check was therefore always False and the
+        # guard never executed.
+        if not self._boot_grace_done.get(ctx.asset, False):
+            self._boot_grace_done[ctx.asset] = True
+            cfg_obj = self._entry_cfg
+            if cfg_obj is None:
+                from src.config import strategy as _strategy
+                cfg_obj = _strategy()
+            if getattr(cfg_obj, "SKIP_IF_LATE_WINDOW_AT_BOOT", True):
+                grace_sec = float(
+                    getattr(cfg_obj, "ENTRY_OPEN_OFFSET_GRACE_SEC", 180.0)
+                )
                 age_sec = ctx.elapsed()
                 if age_sec > grace_sec:
                     ctx.skip_until_next_window = True

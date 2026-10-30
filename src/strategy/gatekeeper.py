@@ -18,13 +18,8 @@ Two separate "baseline" concepts:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
-
 from src.config import strategy as _s
 from src.infra.logging import get_logger
-
-if TYPE_CHECKING:
-    from src.strategy.round_state import TierSnapshot
 
 log = get_logger(__name__)
 

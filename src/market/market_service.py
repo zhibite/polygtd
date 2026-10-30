@@ -70,11 +70,32 @@ class MarketService:
                     tz=timezone.utc,
                 )
             except Exception:
-                window_start = now
+                window_ts = int(now.timestamp()) // self._window_sec * self._window_sec
+                window_start = datetime.fromtimestamp(window_ts, tz=timezone.utc)
                 window_end = end_dt
 
-            if window_end <= now or window_start >= window_end:
+            # Only accept the market whose window CONTAINS `now`. The
+            # previous check (`endDate > now`) also accepted the NEXT
+            # 15-minute market when the current one was briefly missing
+            # from Gamma's response, which would make the bot trade the
+            # wrong window.
+            if not (window_start <= now < window_end):
                 continue
+
+            tick_size = 0.01
+            try:
+                fetched_tick = await self._pm.get_tick_size(
+                    tokens[0].get("token_id", "")
+                )
+                fetched_tick_f = float(fetched_tick)
+                if fetched_tick_f > 0:
+                    tick_size = fetched_tick_f
+            except Exception:
+                log.debug(
+                    "discover_market.tick_size_failed",
+                    slug=m.get("_event_slug", ""),
+                    note="falling back to 0.01",
+                )
 
             neg_risk = False
             token_id_for_check = tokens[0].get("token_id", "")
@@ -105,6 +126,7 @@ class MarketService:
                 window_open_down=window_open_down,
                 slug=m.get("_event_slug", ""),
                 round_start_ts=window_ts,
+                tick_size=tick_size,
             )
         return None
 

@@ -31,6 +31,7 @@ CRITICAL — TRADE event attribution:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import time
 from dataclasses import dataclass, field
@@ -152,6 +153,25 @@ class UserWS:
         self._api_passphrase = api_passphrase
         self._on_maker_fill = on_maker_fill
         self._on_order = on_order
+        # Detect ONCE whether the callback accepts the `candidates=` keyword.
+        # The previous try/except TypeError fallback could not distinguish a
+        # signature mismatch from a TypeError raised INSIDE the callback, and
+        # would then invoke the callback a second time (double-booking the
+        # same fill).
+        self._maker_fill_accepts_candidates = False
+        if on_maker_fill is not None:
+            try:
+                params = inspect.signature(on_maker_fill).parameters
+                self._maker_fill_accepts_candidates = (
+                    "candidates" in params
+                    or any(
+                        p.kind is inspect.Parameter.VAR_KEYWORD
+                        for p in params.values()
+                    )
+                )
+            except (TypeError, ValueError):
+                # Builtins / C callables: default to the 2-arg form.
+                self._maker_fill_accepts_candidates = True
         self._cache = order_cache or UserOrderCache()
         self._running = False
         self._task: asyncio.Task[None] | None = None
@@ -266,10 +286,17 @@ class UserWS:
             msg = json.loads(raw)
         except json.JSONDecodeError:
             return
+        # The user channel can emit JSON arrays (batched events) as well as
+        # objects. The old code called `msg.get(...)` unconditionally, which
+        # raised AttributeError and forced a WS reconnect on every array.
+        if not isinstance(msg, dict):
+            return
 
         event_type = msg.get("event_type", "")
         type_ = msg.get("type", "")
         content = msg.get("content", msg)
+        if not isinstance(content, dict):
+            return
 
         # H-V6-12 debug: dump every trade message at info level so we can see
         # which fields Polymarket actually sends (size, maker_orders, etc.).
@@ -577,14 +604,19 @@ class UserWS:
         )
 
         try:
-            self._on_maker_fill(fill, candidates=candidates)  # type: ignore[call-arg]
-        except TypeError:
-            # Backwards compat: callers that only accept the fill positional
-            # arg. We try the 2-arg form first to give the router the full
-            # candidate list; if the legacy 1-arg signature is wired up we
-            # silently fall back. The router should be updated to support
-            # the 2-arg form (see main.py _make_maker_fill_callback).
-            self._on_maker_fill(fill)  # type: ignore[call-arg]
+            if self._maker_fill_accepts_candidates:
+                self._on_maker_fill(fill, candidates=candidates)  # type: ignore[call-arg]
+            else:
+                # Legacy 1-arg callback: it can only see the representative
+                # fill. Log a warning once so the wiring gets fixed.
+                if not getattr(self, "_legacy_fill_cb_warned", False):
+                    self._legacy_fill_cb_warned = True
+                    log.warning(
+                        "user_ws.legacy_fill_callback",
+                        note="on_maker_fill does not accept `candidates`; "
+                             "per-maker attribution is unavailable",
+                    )
+                self._on_maker_fill(fill)  # type: ignore[call-arg]
         except Exception:
             log.exception("user_ws.on_maker_fill callback raised")
 

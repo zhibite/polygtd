@@ -16,11 +16,12 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from decimal import Decimal
 from typing import Literal
 
 from src.config import strategy as _s
-from src.execution.clob_client import CLOBClient, FillResult
+from src.execution.clob_client import CLOBClient, FillResult, _round_down
 from src.infra.logging import get_logger
 from src.market.market_ws import PriceCache
 from src.market.pm_client import PolymarketClient
@@ -252,6 +253,74 @@ class OrderManager:
     # Place BUY (GTD)
     # ------------------------------------------------------------------
 
+    async def _find_conflicting_open_order(
+        self,
+        token_id: str,
+        side: str,
+        price: float,
+        tick_size: float,
+    ) -> str | None:
+        """Return the server id of a live order at the same asset/side/price.
+
+        Why this exists: a POST can be accepted by the CLOB while the client
+        sees a timeout/reset and records a failure. The order is then live on
+        the book but absent from `self._orders`; the next strategy tick would
+        post a SECOND order at the same tier price. Scanning open orders by
+        (asset, side, price) before every post closes that orphan window.
+
+        Returns None when no conflict exists. Raises when the CLOB query
+        itself fails — callers treat that as "cannot verify" and refuse to
+        place (fail-closed), because a blind post is exactly how duplicates
+        happen.
+
+        Test doubles / older clients without `get_open_orders` are treated
+        as "verification unavailable" (None); the local in-memory duplicate
+        check remains the protection there.
+        """
+        if not token_id:
+            return None
+        settings = getattr(self, "_s", None)
+        if settings is not None and not getattr(
+            settings, "VERIFY_NO_EXISTING_ORDER", True
+        ):
+            return None
+        getter = getattr(self._clob, "get_open_orders", None)
+        if getter is None:
+            return None
+        try:
+            orders = await getter(asset_id=token_id)
+        except TypeError:
+            # Fake/older signature without the asset_id keyword.
+            orders = await getter()
+        if orders is None:
+            raise RuntimeError("open-orders query returned None")
+
+        tolerance = max(abs(float(tick_size)) / 2.0, 1e-9)
+        live_statuses = {"", "LIVE", "INVALID", "UNKNOWN", "PLACED", "OPEN"}
+        for order in orders:
+            order_asset = str(
+                order.get("asset_id")
+                or order.get("assetId")
+                or order.get("token_id")
+                or ""
+            )
+            if order_asset and order_asset != token_id:
+                continue
+            if str(order.get("side") or "").upper() != side.upper():
+                continue
+            status = str(order.get("status") or "").upper()
+            if status not in live_statuses:
+                continue
+            try:
+                order_price = float(order.get("price", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if abs(order_price - float(price)) <= tolerance + 1e-12:
+                return str(
+                    order.get("id") or order.get("orderID") or "unknown"
+                )
+        return None
+
     # ------------------------------------------------------------------
     # Place BUY (GTD) at an EXACT strategy price (no orderbook snap)
     # ------------------------------------------------------------------
@@ -428,12 +497,66 @@ class OrderManager:
         # at the engine's exact strategy price. The legacy
         # `_adjust_buy_price` orderbook fetch has been removed entirely.
         adjusted_price = float(price)
+        # Quantize the share count to the same precision the CLOB will use.
+        # TrackedOrder.size / placed_size then equal the server-accepted
+        # order exactly: no "expected 5.000 but server took 4.99" drift, and
+        # the tier budget can never be overspent by rounding.
+        size_q = (
+            _round_down(size, Decimal(str(tick_size)))
+            if tick_size and tick_size > 0
+            else float(size)
+        )
 
         async with self._lock:
+            # Authoritative duplicate guard. The same check exists in
+            # `place_buy_by_strategy_price` before the lock, but that one is
+            # TOCTOU: two concurrent callers can both pass it before either
+            # acquires the lock. Re-check under the lock so a tier can never
+            # have two live BUY GTDs (double-spending its notional).
+            for existing in self.open_orders_for_round(round_start_ts):
+                if existing.tier_name == tier_name:
+                    log.warning(
+                        "order_manager.buy.duplicate_tier_rejected",
+                        token=token_id[:16],
+                        tier=tier_name,
+                        round=round_start_ts,
+                        existing_client_id=existing.client_order_id,
+                    )
+                    return None
+
+            # Orphan guard: catch an order that reached the CLOB but whose
+            # POST response never reached us (timeout / reset). Fail closed
+            # if the open-orders query itself cannot be verified.
+            try:
+                conflict = await self._find_conflicting_open_order(
+                    token_id, "BUY", adjusted_price, tick_size
+                )
+            except Exception as exc:
+                log.warning(
+                    "order_manager.buy.verify_failed",
+                    token=token_id[:16],
+                    price=adjusted_price,
+                    tier=tier_name,
+                    error=str(exc),
+                    note="refusing to post without orphan verification",
+                )
+                return None
+            if conflict:
+                log.error(
+                    "order_manager.buy.existing_order_on_book",
+                    token=token_id[:16],
+                    price=adjusted_price,
+                    tier=tier_name,
+                    existing_server_id=conflict[:16],
+                    note="an open order already exists at this asset/side/"
+                         "price; refusing to place a duplicate",
+                )
+                return None
+
             result: FillResult = await self._clob.place_gtd_buy(
                 token_id=token_id,
                 price=adjusted_price,
-                size=size,
+                size=size_q,
                 lifetime_s=lifetime_s,
                 tick_size=tick_size,
             )
@@ -446,7 +569,7 @@ class OrderManager:
                 self._cleanup_failed_post(result.order_id)
                 log.warning(
                     "order_manager.buy.failed",
-                    token=token_id[:16], price=adjusted_price, size=size,
+                    token=token_id[:16], price=adjusted_price, size=size_q,
                     tier=tier_name, error=result.error,
                 )
                 return None
@@ -468,12 +591,11 @@ class OrderManager:
                 token_id=token_id,
                 tier_name=tier_name,
                 price=adjusted_price,  # the price actually sent to CLOB
-                size=size,
-                # M-1: CLOB may round-down size_q to a tick boundary; the
-                # engine must size tier.size_expected against the size the
-                # CLOB actually accepted, not the naive notional/price
-                # quotient (which can be off by one tick).
-                placed_size=result.tokens if result.tokens > 0 else size,
+                size=size_q,
+                # M-1: CLOBClient returns the post-round-down accepted size
+                # in `tokens` for a BUY post (not a fill). Fall back to our
+                # own size_q for older/fake clients that return 0.
+                placed_size=result.tokens if result.tokens > 0 else size_q,
                 lifetime_s=effective_lifetime,
                 expires_at=float(expiration_ts),
                 placed_at=time.time(),
@@ -497,8 +619,8 @@ class OrderManager:
                 token=token_id[:16],
                 price=price,
                 adjusted_price=adjusted_price,
-                size=size,
-                filled_tokens=result.tokens,
+                size=size_q,
+                accepted_size=result.tokens,
                 fill_price=result.fill_price,
                 tier=tier_name,
                 desired_lifetime_s=lifetime_s,
@@ -550,10 +672,43 @@ class OrderManager:
             # at the engine's exact tp/target price. The legacy
             # `_adjust_sell_price` orderbook fetch has been removed.
             adjusted_price = float(price) if price_lock else float(price)
+            # CLOBClient rounds SELL size to 0.0001 shares. Quantize here
+            # too so the watcher's expected_size matches the real order.
+            size_q = _round_down(size, Decimal("0.0001"))
+
+            # Orphan guard for the TP side: a lost POST response can leave a
+            # live SELL at this exact price while the local bookkeeping
+            # thinks the post failed. Fail closed on query errors.
+            try:
+                conflict = await self._find_conflicting_open_order(
+                    token_id, "SELL", adjusted_price, tick_size
+                )
+            except Exception as exc:
+                log.warning(
+                    "order_manager.gtd_sell.verify_failed",
+                    token=token_id[:16],
+                    price=adjusted_price,
+                    tier=tier_name,
+                    error=str(exc),
+                    note="refusing to post without orphan verification",
+                )
+                return None
+            if conflict:
+                log.error(
+                    "order_manager.gtd_sell.existing_order_on_book",
+                    token=token_id[:16],
+                    price=adjusted_price,
+                    tier=tier_name,
+                    existing_server_id=conflict[:16],
+                    note="an open SELL already exists at this asset/price; "
+                         "refusing to place a duplicate",
+                )
+                return None
+
             result: FillResult = await self._clob.place_gtd_sell(
                 token_id=token_id,
                 price=adjusted_price,
-                size=size,
+                size=size_q,
                 lifetime_s=gtd_lifetime,
                 tick_size=tick_size,
             )
@@ -564,7 +719,7 @@ class OrderManager:
                 self._cleanup_failed_post(result.order_id)
                 log.warning(
                     "order_manager.gtd_sell.failed",
-                    token=token_id[:16], size=size, price=adjusted_price,
+                    token=token_id[:16], size=size_q, price=adjusted_price,
                     tier=tier_name, error=result.error,
                 )
                 # Even partial fills are returned in result.tokens; surface them.
@@ -590,8 +745,8 @@ class OrderManager:
                 token_id=token_id,
                 tier_name=tier_name,
                 price=adjusted_price,
-                size=size,
-                placed_size=result.tokens if result.tokens > 0 else size,
+                size=size_q,
+                placed_size=size_q,
                 lifetime_s=gtd_lifetime,
                 expires_at=float(expiration_ts),
                 placed_at=time.time(),
@@ -611,7 +766,7 @@ class OrderManager:
                 client_id=cid,
                 server_id=server_id[:16] if server_id else "",
                 token=token_id[:16],
-                size=size,
+                size=size_q,
                 price=adjusted_price,
                 tier=tier_name,
                 desired_lifetime_s=gtd_lifetime,
@@ -719,65 +874,76 @@ class OrderManager:
     async def cancel(self, client_order_id: str, reason: str = "manual") -> bool:
         """Cancel an order by client_order_id."""
         async with self._lock:
-            order = self._orders.get(client_order_id)
-            if not order:
-                log.warning("order_manager.cancel.not_found", client_id=client_order_id)
-                return False
+            return await self._cancel_locked(client_order_id, reason)
 
-            if order.status in ("filled", "cancelled", "expired"):
+    async def _cancel_locked(
+        self, client_order_id: str, reason: str = "manual"
+    ) -> bool:
+        """Cancel implementation. Caller MUST hold `self._lock`.
+
+        Extracted from `cancel()` so that `cancel_by_server_id()` — which
+        already holds the (non-reentrant) asyncio.Lock — does not deadlock
+        by calling the public `cancel()`.
+        """
+        order = self._orders.get(client_order_id)
+        if not order:
+            log.warning("order_manager.cancel.not_found", client_id=client_order_id)
+            return False
+
+        if order.status in ("filled", "cancelled", "expired"):
+            log.info(
+                "order_manager.cancel.already_gone",
+                client_id=client_order_id, status=order.status,
+                side=order.side, tier=order.tier_name,
+            )
+            return False
+
+        server_id = order.server_order_id
+        if server_id:
+            ok = await self._clob.cancel_order(server_id)
+            if ok:
+                order.status = "cancelled"
+                # M-V4-3 fix: drop any queued pending fills for this
+                # server_id (partial fills that arrived before the
+                # cancel request would otherwise sit in `_pending_fills`
+                # forever and accumulate over a long session).
+                self.drain_pending_fills(server_id)
                 log.info(
-                    "order_manager.cancel.already_gone",
-                    client_id=client_order_id, status=order.status,
-                    side=order.side, tier=order.tier_name,
-                )
-                return False
-
-            server_id = order.server_order_id
-            if server_id:
-                ok = await self._clob.cancel_order(server_id)
-                if ok:
-                    order.status = "cancelled"
-                    # M-V4-3 fix: drop any queued pending fills for this
-                    # server_id (partial fills that arrived before the
-                    # cancel request would otherwise sit in `_pending_fills`
-                    # forever and accumulate over a long session).
-                    self.drain_pending_fills(server_id)
-                    log.info(
-                        "order_manager.cancelled",
-                        client_id=client_order_id,
-                        server_id=server_id[:16],
-                        side=order.side,
-                        tier=order.tier_name,
-                        reason=reason,
-                        matched=order.size_matched,
-                        expected=order.size,
-                        residual=max(0.0, order.size - order.size_matched),
-                    )
-                    return True
-                # H-V6-2 fix: previously a failed cancel returned False
-                # silently and operators could not tell whether the order
-                # was actually still live. Surface the failure with the
-                # reason (passed by caller — e.g. "gtd_expired", "round_end",
-                # "manual") so logs can be filtered.
-                log.warning(
-                    "order_manager.cancel.failed",
+                    "order_manager.cancelled",
                     client_id=client_order_id,
                     server_id=server_id[:16],
                     side=order.side,
                     tier=order.tier_name,
                     reason=reason,
+                    matched=order.size_matched,
+                    expected=order.size,
+                    residual=max(0.0, order.size - order.size_matched),
                 )
-                return False
-
-            order.status = "cancelled"
-            log.info(
-                "order_manager.cancelled.no_server_id",
+                return True
+            # H-V6-2 fix: previously a failed cancel returned False
+            # silently and operators could not tell whether the order
+            # was actually still live. Surface the failure with the
+            # reason (passed by caller — e.g. "gtd_expired", "round_end",
+            # "manual") so logs can be filtered.
+            log.warning(
+                "order_manager.cancel.failed",
                 client_id=client_order_id,
+                server_id=server_id[:16],
                 side=order.side,
                 tier=order.tier_name,
                 reason=reason,
             )
-            return True
+            return False
+
+        order.status = "cancelled"
+        log.info(
+            "order_manager.cancelled.no_server_id",
+            client_id=client_order_id,
+            side=order.side,
+            tier=order.tier_name,
+            reason=reason,
+        )
+        return True
 
     async def cancel_by_server_id(
         self,
@@ -808,7 +974,10 @@ class OrderManager:
                     reason=reason,
                 )
                 return False
-            return await self.cancel(client_id, reason=reason)
+            # Call the lock-held implementation directly: asyncio.Lock is
+            # NOT reentrant, so `await self.cancel(...)` here would deadlock
+            # forever and freeze the DecisionLoop + round rollover.
+            return await self._cancel_locked(client_id, reason=reason)
 
     async def cancel_market(self, round_start_ts: int) -> list[str]:
         """Cancel all open orders for a round. Returns list of cancelled client_ids."""
@@ -851,17 +1020,33 @@ class OrderManager:
                             client_id=o.client_order_id,
                             server_id=o.server_order_id[:16],
                             side=o.side, tier=o.tier_name,
+                            note="CLOB did not confirm the cancel; order "
+                                 "remains tracked/live so late fills are "
+                                 "still attributed",
+                        )
+                    else:
+                        log.warning(
+                            "order_manager.cancel_market.unconfirmed",
+                            client_id=o.client_order_id,
+                            server_id=o.server_order_id[:16],
+                            side=o.side, tier=o.tier_name,
+                            note="cancel response did not mention this id; "
+                                 "keeping live status",
                         )
 
+            # Orders with no server id were never on the CLOB — they can be
+            # marked cancelled locally. Orders whose cancel was not confirmed
+            # stay in "live" status on purpose: force-marking them cancelled
+            # would hide a real fill from the engine.
             for o in to_cancel:
-                if o.status != "cancelled":
+                if not o.server_order_id and o.status != "cancelled":
                     o.status = "cancelled"
 
             # M-V4-3 fix: drain pending fills for any server_id we just
             # cancelled so the dead-letter queue does not accumulate stale
             # entries from previous partial-fill events.
             for o in to_cancel:
-                if o.server_order_id:
+                if o.server_order_id and o.status == "cancelled":
                     self.drain_pending_fills(o.server_order_id)
 
             log.info(
@@ -885,7 +1070,21 @@ class OrderManager:
         async with self._lock:
             try:
                 live_orders = await self._clob.get_open_orders(condition_id)
-                live_server_ids = {str(o.get("orderID", "")) for o in live_orders}
+                if live_orders is None:
+                    # Query failed — we do NOT know which orders are gone.
+                    # Marking everything cancelled here (the old behaviour,
+                    # caused by get_open_orders swallowing errors into [])
+                    # would leave live GTDs on the book while the engine
+                    # believes the slots are free.
+                    log.warning(
+                        "order_manager.reconcile.query_failed",
+                        note="skipping state reconciliation; live orders kept",
+                    )
+                    return
+                live_server_ids = {
+                    str(o.get("id") or o.get("orderID") or "")
+                    for o in live_orders
+                }
 
                 for co in list(self._orders.values()):
                     if co.status not in ("placed", "live"):
@@ -942,6 +1141,17 @@ class OrderManager:
         """
         if self._startup_reconciled:
             return
+        settings = getattr(self, "_s", None)
+        if settings is not None and not getattr(
+            settings, "STARTUP_RECONCILE_CANCEL_ALL", True
+        ):
+            self._startup_reconciled = True
+            log.info(
+                "order_manager.startup_reconcile.disabled",
+                note="STARTUP_RECONCILE_CANCEL_ALL=False; leaving existing "
+                     "account orders untouched (shared-wallet mode)",
+            )
+            return
         try:
             open_orders = await self._clob.get_open_orders()
         except Exception as exc:
@@ -950,6 +1160,14 @@ class OrderManager:
                 error=str(exc),
                 note="cannot enumerate stale CLOB orders; "
                      "balance lock may persist — manual intervention needed",
+            )
+            return
+
+        if open_orders is None:
+            log.warning(
+                "order_manager.startup_reconcile.query_failed",
+                note="open-orders query failed; cannot distinguish our "
+                     "orders from other account activity — skipping",
             )
             return
 
@@ -988,6 +1206,14 @@ class OrderManager:
                 }),
             )
         server_ids = [sid for _, sid in cancel_candidates]
+        if not server_ids:
+            self._startup_reconciled = True
+            log.info(
+                "order_manager.startup_reconcile",
+                cancelled=0,
+                note="open orders are all terminal; nothing to cancel",
+            )
+            return
         log.warning(
             "order_manager.startup_reconcile.stale_orders",
             count=len(server_ids),
@@ -1060,10 +1286,24 @@ class OrderManager:
         observability.
         """
         async with self._lock:
+            # Only purge terminal state. A previous-round order whose cancel
+            # was not confirmed by the CLOB must stay tracked: deleting the
+            # mapping would turn a late fill into an "untracked" event and
+            # lose it from the books.
+            #
+            # `<=` (not `==`) so terminal orders from older rounds are also
+            # collected — otherwise a single never-confirmed cancel could
+            # keep an old-round entry alive forever.
             stale = [
                 cid for cid, o in self._orders.items()
-                if o.round_start_ts == round_start_ts
+                if o.round_start_ts <= round_start_ts
+                and o.status not in ("placed", "live")
             ]
+            skipped_live = sum(
+                1 for o in self._orders.values()
+                if o.round_start_ts <= round_start_ts
+                and o.status in ("placed", "live")
+            )
             for cid in stale:
                 o = self._orders.pop(cid, None)
                 if o is None:
@@ -1072,11 +1312,12 @@ class OrderManager:
                 if sid:
                     self._by_server.pop(sid, None)
                     self.drain_pending_fills(sid)
-            if stale:
+            if stale or skipped_live:
                 log.info(
                     "order_manager.purge_round",
                     round_start_ts=round_start_ts,
                     purged=len(stale),
+                    skipped_live=skipped_live,
                     remaining=len(self._orders),
                 )
             return len(stale)
@@ -1123,10 +1364,10 @@ class OrderManager:
         expected_threshold = (
             order.placed_size if order.placed_size > 0 else order.size
         )
-        if (
-            order.size_matched > 0
-            and order.size_matched + 1e-9 < expected_threshold * 0.995
-        ):
+        # NOTE: no `size_matched > 0` escape hatch here. A zero-matched order
+        # is *not* filled; the old condition let mark_filled() promote an
+        # order that had received no fills at all.
+        if order.size_matched + 1e-9 < expected_threshold * 0.995:
             log.debug(
                 "order_manager.partial_fill_skip_mark_filled",
                 client_id=order.client_order_id,

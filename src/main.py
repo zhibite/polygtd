@@ -34,20 +34,18 @@ import asyncio
 import signal
 import sys
 import time
-from datetime import datetime, timezone
-from pathlib import Path
+from typing import Optional
 
-from src.config import general, binance, log_config, strategy
+from src.config import binance, log_config, strategy
 from src.clob_l1_auth import create_or_derive_clob_api_creds, ClobL1Error
 from src.execution.clob_client import CLOBClient
 from src.execution.gtd_expiry_watcher import GtdExpiryWatcher
 from src.execution.heartbeat import HeartbeatLoop
 from src.execution.order_manager import OrderManager
-from src.execution.tier_watcher import TierWatcher, TierOutcome, WatcherResult
+from src.execution.tier_watcher import TierWatcher, WatcherResult
 from src.feeds.binance_spot import BinanceCache, BinanceFeed, BinanceSpotService, RingBuffer
 from src.infra.logging import configure_logging, get_logger
 from src.market.market_service import MarketService
-from src.market.models import MarketInfo
 from src.market.pm_client import PolymarketClient
 from src.market.window_manager import WindowManager
 from src.market.market_ws import MarketWS, PriceCache
@@ -184,22 +182,53 @@ async def _maybe_realize_closed(token_id: str, eng, pos) -> None:
         )
         return
 
+    if bal is None:
+        # The balance API failed. It is NOT evidence that the inventory is
+        # gone — never wipe the position on an error.
+        log.warning(
+            "router.realize_check.unavailable",
+            token=token_id[:16],
+            note="balance query unavailable; keeping in-memory position as-is",
+        )
+        return
+
     # balance is in shares; epsilon-comparison with the in-memory qty.
     if bal <= 0.5 and pos.total_qty > 0.5:
+        # Confirm with a second read before destroying state. A single
+        # zero can be a transient CLOB cache/settlement artefact right
+        # after a fill; two consecutive zeros 0.5 s apart are credible
+        # evidence that the wallet really is empty.
+        await asyncio.sleep(0.5)
+        try:
+            bal2 = await eng._state.clob.get_token_balance(token_id)
+        except Exception:
+            bal2 = None
+        if bal2 is None or bal2 > 0.5:
+            log.warning(
+                "router.realize_check.transient_zero",
+                token=token_id[:16],
+                first_read=bal,
+                second_read=bal2,
+                in_memory_qty=pos.total_qty,
+                note="zero balance was not confirmed on re-read; keeping "
+                     "position state",
+            )
+            return
         log.warning(
             "router.realize_check.drained",
             token=token_id[:16],
-            clob_balance_shares=bal,
+            clob_balance_shares=bal2,
             in_memory_qty=pos.total_qty,
-            note="CLOB balance is 0 but engine still thinks we hold tokens; "
-                 "calling realize_position_closed()",
+            note="CLOB balance is 0 (confirmed twice) but engine still "
+                 "thinks we hold tokens; calling realize_position_closed()",
         )
         pos.realize_position_closed(
             source="router.realize_check",
             note=(
-                "REST get_token_balance returned 0 during TP-rejection "
-                "reconciliation; user-side UI sell (or upstream bot crash "
-                "consuming the inventory) is the most likely cause"
+                "REST get_token_balance returned 0 on two consecutive reads "
+                "during TP-rejection reconciliation; user-side UI sell (or "
+                "upstream bot crash consuming the inventory) is the most "
+                "likely cause"
             ),
         )
     elif bal + 0.5 < pos.total_qty:
@@ -296,15 +325,34 @@ class ActionRouter:
         """
         existing = self._watchers.get((round_start_ts, tier))
         if existing is not None and not existing.result:
-            # Watcher is still running (or pending). Refuse the duplicate.
+            if existing._server_order_id == server_order_id:
+                # Same order, double spawn — harmless no-op.
+                log.warning(
+                    "router.duplicate_tier_watcher_rejected",
+                    round=round_start_ts,
+                    tier=tier,
+                    server_id=server_order_id[:16],
+                    active_server_id=(existing._server_order_id or "")[:16],
+                )
+                return existing
+            # A NEW order for the same tier (the previous GTD was cancelled
+            # by the strategy tick and the tier re-armed on a price rebound).
+            # Supersede the stale watcher: refusing the spawn left the new
+            # order unmonitored, and the old watcher would later apply its
+            # result to the rebound tier.
+            old_sid = existing._server_order_id or ""
             log.warning(
-                "router.duplicate_tier_watcher_rejected",
+                "router.stale_tier_watcher_superseded",
                 round=round_start_ts,
                 tier=tier,
-                server_id=server_order_id[:16],
-                active_server_id=(existing._server_order_id or "")[:16],
+                old_server_id=old_sid[:16],
+                new_server_id=server_order_id[:16],
             )
-            return existing
+            if old_sid:
+                self._watcher_by_server_id.pop(old_sid, None)
+            stop_task = asyncio.create_task(existing.stop())
+            self._state._bg_tasks.add(stop_task)
+            stop_task.add_done_callback(self._state._bg_tasks.discard)
 
         cfg = strategy()
         eng = self._state.engine
@@ -314,6 +362,23 @@ class ActionRouter:
             if not eng or not eng._round:
                 return
             tier_snap = eng._round.position.tiers[tier - 1]
+            # Stale-watcher guard: if this tier has since been re-armed with
+            # a NEW server order, a terminal result from the old order must
+            # not mutate the current tier (it would mark the new order
+            # filled/expired based on the old one's outcome).
+            if (
+                tier_snap.server_order_id
+                and result.server_order_id
+                and tier_snap.server_order_id != result.server_order_id
+            ):
+                log.warning(
+                    "router.stale_watcher_result_ignored",
+                    tier=tier,
+                    stale_server_id=result.server_order_id[:16],
+                    current_server_id=tier_snap.server_order_id[:16],
+                    outcome=result.outcome.value,
+                )
+                return
 
             # H-NEW-2026-07-12 (audit R10, double-count fix): when the watcher
             # fast-fills on spawn (or reaches FILLED via balance-poll before
@@ -489,6 +554,14 @@ class ActionRouter:
                 return
             if cumulative_size_matched <= 1e-9:
                 return
+            # Ignore a stale watcher's polling if the tier was re-armed with
+            # a different order in the meantime.
+            tier_snap = eng._round.position.tiers[tier - 1]
+            if (
+                tier_snap.server_order_id
+                and tier_snap.server_order_id != server_order_id
+            ):
+                return
             tracked = om.by_server_id(server_order_id)
             prev_size_matched = tracked.size_matched if tracked else 0.0
             # The TierWatcher passed the CLOB's authoritative cumulative.
@@ -556,29 +629,82 @@ class ActionRouter:
     ) -> TierWatcher:
         """Spawn a TierWatcher for a TP SELL GTD."""
         cfg = strategy()
-        eng = self._state.engine
 
         async def on_done(result: WatcherResult) -> None:
             eng = self._state.engine
             if not eng or not eng._round:
                 return
             pos = eng._round.position
-            # Treat a watcher complete as a TP fill (full or partial).
-            filled_qty = result.filled_qty
-            if result.outcome in (
-                TierOutcome.FILLED,
-                TierOutcome.OVER_FILLED,
-                TierOutcome.EXPIRED,
-                TierOutcome.CROSSED,
-                TierOutcome.CANCELLED,
-            ) and filled_qty > 0:
-                # record_tp_fill reduces _total_qty / _total_cost and
-                # clears _tp_inflight.
-                pos.record_tp_fill(result.server_order_id, result.strategy_price, filled_qty)
-            else:
-                # No fill (zero qty) → just clear the mutex so the next
-                # tick can re-arm TP.
-                pos._tp_inflight = False
+            sid = result.server_order_id
+            # `filled_qty` is the watcher's AUTHORITATIVE per-order cumulative
+            # matched size. Apply only the part not already booked by the WS
+            # TRADE path / an earlier partial-resync callback.
+            try:
+                already = pos.tp_size_sold(sid)
+                if already is None:
+                    # Snapshot already closed — the full amount was booked.
+                    delta = 0.0
+                else:
+                    delta = max(0.0, float(result.filled_qty) - already)
+                if delta > 1e-9:
+                    fill_px = (
+                        result.avg_fill_price
+                        if result.avg_fill_price and result.avg_fill_price > 0
+                        else result.strategy_price
+                    )
+                    # record_tp_fill reduces _total_qty / _total_cost and
+                    # released `_tp_inflight` on every fill.
+                    pos.record_tp_fill(sid, fill_px, delta)
+                else:
+                    pos._tp_inflight = False
+            finally:
+                # Terminal watcher state: release the TP slot so the next
+                # tick can re-arm against the residual (if any). Without
+                # this the snapshot leaks and `has_open_tp_orders` blocks
+                # every future TP for the rest of the round.
+                pos.close_tp_order(sid)
+
+        async def on_partial_fill(
+            cumulative_size_matched: float,
+            fill_price: float,
+            hint_result: "WatcherResult | None",
+        ) -> None:
+            """Ground-truth resync for partial TP sells.
+
+            Without this, a partial SELL that the WS TRADE channel missed
+            stayed invisible until the watcher's terminal state (up to the
+            full GTD lifetime). The delta contract mirrors the BUY path:
+            derive the increment from OrderManager's monotonic
+            `size_matched`, then let the engine book it.
+            """
+            eng = self._state.engine
+            om = self._state.order_manager
+            if not eng or not om or cumulative_size_matched <= 0:
+                return
+            tracked = om.by_server_id(server_order_id)
+            prev_matched = tracked.size_matched if tracked else 0.0
+            effective_delta = cumulative_size_matched - prev_matched
+            if effective_delta <= 1e-9:
+                return
+            om.apply_fill_event(
+                server_order_id,
+                size_matched=cumulative_size_matched,
+                fill_price=fill_price,
+            )
+            om.mark_filled(server_order_id)
+            # No BUY tier matches a SELL id, so on_order_filled falls
+            # through to Position.record_tp_fill.
+            eng.on_order_filled(
+                token_id, server_order_id, fill_price, effective_delta
+            )
+            log.info(
+                "router.tp_polling_resync",
+                token=token_id[:16],
+                order_id=server_order_id[:16],
+                cumulative=cumulative_size_matched,
+                delta_size=effective_delta,
+                fill_price=fill_price,
+            )
 
         def is_active() -> bool:
             eng = self._state.engine
@@ -594,6 +720,7 @@ class ActionRouter:
             expires_at=expires_at,
             poll_s=cfg.TIER_WATCHER_POLL_S,
             on_complete=on_done,
+            on_partial_fill=on_partial_fill,
             is_still_active=is_active,
         )
         task = watcher.start()
@@ -603,6 +730,70 @@ class ActionRouter:
         # H-NEW-2026-07-11-3: same reverse-lookup registration as BUY.
         self._watcher_by_server_id[server_order_id] = watcher
         return watcher
+
+    async def _final_reconcile_before_close(self, server_order_id: str) -> None:
+        """Account for fills up to the moment an order is cancelled.
+
+        A cancel can race a fill. Before the router frees the tier/TP slot,
+        read the order's authoritative `size_matched` and push any delta
+        that WS + watcher polling have not already booked. This is what
+        guarantees the in-memory position matches reality before a new
+        order is allowed for the same tier.
+        """
+        om = self._state.order_manager
+        eng = self._state.engine
+        clob = self._state.clob
+        if not om or not eng or not eng._round or not clob or not server_order_id:
+            return
+        tracked = om.by_server_id(server_order_id)
+        if tracked is None:
+            return
+        prev = tracked.size_matched or 0.0
+        cumulative = prev
+        fill_px = tracked.price
+        try:
+            fill_state = await clob.get_order_fill_state(server_order_id)
+        except Exception:
+            fill_state = None
+        if fill_state:
+            try:
+                cumulative = max(
+                    cumulative, float(fill_state.get("size_matched", 0) or 0)
+                )
+            except (TypeError, ValueError):
+                pass
+            try:
+                avg_px = float(fill_state.get("avg_price", 0) or 0)
+                if avg_px > 0:
+                    fill_px = avg_px
+            except (TypeError, ValueError):
+                pass
+        delta = cumulative - prev
+        if delta <= 1e-9:
+            return
+        om.apply_fill_event(
+            server_order_id, size_matched=cumulative, fill_price=fill_px
+        )
+        if tracked.side == "SELL":
+            pos = eng._round.position
+            if (
+                hasattr(pos, "tp_size_sold")
+                and pos.tp_size_sold(server_order_id) is not None
+            ):
+                pos.record_tp_fill(server_order_id, fill_px, delta)
+        else:
+            eng.on_order_filled(
+                tracked.token_id, server_order_id, fill_px, delta
+            )
+        log.info(
+            "router.final_reconcile",
+            side=tracked.side,
+            order_id=server_order_id[:16],
+            prev_matched=prev,
+            cumulative=cumulative,
+            delta_size=delta,
+            fill_price=fill_px,
+        )
 
     async def stop_all_watchers(self) -> None:
         """Cancel every active watcher (called on shutdown / round-end)."""
@@ -686,6 +877,9 @@ class ActionRouter:
                 )
                 eng._round.position.entry_side = None
                 eng._round.position.entry_token = None
+                # Backoff before the next T1 attempt (2 s) so a rejected
+                # POST is not retried on every 250 ms tick.
+                eng._round.position.t1_retry_after_ts = time.time() + 2.0
 
         elif isinstance(action, ActionOpenTN):
             order = await om.place_buy_by_strategy_price(
@@ -746,6 +940,8 @@ class ActionRouter:
                     tier_snap.watching = False
                     tier_snap.server_order_id = None
                     tier_snap.expires_at = 0.0
+                    # Backoff before retrying this tier (2 s).
+                    tier_snap.retry_after_ts = time.time() + 2.0
 
         elif isinstance(action, ActionTakeProfit):
             # H-NEW-2026-07-11: a single GTD SELL at tp_target, monitored
@@ -775,6 +971,29 @@ class ActionRouter:
                         tier_name="TP",
                         tick_size=tick_size,
                     )
+                    if order and not pos._tp_inflight:
+                        # The engine abandoned the TP while the POST was in
+                        # flight. Cancel the fresh GTD; if the cancel fails,
+                        # fall through and track it so a late fill is still
+                        # attributed.
+                        cancelled = await om.cancel(
+                            order.client_order_id,
+                            reason="tp_inflight_cleared",
+                        )
+                        if cancelled:
+                            log.info(
+                                "router.tp_runner.cancelled_after_post",
+                                token=action.token[:16],
+                                server_id=(order.server_order_id or "")[:16],
+                            )
+                            return
+                        log.warning(
+                            "router.tp_runner.cancel_failed_tracking",
+                            token=action.token[:16],
+                            server_id=(order.server_order_id or "")[:16],
+                            note="engine abandoned TP but CLOB cancel failed; "
+                                 "tracking the order so fills are not lost",
+                        )
                     if not order:
                         pos._tp_inflight = False
                         log.warning(
@@ -912,12 +1131,33 @@ class ActionRouter:
                     action.server_order_id, reason=action.reason
                 )
                 if ok:
+                    pos.tp_cancel_retry_after_ts = 0.0
+                    # Book any fill that raced the cancel BEFORE closing the
+                    # snapshot, then stop the watcher (no more polling).
+                    await self._final_reconcile_before_close(
+                        action.server_order_id
+                    )
+                    watcher = self._watcher_by_server_id.pop(
+                        action.server_order_id, None
+                    )
+                    if watcher is not None:
+                        try:
+                            await watcher.stop()
+                        except Exception:
+                            pass
+                    # Cancellation confirmed: the TP slot is free. (If the
+                    # cancel failed, keep the snapshot so a late fill is
+                    # still attributed and no second TP is posted.)
+                    pos.close_tp_order(action.server_order_id)
                     log.info(
                         "router.cancel_tp.done",
                         server_id=action.server_order_id[:16],
                         reason=action.reason,
                     )
                 else:
+                    # Back off before retrying the cancel; the snapshot is
+                    # kept so `has_open_tp_orders` still blocks a second TP.
+                    pos.tp_cancel_retry_after_ts = time.time() + 2.0
                     log.warning(
                         "router.cancel_tp.failed",
                         server_id=action.server_order_id[:16],
@@ -954,6 +1194,22 @@ class ActionRouter:
             # (the engine checks `cancel_pending` to single-flight).
             tier_snap.cancel_pending = False
             if ok:
+                tier_snap.cancel_retry_after_ts = 0.0
+                # Book fills that raced the cancel, then stop the watcher.
+                # Only after this final reconcile is the tier slot truly
+                # free; a later re-arm therefore sizes against the correct
+                # remaining budget.
+                await self._final_reconcile_before_close(
+                    action.server_order_id
+                )
+                watcher = self._watcher_by_server_id.pop(
+                    action.server_order_id, None
+                )
+                if watcher is not None:
+                    try:
+                        await watcher.stop()
+                    except Exception:
+                        pass
                 # We keep server_order_id so a late-arriving WS TRADE
                 # event can still attribute to this tier. The
                 # optimistic release already removed the placed flag,
@@ -967,10 +1223,23 @@ class ActionRouter:
                     size_expected=tier_snap.size_expected,
                 )
             else:
-                # CLOB rejected the cancel — log it so operators can
-                # see the failure. `placed` is already False; the
-                # watcher's EXPIRED sweep will eventually fire terminal
-                # state and reconcile.
+                # The cancel was NOT confirmed. If the order is still live
+                # on the CLOB, the slot is NOT free: restore placed/watching
+                # so `total_notional_committed` keeps reserving this tier's
+                # notional and the engine cannot add another order on top of
+                # it. (If the order already reached a terminal state, leave
+                # the optimistic release in place.)
+                tracked = om.by_server_id(action.server_order_id)
+                still_live = (
+                    tracked is not None
+                    and tracked.status in ("placed", "live")
+                )
+                if still_live:
+                    tier_snap.placed = True
+                    tier_snap.watching = True
+                    tier_snap.expires_at = tracked.expires_at
+                    # Do not re-issue the cancel on every 250 ms tick.
+                    tier_snap.cancel_retry_after_ts = time.time() + 2.0
                 log.warning(
                     "router.cancel_tier.failed",
                     tier=action.tier,
@@ -978,6 +1247,7 @@ class ActionRouter:
                     reason=action.reason,
                     size_filled=tier_snap.size_filled,
                     size_expected=tier_snap.size_expected,
+                    still_live=still_live,
                 )
 
     def _make_fill_callback(self):
@@ -1056,18 +1326,19 @@ class ActionRouter:
                 return
             fill_delta_size = effective_delta
 
-            # 1) Promote tracked-order status to "filled" (no-op if partial).
-            om.mark_filled(order_id)
-
-            # 2) Feed the engine position state with the DELTA. record_fill
-            #    does `size_filled += size` which under delta semantics is
-            #    exactly correct — no double counting (B-3). We also pass
-            #    cumulative to the OrderManager for its own bookkeeping.
+            # 1) Mirror the cumulative into OrderManager FIRST (monotonic),
+            #    then promote status. mark_filled compares size_matched to
+            #    the expected size, so it must run after apply_fill_event.
             om.apply_fill_event(
                 order_id,
                 size_matched=fill_total_size,
                 fill_price=fill_price,
             )
+            om.mark_filled(order_id)
+
+            # 2) Feed the engine position state with the DELTA. record_fill
+            #    does `size_filled += size` which under delta semantics is
+            #    exactly correct — no double counting (B-3).
             eng.on_order_filled(
                 token_id, order_id, fill_price, fill_delta_size
             )
@@ -1108,9 +1379,50 @@ def _on_market_discovered(asset: str, mkt) -> None:
             if old_t and old_t != mkt.token_up_id and old_t != mkt.token_down_id:
                 state.price_cache.clear_token(old_t)
 
-    if state.market_ws:
-        state.market_ws.subscribe_tokens([mkt.token_up_id, mkt.token_down_id])
+    # Publish the market FIRST. A failure in the WS subscription must not
+    # leave `current_market` pointing at the previous (expired) window.
     state.current_market = mkt
+
+    if state.market_ws:
+        try:
+            state.market_ws.subscribe_tokens([mkt.token_up_id, mkt.token_down_id])
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "market.subscribe_failed",
+                cid=mkt.condition_id[:16],
+                error=str(exc),
+                note="engine still receives the market; MarketWS will "
+                     "re-subscribe on its next reconnect",
+            )
+
+    # Late discovery: the round may have started before this market was
+    # available (Gamma lag at the boundary). Bind the tokens to the
+    # already-created RoundState so the engine can trade this window.
+    eng = state.engine
+    if eng is not None and eng._round is not None:
+        try:
+            eng.attach_market(mkt)
+        except Exception:
+            log.exception(
+                "market.attach_market_failed",
+                cid=mkt.condition_id[:16],
+            )
+        # A late (retry) discovery can run AFTER _on_new_round has already
+        # created the RoundState. If WindowManager's pre-check flagged this
+        # window as unsafe, apply the skip flag now.
+        ctx = state.wm.get("BTC") if state.wm else None
+        if (
+            ctx is not None
+            and ctx.skip_until_next_window
+            and eng._round is not None
+            and not eng._round.skip_reason
+        ):
+            eng._round.skip_reason = "window_precheck"
+            log.warning(
+                "round.skip.late_market",
+                round_start_ts=eng._round.round_start_ts,
+                reason="window_precheck",
+            )
 
     if is_transition:
         log.info(
@@ -1166,6 +1478,15 @@ async def _on_new_round(round_start_ts: int) -> None:
             await state.engine.on_round_end()
         if state.order_manager:
             await state.order_manager.cancel_market(prev)
+            # Refresh in-memory state against the CLOB before purging. This
+            # marks orders the server already dropped as terminal, so
+            # `purge_round` can safely remove them. Orders whose cancel was
+            # NOT confirmed stay live and are kept tracked (late fills are
+            # still attributed instead of being silently lost).
+            try:
+                await state.order_manager.reconcile()
+            except Exception as exc:
+                log.warning("round.reconcile_failed", error=str(exc))
             # M-V4-1 fix: drop the previous round's TrackedOrders /
             # server_id mappings / pending fills so the maps do not grow
             # unbounded across rounds.
@@ -1181,20 +1502,54 @@ async def _on_new_round(round_start_ts: int) -> None:
 
     # ── Use WindowManager for market discovery ─────────────────────────────────
     # Note: market subscription (token IDs) is handled in _on_market_discovered.
-    # Here we just check that market is available.
+    # Always read the market from the CURRENT WindowContext and reject any
+    # market that belongs to a different round. The previous version trusted
+    # `state.current_market`, which still held the expired previous-window
+    # market when discovery failed at the boundary — and then traded it for
+    # the entire next 15 minutes.
+    mkt = None
     if state.wm:
         ctx = state.wm.get("BTC")
-        if not (ctx and ctx.market):
-            log.warning("round.market_not_found", round_start_ts=round_start_ts)
-    else:
-        state.current_market = None
-        log.warning("round.market_not_found.wm_unavailable", round_start_ts=round_start_ts)
+        mkt = ctx.market if ctx else None
+        if mkt is not None and mkt.round_start_ts and mkt.round_start_ts != round_start_ts:
+            log.warning(
+                "round.stale_market_rejected",
+                round_start_ts=round_start_ts,
+                stale_market_round_ts=mkt.round_start_ts,
+                stale_slug=mkt.slug or "",
+            )
+            mkt = None
+    state.current_market = mkt
+    if mkt is None:
+        log.warning(
+            "round.market_not_found",
+            round_start_ts=round_start_ts,
+            note="waiting for WindowManager retry discovery; engine starts "
+                 "without tokens and is late-bound by _on_market_discovered",
+        )
 
     # Notify engine of new round. Baseline is now seeded by
     # `_on_window_baseline` (called from WM.tick after fetch_at_window_open)
     # — see main.py / window_manager.py.
     if state.engine:
-        await state.engine.on_new_round(round_start_ts, state.current_market)
+        await state.engine.on_new_round(round_start_ts, mkt)
+        # Honour the WindowManager window pre-checks (late boot / big
+        # cross-window BTC gap). Previously these flags were set but never
+        # consumed, so the "skip this window" protection did nothing.
+        ctx = state.wm.get("BTC") if state.wm else None
+        if (
+            ctx is not None
+            and ctx.skip_until_next_window
+            and state.engine._round is not None
+        ):
+            state.engine._round.skip_reason = "window_precheck"
+            log.warning(
+                "round.skip",
+                round_start_ts=round_start_ts,
+                reason="window_precheck",
+                note="WindowManager flagged this window as unsafe "
+                     "(late boot or cross-window BTC drift)",
+            )
 
     # Persist round start
     mkt = state.current_market
@@ -1216,8 +1571,6 @@ async def _on_new_round(round_start_ts: int) -> None:
 async def _midpoint_poll_loop() -> None:
     """Poll /midpoint REST API every 2s to keep stable price cache updated."""
     last_condition_id = ""
-    last_up_token = ""
-    last_down_token = ""
     while True:
         await asyncio.sleep(2.0)
         s = STATE
@@ -1248,8 +1601,6 @@ async def _midpoint_poll_loop() -> None:
                 round_start_ts=mkt.round_start_ts,
             )
         last_condition_id = condition_id
-        last_up_token = up_token
-        last_down_token = down_token
 
         try:
             up_mid = await s.pm_client.get_midpoint(up_token)
@@ -1271,6 +1622,66 @@ async def _midpoint_poll_loop() -> None:
 # ---------------------------------------------------------------------------
 # Status printer
 # ---------------------------------------------------------------------------
+
+
+def _audit_gtd_invariants(s: AppState) -> None:
+    """Audit the three GTD invariants every STATUS tick (5 s).
+
+    Emits ERROR (not just a debug line) when one is violated so an operator
+    can act immediately:
+      1. at most ONE live order per (round, tier)
+      2. a tier never spends more than its configured notional
+      3. total committed exposure never exceeds the configured cap
+    """
+    eng = s.engine
+    om = s.order_manager
+    if not eng or not eng._round or not om:
+        return
+    pos = eng._round.position
+    cap = strategy().total_max_notional
+
+    committed = pos.total_notional_committed
+    if committed > cap + 0.01:
+        log.error(
+            "invariant.round_over_committed",
+            committed=round(committed, 4),
+            cap=cap,
+            note="round exposure exceeds total_max_notional",
+        )
+
+    for tier in pos.tiers:
+        if tier.cost_filled > tier.notional + 0.01:
+            log.error(
+                "invariant.tier_over_budget",
+                tier=tier.tier,
+                spent=round(tier.cost_filled, 4),
+                notional=tier.notional,
+                note="tier spent more than its configured notional",
+            )
+        if tier.placed and not tier.watching:
+            log.warning(
+                "invariant.tier_placed_without_watcher",
+                tier=tier.tier,
+                server_id=(tier.server_order_id or "")[:16],
+                note="placed tier has no watcher; terminal fills may be "
+                     "missed unless a WS event arrives",
+            )
+
+    live_by_tier: dict[str, list[str]] = {}
+    for order in om.open_orders_for_round(s.round_start_ts):
+        live_by_tier.setdefault(order.tier_name, []).append(
+            order.client_order_id
+        )
+    for tier_name, client_ids in live_by_tier.items():
+        if len(client_ids) > 1:
+            log.error(
+                "invariant.duplicate_live_orders",
+                tier=tier_name,
+                count=len(client_ids),
+                client_ids=client_ids[:4],
+                note="more than one live GTD for the same tier/round",
+            )
+
 
 async def _status_loop() -> None:
     cfg = log_config()
@@ -1385,6 +1796,9 @@ async def _status_loop() -> None:
                 f" uPnL={upnl_str}"
                 f"{tp_str}"
             )
+
+        # Runtime audit of the duplicate / over-allocation invariants.
+        _audit_gtd_invariants(s)
 
         log.info(
             f"STATUS  binance={bc:,.1f}  {gate_str}"
@@ -1592,11 +2006,24 @@ async def main() -> None:
     status_task.cancel()
     midpoint_task.cancel()
 
-    # B-3 v2 fix: await any in-flight TP runners so they finish cleanly
-    # before tearing down dependencies (clob / order_manager). Otherwise a
-    # TP sell could fire after `_shutdown` is set and race against cleanup.
+    # B-3 v2 fix: drain in-flight TP runners / watchers before tearing down
+    # dependencies (clob / order_manager). Watchers must be stopped first:
+    # they normally live until the GTD expires (up to GTD_LIFETIME_S), so
+    # an unbounded gather could hang shutdown for ~5 minutes.
+    router = getattr(s, "router", None)
+    if router is not None:
+        try:
+            await router.stop_all_watchers()
+        except Exception as exc:
+            log.warning("shutdown.stop_watchers_failed", error=str(exc))
     if STATE._bg_tasks:
-        await asyncio.gather(*list(STATE._bg_tasks), return_exceptions=True)
+        pending = [t for t in STATE._bg_tasks if not t.done()]
+        if pending:
+            _, still_running = await asyncio.wait(pending, timeout=10.0)
+            for t in still_running:
+                t.cancel()
+            if still_running:
+                await asyncio.gather(*still_running, return_exceptions=True)
         STATE._bg_tasks.clear()
 
     if s.gtd_expiry:
@@ -1737,32 +2164,10 @@ def _make_maker_fill_callback(state: AppState):
 
         order_id = chosen[0]
         asset_id = chosen[1] or fill.asset_id
-        # chosen[2] = maker row's WS amount (or REST-replaced cumulative
-        # from user_ws when the WS collapsed it to 0). When that's still
-        # 0 (REST also empty), we DO NOT fall back to fill.size —
-        # fill.size is the taker side and overcounts by the
-        # (taker_total / our_maker) ratio (H-NEW-2026-07-11 audit, prod
-        # 14:30 round). Refuse to record a phantom fill instead.
-        fill_size_inc = chosen[2]
-        # Price fallback chain for OUR maker's matched price:
-        # 1. chosen[3]  — maker_orders[].price  (the row's own price)
-        # 2. tracked.price — our limit order's placed price (always
-        #                    present, since this order_id is in OM)
-        # 3. fill.price  — top-level taker-side price (last resort; can
-        #                  be on the wrong token side)
-        fill_price = chosen[3] or tracked.price or fill.price
 
-        if not order_id or (fill_size_inc <= 0 and chosen[4] <= 0):
-            log.info(
-                "router.maker_fill.skip",
-                order_id=order_id, fill_size=fill_size_inc,
-                rest_filled_size=chosen[4],
-                reason="authoritative per-maker amount is 0 (no WS amount, "
-                       "no REST amount) — refusing to use taker-side "
-                       "fill.size which would overcount",
-            )
-            return
-
+        # Resolve the tracked order BEFORE the price fallback reads
+        # `tracked.price` (the previous ordering raised UnboundLocalError
+        # whenever the maker row carried no price).
         tracked = om.by_server_id(order_id)
         if not tracked:
             # Defensive: chosen matched in the loop above but disappeared
@@ -1771,42 +2176,70 @@ def _make_maker_fill_callback(state: AppState):
             log.info(
                 "router.maker_fill.untracked",
                 order_id=order_id, asset_id=asset_id[:16],
-                fill_size=fill_size_inc, fill_price=fill_price,
                 reason="no TrackedOrder matches server_order_id (race?)",
+            )
+            return
+
+        # Price fallback chain for OUR maker's matched price:
+        # 1. chosen[3]  — maker_orders[].price  (the row's own price)
+        # 2. tracked.price — our limit order's placed price (always
+        #                    present, since this order_id is in OM)
+        # 3. fill.price  — top-level taker-side price (last resort; can
+        #                  be on the wrong token side)
+        fill_price = chosen[3] or tracked.price or fill.price
+
+        # When both the WS maker row and the REST fallback are empty we
+        # DO NOT fall back to fill.size — it is the taker side and
+        # overcounts by (taker_total / our_maker).
+        if not order_id or (chosen[2] <= 0 and chosen[4] <= 0):
+            log.info(
+                "router.maker_fill.skip",
+                order_id=order_id, maker_amount=chosen[2],
+                rest_filled_size=chosen[4],
+                reason="authoritative per-maker amount is 0 (no WS amount, "
+                       "no REST amount) — refusing to use taker-side "
+                       "fill.size which would overcount",
             )
             return
 
         # Decide what *increment* to forward to the engine.
         #
-        # chosen[2] is the AUTHORITATIVE size for OUR maker on this TRADE
-        # event. When the WS payload's maker row carried an amount, it's
-        # that row's matched-amount (a per-trade delta for our maker).
-        # When the WS payload collapsed it to 0 and the REST fallback in
-        # user_ws filled it, it's the order's CUMULATIVE size_matched as
-        # returned by CLOB get_order. In both cases, monotonic-max logic
-        # in OrderManager.apply_fill_event absorbs the new value.
-        #
-        # chosen[4] is the REST-derived delta for THIS trade (only set
-        # when the REST fallback fired). When present it represents the
-        # net new matched size from this trade alone, so it's the cleanest
-        # delta to forward to the engine.
+        # chosen[2] semantics:
+        #   * WS path       — maker_orders[].matched_amount for THIS trade,
+        #                     i.e. a per-trade contribution → ADD it.
+        #   * REST fallback — the order's CUMULATIVE size_matched; in that
+        #                     case chosen[4] carries the per-trade delta
+        #                     and takes precedence below.
+        # The previous code subtracted `prev_cumulative` in both cases,
+        # which silently dropped every partial fill after the first one
+        # on a multi-trade GTD.
         prev_cumulative = tracked.size_matched or 0.0
         rest_delta = chosen[4]
         if rest_delta > 0:
-            # REST gave us a per-trade delta for this order_id.
-            fill_size_inc = rest_delta
+            # The REST fallback is AUTHORITATIVE (it is the order's own
+            # `size_matched` delta). Do not clamp it against the local
+            # expected size — the server is the source of truth.
+            new_cumulative = prev_cumulative + rest_delta
         else:
-            # WS gave us the per-row amount (which IS the per-trade
-            # contribution for this maker row).
-            fill_size_inc = max(0.0, chosen[2] - prev_cumulative)
+            inc = max(0.0, float(chosen[2]))
+            # Cap the cumulative at the order's expected size. This absorbs
+            # duplicate MATCHED→MINED→CONFIRMED re-fires when the WS payload
+            # lacks a trade_id.
+            expected_total = (
+                tracked.placed_size if tracked.placed_size > 0 else tracked.size
+            )
+            if expected_total > 0:
+                new_cumulative = min(prev_cumulative + inc, expected_total)
+            else:
+                new_cumulative = prev_cumulative + inc
+        fill_size_inc = new_cumulative - prev_cumulative
         if fill_size_inc <= 1e-9:
             log.debug(
                 "router.maker_fill.no_new",
                 order_id=order_id, prev=prev_cumulative,
-                ws_amount=chosen[2], rest_delta=rest_delta,
+                maker_amount=chosen[2], rest_delta=rest_delta,
             )
             return
-        new_cumulative = prev_cumulative + fill_size_inc
 
         om.apply_fill_event(
             order_id,
@@ -1864,6 +2297,32 @@ def _make_user_ws_order_callback(state: AppState):
         evt_type = ev.event_type.upper()
 
         if evt_type == "CANCELLATION":
+            # A cancellation can race the final fill event. Before closing
+            # a TP snapshot, book any matched size OrderManager already
+            # knows about but the engine has not credited — otherwise
+            # close_tp_order() would drop that residual from the position
+            # forever.
+            om = state.order_manager
+            pos = eng._round.position if eng._round else None
+            tracked = om.by_server_id(order_id) if om else None
+            if (
+                pos is not None
+                and tracked is not None
+                and hasattr(pos, "tp_size_sold")
+            ):
+                already = pos.tp_size_sold(order_id)
+                if already is not None:
+                    delta = max(0.0, tracked.size_matched - already)
+                    if delta > 1e-9:
+                        pos.record_tp_fill(order_id, tracked.price, delta)
+                        log.info(
+                            "router.tp_cancel.booked_residual",
+                            order_id=order_id[:16],
+                            delta_size=delta,
+                            fill_price=tracked.price,
+                            note="booked matched shares observed before the "
+                                 "cancellation closed the TP snapshot",
+                        )
             eng.on_order_cancelled(order_id, reason="user_ws")
             return
 

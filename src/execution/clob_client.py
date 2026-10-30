@@ -18,8 +18,6 @@ from typing import Callable, Optional
 
 from src.infra.logging import get_logger
 
-from src.config import strategy as _s
-
 # py-clob-client-v2 (NOT v1)
 from py_clob_client_v2 import (
     ClobClient,
@@ -336,27 +334,61 @@ class CLOBClient:
     # Balance
     # ------------------------------------------------------------------
 
-    async def get_balance(self) -> float:
-        """USDC (pUSD) collateral balance in human units."""
+    async def get_balance(self) -> float | None:
+        """USDC (pUSD) collateral balance in human units, or None on error.
+
+        py-clob-client-v2 exposes `get_balance_allowance` (NOT `get_balance`
+        / `get_pusd_balance` — those names do not exist in the published
+        SDK). The response is ``{"balance": "<base units>", "allowance":
+        "<base units>"}``; collateral has 6 decimals, so divide by 1e6.
+
+        Returns None (not 0.0) on failure so callers can distinguish
+        "query failed" from "balance really is zero". Treating an error
+        as zero previously caused `_maybe_realize_closed` to wipe a live
+        position after a transient REST failure.
+        """
         if not self._client:
-            return 0.0
+            return None
         try:
-            bal = await self._run(self._client.get_pusd_balance)
-            return float(bal) / 1_000_000 if bal else 0.0
+            from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
+
+            resp = await self._run(
+                self._client.get_balance_allowance,
+                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL),
+            )
+            if not isinstance(resp, dict) or resp.get("balance") is None:
+                return None
+            return float(resp["balance"]) / self._CLOB_BASE_UNITS
         except Exception as exc:
             log.warning("clob.get_balance.error", error=str(exc))
-            return 0.0
+            return None
 
-    async def get_token_balance(self, token_id: str) -> float:
-        """Token balance in shares (human, not micro-units)."""
+    async def get_token_balance(self, token_id: str) -> float | None:
+        """Token balance in shares (human, not micro-units), or None on error.
+
+        Uses `get_balance_allowance` with AssetType.CONDITIONAL. Outcome
+        tokens are ERC-1155 with 6 decimals, so the raw balance is divided
+        by 1e6. Returning None on failure is essential: the TierWatcher /
+        realize checks must not treat an API error as a zero holding.
+        """
         if not self._client:
-            return 0.0
+            return None
         try:
-            bal = await self._run(self._client.get_balance, token_id)
-            return float(bal) if bal else 0.0
+            from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
+
+            resp = await self._run(
+                self._client.get_balance_allowance,
+                BalanceAllowanceParams(
+                    asset_type=AssetType.CONDITIONAL,
+                    token_id=token_id,
+                ),
+            )
+            if not isinstance(resp, dict) or resp.get("balance") is None:
+                return None
+            return float(resp["balance"]) / self._CLOB_BASE_UNITS
         except Exception as exc:
             log.debug("clob.get_token_balance.error", error=str(exc))
-            return 0.0
+            return None
 
     # H-V6-15: the 6-decimal fixed-math convention applies to some CLOB
     # fields but NOT to `get_order` (the WS-fill REST fallback). Evidence
@@ -598,9 +630,14 @@ class CLOBClient:
         )
         # Return success with order_id. Fill progress is owned by
         # TierWatcher + User WS — this method no longer polls.
+        #
+        # `tokens` here is the ACCEPTED PLACED size (post-CLOB round-down),
+        # not a fill. OrderManager copies it into TrackedOrder.placed_size so
+        # the engine's `size_expected` matches what the server actually
+        # accepted (M-1). No fill has happened yet.
         return FillResult(
             order_id=order_id,
-            tokens=0,
+            tokens=float(size_q),
             usdc=0,
             fill_price=price_q,
             success=True,
@@ -616,14 +653,16 @@ class CLOBClient:
         tick_size: float,
     ) -> FillResult:
         """
-        Post a GTD limit SELL order (maker) and poll until filled or expired.
+        Post a GTD limit SELL order (maker) and return immediately.
 
         Behaviour:
-          - Returns a *live* GTD sell. Caller (OrderManager) decides how long to
-            wait. We poll here for at most `GTD_CLIENT_TIMEOUT_SEC` (10 minutes)
-            since the server enforces expiration.
-          - Fires the fill callback incrementally on every fill so the position
-            state can stay in sync while the order lives.
+          - POST /order, pre-register the server id, and return a *live*
+            FillResult. Fill progress is owned by TierWatcher (per-order
+            `size_matched` polling) and the UserWS UPDATE/TRADE channels.
+          - This method deliberately does NOT poll. It used to poll for up
+            to 60 s while OrderManager held its global lock, which blocked
+            every other order operation and, on timeout, reported a still-live
+            GTD as failed (the caller then dropped the tracking mapping).
         """
         if not self._client:
             return FillResult("", 0, 0, price, False, "ClobClient not initialised")
@@ -679,198 +718,24 @@ class CLOBClient:
             except Exception as exc:
                 log.debug("clob.register_pending.error", error=str(exc))
 
-        # Poll until filled or GTD timeout.
-        # B-3 fix: deduper is the single source of truth for delta
-        # computation. We fire cumulative matched size on every poll and let
-        # CLOBClient._fill_deduper translate to delta — that way WS / polling
-        # / FAK responses can all observe the same order without double
-        # counting regardless of who fires first.
-        deadline = time.monotonic() + min(
-            self.GTD_CLIENT_TIMEOUT_SEC, gtd_seconds + 5
+        log.info(
+            "clob.gtd_sell.posted",
+            order_id=order_id[:16],
+            token=token_id[:16],
+            size=size_q,
+            price=price_q,
+            tick=tick_size,
+            expiration_ts=expiration_ts,
         )
-        poll_interval = 0.5
-        total_sz = 0.0
-        total_usdc = 0.0
-        order_size = size_q
-        # H-V6-2 fix: throttle the per-poll progress log so we don't flood
-        # at 0.5s intervals, but emit enough rows to see the GTD SELL's
-        # lifetime progress (~10s cadence).
-        last_progress_log_ts = 0.0
-        progress_log_interval = 10.0
-
-        while time.monotonic() < deadline:
-            await asyncio.sleep(poll_interval)
-
-            try:
-                status_resp = await self._run(self._client.get_order, order_id)
-            except Exception as exc:
-                log.debug("clob.gtd_sell.get_order error", error=str(exc))
-                continue
-
-            if not status_resp:
-                continue
-
-            fills = status_resp.get("fills") or []
-            if fills:
-                for f in fills:
-                    try:
-                        # H-V6-12 fix (audit C-2): fills[].size is in
-                        # 6-decimal base units, same as size_matched. Divide
-                        # by 1_000_000 before summing. Pre-fix, the polling
-                        # loop's total_sz was inflated by 1e6 while
-                        # total_usdc was also inflated by 1e6, so
-                        # avg_px = total_usdc / total_sz accidentally
-                        # cancelled out — but tokens was wildly wrong.
-                        sz_raw = float(f.get("size", 0))
-                        sz = sz_raw / self._CLOB_BASE_UNITS if sz_raw > 0 else 0.0
-                        px = float(f.get("price", price_q))
-                        total_sz += sz
-                        total_usdc += sz * px
-                    except (TypeError, ValueError):
-                        continue
-
-            order_status = (status_resp.get("status") or "").lower()
-            # H-V6-15 fix: `size_matched` returned by GET /data/order/<id>
-            # is in SHARES, NOT 6-decimal base units (H-V6-12 audit C-2
-            # interpretation was wrong — see get_order_filled_size docstring
-            # for the production-validated evidence from 2026-07-11 08:19).
-            # If absent, fall back to total_sz which was already divided
-            # inside the fills[] loop above.
-            matched_sz_raw = status_resp.get("size_matched")
-            if matched_sz_raw is not None and float(matched_sz_raw) > 0:
-                # H-V6-15: no divide — this endpoint returns shares directly.
-                matched_sz = float(matched_sz_raw)
-            else:
-                matched_sz = total_sz
-
-            # Fire cumulative matched size. The CLOBClient-level FillDeduper
-            # translates cumulative -> delta so partial fills remain monotonic
-            # and idempotent regardless of which source (WS, polling, FAK)
-            # observed the order. (B-3 fix — previously emitted_sz here was
-            # a per-thread throttle that did not catch WS / FAK re-fires.)
-            if matched_sz > 0:
-                avg_px = (total_usdc / matched_sz) if matched_sz > 0 else price_q
-                await self._fire_fill_callback(
-                    token_id, order_id, avg_px, matched_sz
-                )
-
-                # Terminal states
-            if order_status in ("matched", "filled"):
-                if total_sz > 0:
-                    avg_px = total_usdc / total_sz
-                    # H-V6-2 fix: enrich the fully-filled terminal log
-                    # with structured fields. Pre-fix the SELL loop never
-                    # logged on success — only on partial_then_expired
-                    # or poll_timeout. Operators couldn't tell whether
-                    # the GTD SELL completed naturally vs hit a fallback.
-                    log.info(
-                        "clob.gtd_sell fully_filled",
-                        order_id=order_id[:16],
-                        token=token_id[:12],
-                        filled_tokens=total_sz,
-                        avg_px=avg_px,
-                        total_usdc=total_usdc,
-                        order_size=order_size,
-                    )
-                    return FillResult(
-                        order_id=order_id,
-                        tokens=_round_down(total_sz, Decimal("0.0001")),
-                        usdc=_round_down(total_usdc, Decimal("0.01")),
-                        fill_price=_round_down(avg_px, tick_d),
-                        success=True,
-                        expiration_ts=expiration_ts,
-                    )
-                # CLOB confirmed status="matched"/"filled" but fills[] and
-                # size_matched are empty — the API responded faster than
-                # CLOB's internal fill ledger updated. Treat as a confirmed
-                # full fill: use order_size as the authoritative filled
-                # quantity and the posted price as the fill price.
-                # Pre-fix this was mis-classified as "gtd_matched_zero"
-                # failure, causing the bot to lose its position inventory
-                # (engine thought TP failed, position kept 5.55 shares)
-                # while the CLOB had already executed the full sell.
-                log.info(
-                    "clob.gtd_sell confirmed_filled_via_status",
-                    order_id=order_id[:16],
-                    token=token_id[:12],
-                    order_size=order_size,
-                    fill_price=price_q,
-                    note="CLOB matched/filled but fills[] empty — "
-                         "treated as confirmed full fill",
-                )
-                return FillResult(
-                    order_id=order_id,
-                    tokens=_round_down(order_size, Decimal("0.0001")),
-                    usdc=_round_down(order_size * price_q, Decimal("0.01")),
-                    fill_price=price_q,
-                    success=True,
-                    expiration_ts=expiration_ts,
-                )
-
-            if order_status in ("cancelled", "expired", "failed"):
-                # Partial fills are valid — return what we have.
-                if total_sz > 0:
-                    avg_px = total_usdc / total_sz
-                    log.info(
-                        "clob.gtd_sell partial_then_expired",
-                        order_id=order_id[:16],
-                        token=token_id[:12],
-                        status=order_status, filled=total_sz,
-                        order_size=order_size,
-                        avg_px=avg_px,
-                    )
-                    return FillResult(
-                        order_id=order_id,
-                        tokens=_round_down(total_sz, Decimal("0.0001")),
-                        usdc=_round_down(total_usdc, Decimal("0.01")),
-                        fill_price=_round_down(avg_px, tick_d),
-                        success=True,
-                        expiration_ts=expiration_ts,
-                    )
-                return FillResult(
-                    order_id=order_id, tokens=0, usdc=0,
-                    fill_price=price_q, success=False,
-                    error=f"gtd_{order_status}",
-                    expiration_ts=expiration_ts,
-                )
-
-            # H-V6-2 fix: periodic progress log so operators can see how
-            # full the GTD SELL is as it lives. This is the only place
-            # where lifetime progress is observable between the post and
-            # the terminal event.
-            now_ts = time.monotonic()
-            if now_ts - last_progress_log_ts >= progress_log_interval:
-                last_progress_log_ts = now_ts
-                age_s = now_ts - (deadline - min(self.GTD_CLIENT_TIMEOUT_SEC, gtd_seconds + 5))
-                log.info(
-                    "clob.gtd_sell poll_progress",
-                    order_id=order_id[:16],
-                    token=token_id[:12],
-                    matched=matched_sz,
-                    order_size=order_size,
-                    order_status=order_status,
-                    lifetime_consumed_s=round(age_s, 1),
-                    lifetime_remaining_s=round(gtd_seconds - age_s, 1),
-                )
-
-        # Client poll timeout — but the order may still be live server-side.
-        # Surface what we know to the caller, leaving the order book-still-posted.
-        log.warning(
-            "clob.gtd_sell poll_timeout",
-            order_id=order_id[:16], token=token_id[:12],
-            matched=total_sz, order_size=order_size,
-            client_timeout_s=self.GTD_CLIENT_TIMEOUT_SEC,
-            gtd_seconds=gtd_seconds,
-        )
+        # Non-blocking contract (see docstring): fills are owned by
+        # TierWatcher + UserWS. Never poll here — this runs under
+        # OrderManager's global lock.
         return FillResult(
             order_id=order_id,
-            tokens=_round_down(total_sz, Decimal("0.0001")),
-            usdc=_round_down(total_usdc, Decimal("0.01")),
-            fill_price=_round_down(
-                (total_usdc / total_sz) if total_sz > 0 else 0, tick_d
-            ),
-            success=False,
-            error="gtd_poll_timeout",
+            tokens=0,
+            usdc=0,
+            fill_price=price_q,
+            success=True,
             expiration_ts=expiration_ts,
         )
 
@@ -902,11 +767,15 @@ class CLOBClient:
         )
 
         try:
+            # py-clob-client-v2 MarketOrderArgsV2 uses `amount` (shares for
+            # a SELL) and `price`; there is no `size` / `slippage` keyword.
+            # The slippage-adjusted price is computed above and passed
+            # explicitly so the market order walks the book only up to it.
             mkt_args = MarketOrderArgs(
                 token_id=token_id,
-                size=float(size_q),
+                amount=float(size_q),
                 side=ClobSide.SELL,
-                slippage=float(slip_d),
+                price=float(sell_price),
             )
             resp = await self._run(
                 self._client.create_and_post_market_order, mkt_args
@@ -1059,23 +928,27 @@ class CLOBClient:
     # Queries
     # ------------------------------------------------------------------
 
-    async def get_open_orders(self, condition_id: str | None = None) -> list[dict]:
+    async def get_open_orders(
+        self,
+        condition_id: str | None = None,
+        asset_id: str | None = None,
+    ) -> list[dict] | None:
         """Fetch open orders from CLOB.
 
-        H-NEW-2026-07-12 production: py-clob-client-v2 exposes
-        `ClobClient.get_open_orders()` (not `get_orders`). The previous
-        call raised `AttributeError` and the order_manager reconcile
-        silently fell back to "no open orders", which left any GTD
-        orders that survived a bot restart holding CLOB balance /
-        allowance indefinitely (audit v6-12 / H-NEW-2026-07-11).
+        Returns a list of dicts, or **None when the query failed**. The
+        None sentinel is important: returning [] on a transient error let
+        `OrderManager.reconcile()` conclude that every tracked order was
+        gone and mark it cancelled while it was still live on the book.
 
-        Returns a list of dicts matching py-clob-client-v2 OpenOrder
-        schema. Each dict has at least:
+        `asset_id` filters the response locally to one outcome token; it is
+        used by the pre-post duplicate/orphan check.
+
+        Each dict has at least:
             id, status, market (condition_id), asset_id, side,
             price, original_size, size_matched, expiration
         """
         if not self._client:
-            return []
+            return None
         try:
             # v2 SDK exposes get_open_orders() as the live-orders query.
             # Some 2.x point releases also added an alias `get_orders()`
@@ -1087,9 +960,9 @@ class CLOBClient:
                 log.warning(
                     "clob.get_open_orders.missing_method",
                     note="neither get_open_orders nor get_orders exists on ClobClient; "
-                         "reconcile will be a no-op for this SDK version",
+                         "cannot reconcile order state for this SDK version",
                 )
-                return []
+                return None
             orders = await self._run(method)
             if condition_id:
                 # V2 schema uses `market` (= condition_id). Keep the V1
@@ -1100,10 +973,20 @@ class CLOBClient:
                     if o.get("market") == condition_id
                     or o.get("conditionID") == condition_id
                 ]
+            if asset_id:
+                orders = [
+                    o for o in orders
+                    if str(
+                        o.get("asset_id")
+                        or o.get("assetId")
+                        or o.get("token_id")
+                        or ""
+                    ) == asset_id
+                ]
             return orders
         except Exception as exc:
             log.warning("clob.get_orders error", error=str(exc))
-            return []
+            return None
 
     async def get_midpoint(self, token_id: str) -> float:
         """REST fallback for token midpoint price."""

@@ -6,8 +6,9 @@ from functools import lru_cache
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Project root = parent of the `src` package. config.toml / .env live there.
 _ROOT = Path(__file__).parent.parent
-_TOML_PATH = _ROOT.parent / "config.toml"
+_TOML_PATH = _ROOT / "config.toml"
 
 
 @lru_cache(maxsize=1)
@@ -77,7 +78,7 @@ class StrategySettings(BaseSettings):
     IMPORTANT: DRY_RUN has been removed. Trading is always live.
     """
 
-    model_config = SettingsConfigDict(env_file=str(_ROOT.parent / ".env"), extra="ignore")
+    model_config = SettingsConfigDict(env_file=str(_ROOT / ".env"), extra="ignore")
 
     # ── CLOB Credentials ──────────────────────────────────────────────────
     # Option A: provide all three L2 API credentials directly (recommended)
@@ -132,6 +133,16 @@ class StrategySettings(BaseSettings):
     # Prevents chasing at the very end of the 15-min window.
     T1_ENTRY_WINDOW_S: float = 300.0    # 5 minutes
 
+    # Boot-time window-age guard: if the process starts more than
+    # ENTRY_OPEN_OFFSET_GRACE_SEC into a window, skip that window entirely.
+    SKIP_IF_LATE_WINDOW_AT_BOOT: bool = True
+    ENTRY_OPEN_OFFSET_GRACE_SEC: float = 180.0
+
+    # Skip a new window when BTC spot jumped more than this percent between
+    # the previous window's recorded price and the new window's open.
+    # 0 disables the guard.
+    CROSS_WINDOW_DRIFT_SKIP_PCT: float = 0.5
+
     # ── Order settings ────────────────────────────────────────────────────
     # GTD lifetime in seconds. CLOB enforces a 180-second hard floor
     # (`CLOBClient.GTD_MIN_SEC = 180`); values below that are clamped to
@@ -143,6 +154,21 @@ class StrategySettings(BaseSettings):
 
     # Slippage for FAK sell orders (as a fraction, e.g. 0.02 = 2%)
     SELL_SLIPPAGE_PCT: float = 0.02
+
+    # Startup reconcile: force-cancel every open CLOB order on the account.
+    # This frees maker allowance left behind by a crashed process, but it is
+    # account-wide — if the same wallet/API key is shared with another bot or
+    # manual orders, those will be cancelled too. Set to False when sharing.
+    STARTUP_RECONCILE_CANCEL_ALL: bool = True
+
+    # Before POSTing a GTD, query the CLOB's open orders for the same
+    # asset + side + price and refuse to place if one already exists.
+    # This is the defence against ORPHAN orders: a POST whose response was
+    # lost (timeout / connection reset) may have been accepted server-side,
+    # so the local OrderManager does not know about it. Without this check
+    # the next strategy tick would place a second GTD at the same tier.
+    # The query failing is treated as "cannot verify" → refuse to place.
+    VERIFY_NO_EXISTING_ORDER: bool = True
 
     # ── GTD pre-arm margin (核心新参数) ────────────────────────────────────
     # GTD 挂单**时机**提前量，按策略价的比例计算。

@@ -18,6 +18,9 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 import websockets
+# `websockets.State` is only exported at the top level from v14 onward;
+# `websockets.protocol.State` is stable across 11–15.
+from websockets.protocol import State as WsState
 
 from src.infra.logging import get_logger
 
@@ -87,7 +90,7 @@ class MarketWS:
         new_tokens = [tid for tid in token_ids if tid not in self._pending_tokens]
         for tid in new_tokens:
             self._pending_tokens.add(tid)
-        if new_tokens and self._ws is not None and self._ws.state == websockets.State.OPEN:
+        if new_tokens and self._ws is not None and self._ws.state == WsState.OPEN:
             # WS is already connected — send subscription right away
             asyncio.create_task(self._subscribe(self._ws, new_tokens))
 
@@ -201,6 +204,19 @@ class MarketWS:
         market_field = msg.get("market")
         if not token and isinstance(market_field, dict):
             token = market_field.get("asset_id") or market_field.get("assetID") or ""
+
+        # ── dedicated last_trade_price event ─────────────────────────────────
+        # Schema: { event_type: "last_trade_price", asset_id, price, ... }
+        # The price is a TOP-LEVEL `price` field. The old parser only looked
+        # for a `last_trade_price` field, which this event never carries, so
+        # every last-trade event was dropped.
+        if event_type == "last_trade_price":
+            price_raw = msg.get("price")
+            if price_raw not in (None, "") and token:
+                try:
+                    self._cache.last_trade_price[token] = float(price_raw)
+                except (TypeError, ValueError):
+                    pass
 
         # ── best_bid / best_ask ──────────────────────────────────────────────
         # Orderbook (best_bid / best_ask / book) events are intentionally

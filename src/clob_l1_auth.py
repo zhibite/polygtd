@@ -11,7 +11,6 @@ v2 changes from v1:
 
 from dataclasses import dataclass
 
-from loguru import logger
 
 from py_clob_client_v2.signer import Signer
 from py_clob_client_v2.signing.eip712 import sign_clob_auth_message

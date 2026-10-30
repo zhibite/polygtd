@@ -13,22 +13,23 @@
 
 ### 方式 A：直接使用已有 L2 API Key（推荐）
 
-在 [.env.docker](.env.docker) 或 `.env` 中填入：
+在 [.env.docker](.env.docker) 或项目根目录的 `.env` 中填入（变量名必须与代码一致）：
 
 ```bash
-POLY_API_KEY=xxxxx
-POLY_API_SECRET=xxxxx
-POLY_API_PASSPHRASE=xxxxx
+API_KEY=xxxxx
+API_SECRET=xxxxx
+API_PASSPHRASE=xxxxx
 ```
 
-> 如果使用 Gnosis Safe（SIGNATURE_TYPE=2），还需确保 Safe 已审批 pUSD 给 CLOB Exchange。
+> 如果使用 Gnosis Safe（SIGNATURE_TYPE=2），还需确保 Safe 已审批 pUSD 给 CLOB Exchange，并设置 `FUNDER_ADDRESS=<Safe 地址>`。
 
 ### 方式 B：从私钥派生
 
 ```bash
-POLY_PRIVATE_KEY=0xYOUR_PRIVATE_KEY
-POLY_WALLET_ADDRESS=0xYOUR_EOA_ADDRESS
-SIGNATURE_TYPE=0   # 0=EOA, 1=POLY_PROXY, 2=GNOSIS_SAFE
+WALLET_PRIVATE_KEY=0xYOUR_PRIVATE_KEY
+WALLET_ADDRESS=0xYOUR_EOA_ADDRESS
+FUNDER_ADDRESS=0x...        # SIG_TYPE=1/2/3 时必填（代理/Safe 地址）
+SIGNATURE_TYPE=0            # 0=EOA, 1=POLY_PROXY, 2=GNOSIS_SAFE
 ```
 
 bot 启动时会自动调用 `create_or_derive_clob_api_creds` 从私钥派生 L2 API Key。
@@ -54,25 +55,27 @@ Polymarket CLOB 使用 pUSD（不是原生 USDC）作为抵押品：
 ## 三、配置参数
 
 ```bash
-# 马丁格尔仓位（美元名义）
+# 马丁格尔仓位（美元名义）— 四层，总最大暴露 2+3+5+6 = 16 USD
 TIER1_NOTIONAL=2.0   # 首单
-TIER2_NOTIONAL=4.0   # 补仓1
-TIER3_NOTIONAL=8.0   # 补仓2
-# 总最大暴露 = 14 USD (H-NEW-2026-07-11-4: 3-tier cap, removed T4)
+TIER2_NOTIONAL=3.0   # 补仓1（下跌 20%）
+TIER3_NOTIONAL=5.0   # 补仓2（下跌 40%）
+TIER4_NOTIONAL=6.0   # 补仓3（下跌 60%）
 
 # 策略阈值
-# H-NEW-2026-07-12: entry cap 0.36 → 0.38, TP decrement 3% → 5%.
-ENTRY_PRICE_CAP=0.38     # 入场价格上限
-TIER2_DROP_PCT=0.30      # T2 触发：价格跌到基准 × 70%
-TIER3_DROP_PCT=0.60      # T3 触发：价格跌到基准 × 40%
+ENTRY_PRICE_CAP=0.40     # T1 入场价格上限
+TIER2_DROP_PCT=0.20      # T2 触发：T1 成交均价 × (1-20%)
+TIER3_DROP_PCT=0.40      # T3 触发：T1 成交均价 × (1-40%)
+TIER4_DROP_PCT=0.60      # T4 触发：T1 成交均价 × (1-60%)
 TP_PROFIT_PCT=0.20       # 止盈目标：成本 + 20%
-TP_DECREMENT_PCT=0.05    # 止盈递减：每补一档 -5% (N=1→15%, N=2→10%)
+TP_DECREMENT_PCT=0.03    # 每补一档 -3% (N=1→17%, N=2→14%, N=3→11%)
+TP_MIN_PCT=0.05          # 止盈下限 5%
 BASELINE_DRIFT_LIMIT=0.0015  # BTC 现货偏移上限 0.15%
 
 # 订单参数
-GTD_LIFETIME_S=180       # GTD 有效期（必须 >= 180）
-SELL_SLIPPAGE_PCT=0.02   # 卖出滑点 2%
+GTD_LIFETIME_S=300       # GTD 有效期（CLOB 硬下限 180，客户端会钳制到 >=181）
+SELL_SLIPPAGE_PCT=0.02   # FAK 卖出滑点 2%
 T1_ENTRY_WINDOW_S=300    # T1 入场时间窗口（窗口开启后 5 分钟内）
+STARTUP_RECONCILE_CANCEL_ALL=true  # 启动时取消账户全部挂单；共享钱包请设为 false
 ```
 
 ---
@@ -83,12 +86,13 @@ T1_ENTRY_WINDOW_S=300    # T1 入场时间窗口（窗口开启后 5 分钟内�
 # 1. 安装依赖
 pip install -r requirements.txt
 
-# 2. 复制并编辑环境变量
-cp .env.example .env
+# 2. 复制并编辑环境变量（项目根目录的 .env 会被自动读取）
+cp .env.docker .env
 # 编辑 .env 填入 API Key
 
 # 3. 启动（必须先设置 .env）
 python -m src.main
+# 数据库默认写入 ./data/polymarket.db（可用 POLYMARKET_DB_PATH 覆盖）
 ```
 
 ---
@@ -125,25 +129,27 @@ Coolify 原生支持 Docker Compose。部署步骤：
 在 Coolify 的 Environment Variables 中添加：
 
 ```
-POLY_API_KEY=xxxxx
-POLY_API_SECRET=xxxxx
-POLY_API_PASSPHRASE=xxxxx
+API_KEY=xxxxx
+API_SECRET=xxxxx
+API_PASSPHRASE=xxxxx
 GAMMA_API=https://gamma-api.polymarket.com
 POLYMARKET_HOST=https://clob.polymarket.com
 POLYGON_RPC_URL=https://polygon-bor.publicnode.com
 TIER1_NOTIONAL=2.0
-TIER2_NOTIONAL=4.0
-TIER3_NOTIONAL=8.0
-# H-NEW-2026-07-12: entry cap 0.38, TP decrement 0.05.
-ENTRY_PRICE_CAP=0.38
-TIER2_DROP_PCT=0.30
-TIER3_DROP_PCT=0.60
+TIER2_NOTIONAL=3.0
+TIER3_NOTIONAL=5.0
+TIER4_NOTIONAL=6.0
+ENTRY_PRICE_CAP=0.40
+TIER2_DROP_PCT=0.20
+TIER3_DROP_PCT=0.40
+TIER4_DROP_PCT=0.60
 TP_PROFIT_PCT=0.20
-TP_DECREMENT_PCT=0.05
+TP_DECREMENT_PCT=0.03
 BASELINE_DRIFT_LIMIT=0.0015
 T1_ENTRY_WINDOW_S=300
-GTD_LIFETIME_S=180
+GTD_LIFETIME_S=300
 SELL_SLIPPAGE_PCT=0.02
+STARTUP_RECONCILE_CANCEL_ALL=true
 ```
 
 ### 3. 配置持久化
@@ -155,11 +161,12 @@ volumes:
   - polymarket_data:/app/data
 ```
 
-### 4. 健康检查
+### 4. 运行检查
 
-- 端口：8004（内部）
-- HTTP 路径：`/` 或 `/health`
+- 本服务**没有 HTTP 服务/健康检查端点**，不要配置 HTTP 探针
+- 容器端口：8034（仅用于与外部系统对齐，程序本身不监听端口）
 - 启动命令：`python -m src.main`
+- 存活判断：`docker logs` 中每 5 秒输出一行 `STATUS ...`
 
 ---
 
@@ -270,7 +277,7 @@ python -m src.main
 - [ ] 环境变量已填入 API Key
 - [ ] `GAMMA_API`、`POLYMARKET_HOST`、`POLYGON_RPC_URL` 已配置
 - [ ] 马丁格尔参数已调优
-- [ ] 端口 8004 已暴露
-- [ ] 数据目录 `/app/data` 已持久化
+- [ ] 端口 8034 已暴露（无 HTTP 服务，仅供编排系统占位）
+- [ ] 数据目录 `/app/data` 已持久化（数据库路径 `/app/data/polymarket.db`）
 - [ ] 日志正常输出（无 ERROR）
 - [ ] 看到 `engine.trigger_t1` 或等待 baseline 的日志

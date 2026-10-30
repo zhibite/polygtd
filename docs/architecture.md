@@ -36,8 +36,7 @@ polygtd/
 │   │   └── user_ws.py       # 用户订单 WebSocket
 │   │
 │   ├── feeds/              # 数据源
-│   │   ├── binance_trades.py  # Binance BTC/USDT 实时价格流（WS）
-│   │   └── binance_spot.py    # Binance BTC/USDT 现货（REST，K线回溯）
+│   │   └── binance_spot.py    # Binance BTC/USDT 现货（WS 实时流 + REST K线回溯）
 │   │
 │   ├── strategy/           # 策略层
 │   │   ├── engine.py       # 策略引擎（决策核心）
@@ -47,6 +46,7 @@ polygtd/
 │   ├── execution/          # 执行层
 │   │   ├── clob_client.py  # CLOB REST API 封装（py-clob-client-v2）
 │   │   ├── order_manager.py # 订单管理器（序列化，无 DRY_RUN）
+│   │   ├── tier_watcher.py # 单笔 GTD 生命周期/成交对账
 │   │   ├── gtd_expiry_watcher.py # GTD 过期检测
 │   │   └── heartbeat.py    # 心跳保活（10秒窗口）
 │   │
@@ -80,9 +80,9 @@ polygtd/
 ├─────────────────────────────────────────────────────────────────┤
 │  Step 3: 策略评估循环 (每价格tick触发)                          │
 │  ├── GateKeeper: 检查 BTC 漂移 ≤ 0.15%                        │
-│  ├── T1 入场: token 价格 ≤ 0.40 时买入                         │
-│  ├── TN 加仓: 下跌 20%/40%/60% 时分别加仓                      │
-│  └── 止盈: 持仓盈利 ≥ 20% 时卖出全部                           │
+│  ├── T1 入场: mid ≤ 0.44 时在 0.40 预挂 GTD BUY                │
+│  ├── TN 加仓: 相对 T1 实际成交均价跌 20/40/60% 时加仓          │
+│  └── 止盈: 达到 tp_target（20%, 逐层 −3%）时预挂 GTD SELL      │
 ├─────────────────────────────────────────────────────────────────┤
 │  回合结束                                                        │
 │  ├── 取消所有未成交订单                                          │
@@ -94,13 +94,13 @@ polygtd/
 
 | 层级 | 名义价值 | 触发条件 | 说明 |
 |------|---------|---------|------|
-| T1   | $2      | 价格 ≤ 0.40 且 GateKeeper PASS | 初始入场 |
-| T2   | $2      | 下跌 20% | 第一次加仓 |
-| T3   | $4      | 下跌 40% | 第二次加仓 |
-| T4   | $8      | 下跌 60% | 第三次加仓 |
-| TP   | 全部    | 盈利 20% | 止盈离场 |
+| T1   | $2      | mid ≤ 0.40×1.10 且 GateKeeper PASS | 初始入场（GTD 挂在 0.40） |
+| T2   | $3      | 相对 T1 成交均价下跌 20% | 第一次加仓 |
+| T3   | $5      | 相对 T1 成交均价下跌 40% | 第二次加仓 |
+| T4   | $6      | 相对 T1 成交均价下跌 60% | 第三次加仓 |
+| TP   | 全部    | 盈利 20% − N×3%（N=已成交加仓层数） | 止盈离场 |
 
-**最大风险暴露：** $2 + $2 + $4 + $8 = $16/回合
+**最大风险暴露：** $2 + $3 + $5 + $6 = $16/回合
 
 ### GateKeeper（漂移门控）
 
@@ -176,7 +176,7 @@ drift = |BTC_now - BTC_baseline| / BTC_baseline
 - 检测到边界切换时调用 `tick()` 发现新窗口市场，并触发回调 `on_new_round(round_start_ts)`
 - 窗口切换时：记录跨窗口 BTC 偏移、检测新窗口、更新价格
 
-### 2. BinanceFeed (binance_trades.py)
+### 2. BinanceFeed (binance_spot.py)
 
 **职责：** 订阅 Binance BTC/USDT 实时成交数据。
 
@@ -185,13 +185,17 @@ drift = |BTC_now - BTC_baseline| / BTC_baseline
 - `RingBuffer`: 时间边界 FIFO 缓冲区（默认保留 1200 秒）
 - `compute_baseline()`: 计算基准窗口的中位数价格
 
-### 3. MarketDiscovery (discovery.py)
+### 3. MarketService / PolymarketClient (market_service.py / pm_client.py)
 
 **职责：** 通过 Gamma REST API 发现 Polymarket 市场。
 
 **Slug 格式：** `btc-updown-15m-{round_start_ts}`
 
-**重试策略：** 最多 20 次重试，每次间隔 5-30 秒递增
+**校验：** 只接受窗口包含当前时间的市场；按 Gamma `outcomes` 字段
+映射 UP/DOWN token 顺序；同时拉取 `tick-size`。
+
+**重试策略：** WindowManager 在窗口内每 5 秒重试 discovery，直到拿到
+当前回合的市场（不再等到下一个 15 分钟边界）。
 
 ### 4. MarketWS (market_ws.py)
 
@@ -328,24 +332,25 @@ HEARTBEAT_S = 5
 
 ```bash
 # Polymarket API 凭证
-POLY_API_KEY=xxx
-POLY_API_SECRET=xxx
-POLY_API_PASSPHRASE=xxx
-POLY_WALLET_ADDRESS=xxx
+API_KEY=xxx
+API_SECRET=xxx
+API_PASSPHRASE=xxx
+WALLET_ADDRESS=xxx
 
-# 策略参数
-# H-NEW-2026-07-11-4: 3-tier cap. Notionals 2/4/8, drop thresholds 30% / 60%.
-# H-NEW-2026-07-11-5: entry cap 0.40→0.36, TP decrement 3%→5%.
+# 策略参数（四层马丁，最大暴露 2+3+5+6 = 16 USD）
 TIER1_NOTIONAL=2.0
-TIER2_NOTIONAL=4.0
-TIER3_NOTIONAL=8.0
-ENTRY_PRICE_CAP=0.38
-TIER2_DROP_PCT=0.30
-TIER3_DROP_PCT=0.60
+TIER2_NOTIONAL=3.0
+TIER3_NOTIONAL=5.0
+TIER4_NOTIONAL=6.0
+ENTRY_PRICE_CAP=0.40
+TIER2_DROP_PCT=0.20
+TIER3_DROP_PCT=0.40
+TIER4_DROP_PCT=0.60
 TP_PROFIT_PCT=0.20
-TP_DECREMENT_PCT=0.05
+TP_DECREMENT_PCT=0.03
+TP_MIN_PCT=0.05
 BASELINE_DRIFT_LIMIT=0.0015
-GTD_LIFETIME_S=180
+GTD_LIFETIME_S=300
 ```
 
 ---
@@ -370,13 +375,10 @@ GTD_LIFETIME_S=180
 - 记录 rounds、orders、fills 三个核心表
 - 支持重启后恢复未完成订单状态
 
-### 4. DRY_RUN 模式
+### 4. 实盘模式（无 DRY_RUN）
 
-```python
-DRY_RUN: bool = True  # 默认只打印，不实际下单
-```
-
-生产环境设为 `False` 启用真实交易。
+代码中已移除 DRY_RUN：所有订单直接发送到真实 CLOB。凭证缺失时
+CLOBClient 保持未配置状态，订单操作会失败而不是模拟成交。
 
 ### 5. 序列化订单操作
 
@@ -407,12 +409,10 @@ async with self._lock:  # asyncio.Lock 保证并发安全
 - 监控连接状态
 - 考虑添加本地价格告警
 
-### 4. UserWS 未集成
+### 4. UserWS 已集成
 
-代码中 `user_ws.py` 已实现但主流程未使用，无法接收真实订单事件反馈。建议后续集成以实现：
-- 实时订单状态同步
-- 部分成交处理
-- 订单确认事件
+`user_ws.py` 已在主流程中启动，订单 UPDATE / TRADE 事件会实时同步到
+OrderManager 与策略引擎；TierWatcher 作为 REST 兜底对账。
 
 ---
 
@@ -422,24 +422,20 @@ async with self._lock:  # asyncio.Lock 保证并发安全
 
 ```bash
 # 1. 安装依赖
-pip install -e .
+pip install -r requirements.txt
 
-# 2. 配置环境变量
-cp .env.example .env
+# 2. 配置环境变量（项目根目录 .env 会被自动读取）
+cp .env.docker .env
 # 编辑 .env 填入 Polymarket API 凭证
 
-# 3. 配置 config.toml
-# 根据需要调整参数
+# 3. 按需调整 config.toml / .env
 ```
 
 ### 启动命令
 
 ```bash
-# DRY_RUN 模式（默认）
+# 实盘启动（无 DRY_RUN）
 python -m src.main
-
-# 生产模式（实际下单）
-DRY_RUN=false python -m src.main
 ```
 
 ### 日志输出示例
@@ -468,7 +464,7 @@ INFO | engine.trigger_tp last_trade=0.46 tp_target=0.456 qty=10.5
 
 ## 扩展建议
 
-1. **集成 UserWS**: 实现完整的订单事件闭环
+1. **UserWS 已集成**: 订单 UPDATE / TRADE 事件闭环 + TierWatcher REST 兜底
 2. **Dashboard**: 添加 Web UI 展示实时状态
 3. **风险控制**: 添加每日亏损限额、连续亏损监控
 4. **通知**: 支持 Telegram/Discord 告警

@@ -10,6 +10,7 @@ __pycache__/
 htmlcov/
 
 # Database / runtime state
+data/
 polymarket.db
 polymarket.db-shm
 polymarket.db-wal

@@ -214,6 +214,14 @@ class TierWatcher:
         # always have size_matched ≥ 0, so the sentinel also doubles as
         # "no WS update received yet".
         self._last_size_matched: float = -1.0
+        # H-NEW-2026-10-30: authoritative per-order cumulative matched size
+        # observed from REST `get_order().size_matched` (or the WS UPDATE).
+        # Used for ALL terminal decisions. The wallet token balance must
+        # NEVER be used here: it is cumulative across every tier that bought
+        # the same outcome token (so T2+ would over-count), and for a SELL
+        # it *decreases* as the order fills (so `balance >= expected` would
+        # immediately declare an unfilled TP "filled").
+        self._last_observed_size_matched: float = 0.0
         # asyncio.Event used to wake the watch loop early when an UPDATE
         # arrives — without this we'd still poll at _poll_s cadence and
         # only notice the update on the next tick (worst case _poll_s).
@@ -299,12 +307,22 @@ class TierWatcher:
         the WS update arrived). The REST call gives us the authoritative
         average fill price so the position accumulates at the true cost basis.
         """
-        if self._avg_price_running is not None:
+        # `_avg_price_running` is a float initialised to 0.0, never None.
+        # The old `is not None` check made this method a permanent no-op,
+        # so WS fast-fills priced the position at the limit price instead
+        # of the real average.
+        if self._avg_price_running is not None and self._avg_price_running > 0:
             return
         fs = await self._read_fill_state()
         if not fs:
             return
-        self._last_size_matched = fs.get("size_matched", self._last_size_matched)
+        self._last_size_matched = max(
+            self._last_size_matched,
+            float(fs.get("size_matched", 0.0) or 0.0),
+        )
+        self._last_observed_size_matched = max(
+            self._last_observed_size_matched, self._last_size_matched
+        )
         avg = fs.get("avg_price", 0.0)
         if avg > 0:
             self._avg_price_running = avg
@@ -329,7 +347,12 @@ class TierWatcher:
                 side=self._side,
                 strategy_price=self._strategy_price,
                 expected_size=self._expected_size,
-                filled_qty=0.0,
+                # Report what we last observed so the router can still
+                # reconcile a partial fill that landed before the crash.
+                filled_qty=max(
+                    self._last_observed_size_matched,
+                    max(0.0, self._last_size_matched),
+                ),
                 cancel_sent=False,
                 error=str(exc),
             )
@@ -350,9 +373,8 @@ class TierWatcher:
         threshold. The only terminal conditions it emits are:
 
           - FILLED         — GTD fully matched (detected via WS UPDATE,
-                             spawn fast-path, or balance reaching
-                             expected_size)
-          - OVER_FILLED    — balance > expected_size (defensive)
+                             spawn fast-path, or per-order `size_matched`)
+          - OVER_FILLED    — per-order matched > expected_size (defensive)
           - EXPIRED        — GTD lifetime crossed
           - CANCELLED      — external cancel / round rollover
 
@@ -437,7 +459,7 @@ class TierWatcher:
                     cancel_sent=cancel_sent,
                     avg_fill_price=(
                         self._avg_price_running
-                        if self._avg_price_running is not None
+                        if self._avg_price_running and self._avg_price_running > 0
                         else self._strategy_price
                     ),
                     dedup_key=self._dedup_key(TierOutcome.FILLED),
@@ -454,20 +476,23 @@ class TierWatcher:
                 await self._fire_complete(self._result)
                 return
 
-            # 1) Read the ground-truth balance.
+            # 1) Read the wallet token balance. DIAGNOSTIC ONLY.
+            #
+            # The wallet balance is the total holding of this outcome token
+            # across every tier, and for a SELL it *decreases* as the order
+            # fills. Using it as "shares filled on this order" (the old
+            # behaviour) over-counts T2+ BUY tiers and makes an unfilled TP
+            # look instantly filled. Terminal decisions below use the
+            # per-order `size_matched` from `get_order` instead.
             balance = await self._read_balance()
             if balance is None:
-                # Transient error — wait for either the next poll_s tick
-                # OR an early wake from a WS UPDATE.
-                try:
-                    await asyncio.wait_for(
-                        self._update_event.wait(),
-                        timeout=self._poll_s,
-                    )
-                    self._update_event.clear()
-                except asyncio.TimeoutError:
-                    pass
-                continue
+                log.debug(
+                    "tier_watcher.balance_unavailable",
+                    server_id=self._server_order_id[:16],
+                    side=self._side,
+                    note="balance endpoint failed; per-order size_matched "
+                         "polling continues",
+                )
 
             # H-NEW-2026-07-12: continuous ground-truth reconciliation.
             #
@@ -476,29 +501,32 @@ class TierWatcher:
             # last push, fire `on_partial_fill(delta, avg_price)` so the
             # router can route the increment through the same
             # `om.apply_fill_event` + `eng.on_order_filled` path the WS
-            # TRADE channel uses. Falls back to `strategy_price` if the
-            # fill_state call transiently fails (price half is best-effort;
-            # the *delta* is what matters for reconciliation).
-            #
-            # Why balance alone isn't sufficient: balance is the token
-            # holding (shares of UP/DOWN), which can be polluted by other
-            # trades on the same token. size_matched is per-order, so the
-            # delta has a clean provenance.
+            # TRADE channel uses.
             #
             # Idempotency: `_last_pushed_size_matched` is monotonic; a
             # polling observation that is *not* strictly greater than
             # what we previously pushed (or what the WS already advanced)
             # is a no-op, which is exactly the dedup contract the WS path
-            # also obeys (line 757–779 in main.py `_make_fill_callback`).
-            await self._maybe_push_partial_fill(balance)
+            # also obeys (see `_make_fill_callback` in main.py).
+            await self._maybe_push_partial_fill(
+                balance if balance is not None else 0.0
+            )
 
-            # 2) Over-fill safety net (defensive — should not happen).
-            if balance > self._expected_size * 1.01 and self._side == "BUY":
+            observed = self._observed_size_matched()
+            avg_price = (
+                self._avg_price_running
+                if self._avg_price_running and self._avg_price_running > 0
+                else self._strategy_price
+            )
+
+            # 2) Over-fill safety net (defensive — should not happen for a
+            #    per-order cumulative).
+            if observed > self._expected_size * 1.01:
                 log.warning(
                     "tier_watcher.over_filled",
                     server_id=self._server_order_id[:16],
                     side=self._side,
-                    balance=balance,
+                    observed=observed,
                     expected=self._expected_size,
                 )
                 cancel_sent = await self._safe_cancel()
@@ -509,19 +537,16 @@ class TierWatcher:
                     side=self._side,
                     strategy_price=self._strategy_price,
                     expected_size=self._expected_size,
-                    filled_qty=balance,
+                    filled_qty=observed,
                     cancel_sent=cancel_sent,
-                    avg_fill_price=self._strategy_price,
+                    avg_fill_price=avg_price,
                     dedup_key=self._dedup_key(TierOutcome.OVER_FILLED),
                 )
                 await self._fire_complete(self._result)
                 return
 
             # 3) Fully matched — emit FILLED so position state finalises.
-            # H-NEW-2026-07-15: was `balance >= expected * fill_ratio`
-            # (which short-circuited at 90%). Now only fires on a true
-            # full fill. Mid-fill policy is owned by the strategy tick.
-            if balance + 1e-9 >= self._expected_size:
+            if observed + 1e-9 >= self._expected_size:
                 cancel_sent = await self._safe_cancel()
                 self._result = WatcherResult(
                     outcome=TierOutcome.FILLED,
@@ -530,16 +555,17 @@ class TierWatcher:
                     side=self._side,
                     strategy_price=self._strategy_price,
                     expected_size=self._expected_size,
-                    filled_qty=balance,
+                    filled_qty=observed,
                     cancel_sent=cancel_sent,
-                    avg_fill_price=self._strategy_price,
+                    avg_fill_price=avg_price,
                     dedup_key=self._dedup_key(TierOutcome.FILLED),
                 )
                 log.info(
                     "tier_watcher.filled",
                     server_id=self._server_order_id[:16],
                     side=self._side,
-                    balance=balance,
+                    observed=observed,
+                    wallet_balance=balance,
                     expected=self._expected_size,
                     cancel_sent=cancel_sent,
                 )
@@ -559,18 +585,19 @@ class TierWatcher:
                     side=self._side,
                     strategy_price=self._strategy_price,
                     expected_size=self._expected_size,
-                    filled_qty=balance,
+                    filled_qty=observed,
                     cancel_sent=cancel_sent,
-                    avg_fill_price=self._strategy_price,
+                    avg_fill_price=avg_price,
                     dedup_key=self._dedup_key(TierOutcome.EXPIRED),
                 )
                 log.info(
                     "tier_watcher.expired",
                     server_id=self._server_order_id[:16],
                     side=self._side,
-                    balance=balance,
+                    observed=observed,
+                    wallet_balance=balance,
                     expected=self._expected_size,
-                    lifetime_s=int(self._expires_at - now),
+                    lifetime_remaining_s=int(self._expires_at - now),
                 )
                 await self._fire_complete(self._result)
                 return
@@ -612,6 +639,19 @@ class TierWatcher:
         fast-path / balance-path branch fires first.
         """
         return f"{self._server_order_id}|{outcome.value}"
+
+    def _observed_size_matched(self) -> float:
+        """Authoritative per-order cumulative matched shares.
+
+        Combines the latest REST `size_matched` observation with any WS
+        UPDATE value. Never uses the wallet token balance — see the module
+        docstring and the P0-6 audit note.
+        """
+        return max(
+            0.0,
+            self._last_observed_size_matched,
+            self._last_size_matched,
+        )
 
     async def _read_balance(self) -> Optional[float]:
         try:
@@ -731,6 +771,15 @@ class TierWatcher:
         avg_price = float(fill_state.get("avg_price", 0.0) or 0.0)
         if avg_price > 0:
             self._avg_price_running = avg_price
+
+        # Record the observation for terminal decisions. This happens even
+        # if the callback below raises: the CLOB fact is still true, and
+        # the router's terminal reconciliation self-heals bookkeeping.
+        self._last_observed_size_matched = max(
+            self._last_observed_size_matched,
+            size_matched,
+            self._last_size_matched,
+        )
 
         if not self._partial_filling_initialised:
             # First observation: prime the deduper with the CLOB high-water

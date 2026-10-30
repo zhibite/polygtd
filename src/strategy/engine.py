@@ -13,10 +13,9 @@ This ensures a tier cannot be triggered twice.
 """
 from __future__ import annotations
 
-import asyncio
 import time
 from dataclasses import dataclass
-from typing import Callable, Literal, Protocol
+from typing import Literal, Protocol
 
 from src.config import strategy as _s
 from src.feeds.binance_spot import BinanceCache
@@ -24,7 +23,6 @@ from src.market.models import MarketInfo
 from src.market.market_ws import PriceCache
 from src.strategy.gatekeeper import GateKeeper
 from src.strategy.round_state import (
-    Position,
     PositionSnapshot,
     RoundState,
     TierSnapshot,
@@ -32,6 +30,14 @@ from src.strategy.round_state import (
 from src.infra.logging import get_logger
 
 log = get_logger(__name__)
+
+
+def _ts(value) -> float:
+    """Coerce an optional timestamp to float (test stubs may be MagicMock)."""
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +391,47 @@ class StrategyEngine:
             self._round.binance_baseline = baseline
         log.info("engine.baseline_set", baseline=baseline, prev_baseline=prev_baseline)
 
+    def attach_market(self, market: MarketInfo | None) -> None:
+        """Late-bind market metadata discovered after the round started.
+
+        WindowManager can fail to discover the new round's market exactly
+        at the boundary (Gamma lag / transient error) and retries a few
+        seconds later. `on_new_round` then creates the RoundState with
+        `market=None`; this method fills in the token ids once discovery
+        succeeds, so the engine can still trade the current window instead
+        of idling until the next 15-minute boundary.
+        """
+        if self._round is None or market is None:
+            return
+        rs = self._round
+        if rs.up_token:
+            # Already bound (normal path) — keep the first market.
+            return
+        if market.round_start_ts and market.round_start_ts != rs.round_start_ts:
+            log.warning(
+                "engine.attach_market.round_mismatch",
+                engine_round_start_ts=rs.round_start_ts,
+                market_round_start_ts=market.round_start_ts,
+                slug=market.slug or "",
+            )
+            return
+        rs.market = market
+        rs.slug = market.slug
+        rs.condition_id = market.condition_id
+        rs.up_token = market.up_token
+        rs.down_token = market.down_token
+        rs.tick_size = market.tick_size
+        if getattr(market, "btc_spot_at_window_open", 0.0) > 0:
+            self.set_binance_baseline(float(market.btc_spot_at_window_open))
+        log.info(
+            "engine.market_attached",
+            round_start_ts=rs.round_start_ts,
+            slug=market.slug or "",
+            condition_id=(market.condition_id or "")[:16],
+            up_token=(market.up_token or "")[:16],
+            down_token=(market.down_token or "")[:16],
+        )
+
     async def on_round_end(self) -> None:
         """Called at round close.
 
@@ -572,7 +619,20 @@ class StrategyEngine:
         """
         if not self._round:
             return
-        for tier in self._round.position.tiers:
+        pos = self._round.position
+        # TP SELL orders are tracked in `_tp_snapshots`, not in the BUY
+        # tier slots. Close the snapshot so `has_open_tp_orders` releases
+        # and a future TP can be posted (otherwise the round wedges).
+        if pos.tp_size_sold(server_order_id) is not None:
+            pos.close_tp_order(server_order_id)
+            log.info(
+                "engine.tp_order_cancelled",
+                server_order_id=server_order_id[:16],
+                reason=reason,
+                total_qty=pos.total_qty,
+            )
+            return
+        for tier in pos.tiers:
             if tier.server_order_id == server_order_id:
                 tier.placed = False
                 tier.server_order_id = None
@@ -631,6 +691,10 @@ class StrategyEngine:
         t.server_order_id = server_order_id
         t.token_id = token_id
         t.expires_at = expires_at
+        # A successful placement clears any post-failure backoff.
+        t.retry_after_ts = 0.0
+        if tier == 1:
+            self._round.position.t1_retry_after_ts = 0.0
         if placed_size is not None and placed_size > 0:
             # Re-posts after a partial fill only reserve the remaining shares.
             # Keep size_expected cumulative so is_complete still represents the
@@ -669,6 +733,10 @@ class StrategyEngine:
         """
         if not self._round or not self._gate:
             return
+        if getattr(self._round, "skip_reason", None):
+            # Window pre-check (late boot / cross-window BTC gap) — do not
+            # open or average any position this round.
+            return
 
         # Single-flight: drop re-entry rather than queue it. The next tick
         # will pick up the new state and call _evaluate again.
@@ -703,8 +771,15 @@ class StrategyEngine:
                 self._round.gate_last_state = new_state
                 log.info("engine.gate", drift=gate_state.drift, state=new_state)
 
-            if not gate_state.within_limit:
-                return  # drift out of bounds — no new orders
+            # NOTE: do NOT early-return on drift here. Each decision path
+            # enforces the gate itself:
+            #   * T1 entry   -> GateKeeper.can_enter() (drift + price cap)
+            #   * averaging  -> can_double_down() (documented drift bypass
+            #                   once the next-tier trigger is reached)
+            #   * TP posting -> can_act()
+            # The old early-return made the averaging bypass unreachable and
+            # froze the cancel sweep / TP-retreat cancel during any drift
+            # spike, leaving stale GTDs on the book.
 
             pos = self._round.position
             # H-NEW-2026-07-15 tick-driven refactor: compute a single
@@ -788,6 +863,9 @@ class StrategyEngine:
                 tier = pos.tiers[tier_idx]
                 if not tier.placed or tier.is_complete:
                     continue
+                # Cancel-failure backoff (set by the router).
+                if time.time() < _ts(getattr(tier, "cancel_retry_after_ts", 0.0)):
+                    continue
                 # H-NEW-2026-07-15 (audit follow-up): single-flight guard.
                 # Don't re-emit Cancel if a previous dispatch hasn't been
                 # resolved yet. Clearing happens in the router after
@@ -818,6 +896,8 @@ class StrategyEngine:
                 and not tier1.is_complete
                 and tier1.server_order_id
                 and not tier1.cancel_pending
+                and time.time()
+                >= _ts(getattr(tier1, "cancel_retry_after_ts", 0.0))
             ):
                 tier1.cancel_pending = True
                 log.info(
@@ -845,6 +925,9 @@ class StrategyEngine:
         for tier_idx in range(0, 3):
             tier = pos.tiers[tier_idx]
             if not tier.placed or tier.is_complete:
+                continue
+            # Cancel-failure backoff (set by the router).
+            if time.time() < _ts(getattr(tier, "cancel_retry_after_ts", 0.0)):
                 continue
             # H-NEW-2026-07-15 (audit follow-up): single-flight guard.
             if tier.cancel_pending:
@@ -915,6 +998,9 @@ class StrategyEngine:
             snap = pos.snapshot()
         if snap.entry_token is not None:
             return  # already entered
+        # Post-failure backoff (set by the router when a T1 POST fails).
+        if time.time() < _ts(getattr(pos, "t1_retry_after_ts", 0.0)):
+            return
 
         s = self._s
         up_tok = self._round.up_token
@@ -934,6 +1020,23 @@ class StrategyEngine:
         strategy_price = float(s.ENTRY_PRICE_CAP)
         # Fire when mid has dropped to (or below) strategy_price * (1 + margin).
         trigger_line = strategy_price * (1.0 + margin)
+
+        # CLOB minimum order size is 5 shares. Catch a misconfigured
+        # TIER1_NOTIONAL here instead of POSTing a guaranteed rejection on
+        # every 250 ms tick.
+        min_shares = 5.0
+        if (
+            strategy_price > 0
+            and s.TIER1_NOTIONAL / strategy_price < min_shares - 1e-9
+        ):
+            self._t1_skip_log(
+                "engine.t1_skip_below_min_size",
+                side="BOTH",
+                notional=s.TIER1_NOTIONAL,
+                strategy_price=strategy_price,
+                min_shares=min_shares,
+            )
+            return
 
         for side, token in [("UP", up_tok), ("DOWN", down_tok)]:
             mid_price = self._pc.get_midpoint(token)
@@ -1222,6 +1325,11 @@ class StrategyEngine:
                 tier.placed = False
                 tier.expires_at = 0.0
 
+            # Post-failure backoff (set by the router when this tier's POST
+            # is rejected). Prevents a 4 Hz POST/retry loop.
+            if time.time() < _ts(getattr(tier, "retry_after_ts", 0.0)):
+                continue
+
             strategy_price = tier.trigger_price(t1_entry)
             if strategy_price is None:
                 # H-NEW-2026-07-11 (audit v6-12): was silent. Should never
@@ -1266,14 +1374,39 @@ class StrategyEngine:
                 )
                 continue
 
-            # H-NEW-2026-07-15 (tick-driven refactor): the per-tier
-            # notional-remaining cap is removed. Under the new model only
-            # ONE GTD is ever on the book per (round, tier) — the
-            # ActionRouter's `_spawn_tier_watcher` rejects double-spawns
-            # at the same key, and the strategy tick cancels the existing
-            # GTD before placing the next tier's. We therefore trust
-            # `tier.notional` directly: no mid-flight USD budget check.
-            order_notional = tier.notional
+            # Budget for THIS placement = the tier's planned USD minus what
+            # has already been filled on it. This is the invariant that makes
+            # re-arms after a partial fill/cancel safe: a tier can never
+            # spend more than its configured notional in total.
+            #
+            # (The old code always used the full `tier.notional`, so a tier
+            # that partially filled, got cancelled, and later re-armed could
+            # spend ~1.5-2x its budget.)
+            order_notional = max(0.0, tier.notional - tier.cost_filled)
+            if order_notional <= 1e-9:
+                self._tN_skip_log(
+                    "engine.tN_skip_budget_exhausted",
+                    tier=tier.tier,
+                    planned=tier.notional,
+                    spent=tier.cost_filled,
+                )
+                continue
+
+            # CLOB rejects orders below 5 shares. Catch it here so we do not
+            # POST a guaranteed rejection on every tick.
+            min_shares = 5.0
+            if (
+                strategy_price > 0
+                and order_notional / strategy_price < min_shares - 1e-9
+            ):
+                self._tN_skip_log(
+                    "engine.tN_skip_below_min_size",
+                    tier=tier.tier,
+                    notional=order_notional,
+                    strategy_price=strategy_price,
+                    min_shares=min_shares,
+                )
+                continue
 
             if pos.stake_cap_remaining < order_notional:
                 log.debug(
@@ -1402,8 +1535,6 @@ class StrategyEngine:
         last_err = getattr(self, "_tp_last_post_error_ts", 0.0) or 0.0
         backoff = getattr(self, "_tp_backoff_s", 5.0) or 5.0
         now = time.time()
-        if last_err > 0.0 and now - last_err < backoff:
-            return
 
         # H-NEW-2026-07-12 (P0-1 fix per prod window 1783818900): when the
         # bot was stuck in TP-POST-error backoff for 60s, the price often
@@ -1438,11 +1569,11 @@ class StrategyEngine:
                         # `trigger_tp`). Reset both as an atomic
                         # state-machine transition.
                         prev_inflight = bool(pos._tp_inflight)
-                        prev_tp_sid = (
-                            snap.tp_server_order_id
-                            if hasattr(snap, "tp_server_order_id")
-                            else None
-                        )
+                        # `tp_server_order_id` resolves from the open TP
+                        # snapshot now (partial fills clear `_tp_inflight`
+                        # while the GTD is still live), so this is the
+                        # authoritative live TP order id.
+                        prev_tp_sid = snap.tp_server_order_id
                         if prev_inflight:
                             pos._tp_inflight = False
                         if getattr(self, "_tp_post_failure_count", 0) > 0 or prev_inflight:
@@ -1471,7 +1602,11 @@ class StrategyEngine:
                         # sentinel meaning "this is a TP GTD, not a BUY
                         # tier"; on its way out it releases `_tp_inflight`
                         # so the next tick can re-evaluate cleanly.
-                        if prev_inflight and prev_tp_sid:
+                        if (
+                            prev_tp_sid
+                            and time.time()
+                            >= _ts(getattr(pos, "tp_cancel_retry_after_ts", 0.0))
+                        ):
                             try:
                                 await self._handler(ActionCancelTier(
                                     tier=-1,               # sentinel for TP GTD
@@ -1492,7 +1627,20 @@ class StrategyEngine:
                                 )
                         return
 
+        # Backoff gate (AFTER the mid-retreat check above, so a live TP
+        # GTD can still be cancelled while a retry is backing off).
+        if last_err > 0.0 and now - last_err < backoff:
+            return
+
         if snap.tp_inflight:
+            return
+
+        # A registered TP GTD may still be live on the CLOB even after a
+        # partial fill cleared `_tp_inflight` (record_tp_fill releases the
+        # mutex for re-arming). Posting a second TP for the residual while
+        # the first order still has shares reserved would oversell the
+        # position. Wait for the watcher/cancel path to close the snapshot.
+        if getattr(pos, "has_open_tp_orders", False):
             return
 
         # H-V5-1 fix: TP must wait for any in-flight averaging tier to settle.

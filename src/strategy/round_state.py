@@ -16,7 +16,6 @@ from typing import TYPE_CHECKING, Literal
 
 from src.config import strategy as _s
 from src.infra.logging import get_logger
-from src.infra.logging import get_logger
 
 if TYPE_CHECKING:
     from src.market.models import MarketInfo
@@ -91,6 +90,15 @@ class TierSnapshot:
     # router clears it after `om.cancel_by_server_id` resolves. The
     # engine skips re-emit when this flag is True.
     cancel_pending: bool = False
+    # Post-failure backoff: the strategy tick will not attempt to place this
+    # tier again before this Unix timestamp. Without it, a rejected POST
+    # (CLOB error / min-size / verification failure) is retried every
+    # 250 ms tick, producing an order-spam loop.
+    retry_after_ts: float = 0.0
+    # Cancel-failure backoff: don't re-issue a cancel every 250 ms tick when
+    # the CLOB keeps rejecting it. The slot stays reserved (placed=True)
+    # until a cancel is confirmed or the order expires.
+    cancel_retry_after_ts: float = 0.0
     # Optional: id of the spawned TierWatcher task (for diagnostics only).
     watcher_task: object | None = None
 
@@ -306,6 +314,11 @@ class Position:
     # landed, whether that fill is the TP itself or residual positioning).
     _tp_inflight: bool = False
     _last_qty_signature: float = 0.0
+    # Same post-failure backoff as TierSnapshot, for the T1 entry.
+    t1_retry_after_ts: float = 0.0
+    # Cancel-failure backoff for the TP GTD (avoids a cancel storm when the
+    # CLOB keeps rejecting the cancel).
+    tp_cancel_retry_after_ts: float = 0.0
 
     # In-flight TP sells keyed by server_order_id. Lets engine.on_order_filled
     # match a SELL fill back to a specific sell order so it can:
@@ -424,12 +437,40 @@ class Position:
         this picks the latest registered TP when multiple are stacked
         (defensive — current model only ever has one in flight).
         """
-        if not self._tp_inflight or not self._tp_snapshots:
+        if not self._tp_snapshots:
             return None
         for sid, snap in reversed(list(self._tp_snapshots.items())):
             if snap.size_sold + 1e-9 < snap.target_qty:
                 return sid
         return None
+
+    @property
+    def has_open_tp_orders(self) -> bool:
+        """True while a registered TP SELL may still be live on the CLOB.
+
+        Snapshots are removed by `close_tp_order()` when the TP watcher
+        reports a terminal state (or the order is confirmed cancelled).
+        Until then, the engine must not post a second TP GTD: the first
+        one still has unfilled shares reserved at the same price.
+        """
+        return self._resolve_inflight_tp_server_id() is not None
+
+    def tp_size_sold(self, server_order_id: str) -> float | None:
+        """Cumulative shares already booked for a TP order.
+
+        Returns None when the snapshot no longer exists (the order was
+        fully accounted for and closed). Used by the terminal watcher
+        callback to apply only the delta it has not already booked.
+        """
+        snap = self._tp_snapshots.get(server_order_id)
+        return snap.size_sold if snap is not None else None
+
+    def close_tp_order(self, server_order_id: str) -> None:
+        """Drop a TP snapshot after its order reached a terminal state."""
+        if not server_order_id:
+            return
+        self._tp_snapshots.pop(server_order_id, None)
+        self._tp_inflight = False
 
     @property
     def stake_cap_remaining(self) -> float:
@@ -793,11 +834,6 @@ class Position:
     _applied_watcher_dedup: set[tuple[str, str]] = field(default_factory=set)
     _DEDUP_SOFT_LIMIT: int = 8
 
-    @property
-    def tiers(self) -> list[TierSnapshot]:
-        return [self.tier1, self.tier2, self.tier3, self.tier4]
-
-
     def apply_tier_watcher_result(
         self,
         tier: TierSnapshot,
@@ -955,68 +991,9 @@ class Position:
                         note="T1 GTD partially filled before expiry; "
                              "rebasing T2+ trigger lines to realised avg",
                     )
-            elif outcome == TierOutcome.CROSSED.value:
-                # Cancel because mid dropped into the next tier's zone. The
-                # next tier watcher will fire from the next _evaluate tick.
-                #
-                # H-NEW-2026-07-11 (audit v6-12): symmetric with EXPIRED —
-                # partial fills before the cross-cancel must still anchor the
-                # realised baseline. Previously this branch was a silent `pass`,
-                # which is exactly the path that fired for the 2026-07-11
-                # 11:15 incident (mid dropped past the T2 fire line while T1
-                # GTD was still live, watcher cancel-with-CROSSED outcome, no
-                # baseline anchor written).
-                if (
-                    tier.tier == 1
-                    and tier.size_filled > 1e-9
-                    and not self.baseline_set_realized
-                ):
-                    new_realized = tier.cost_filled / tier.size_filled
-                    self.baseline_realized_price = new_realized
-                    self.baseline_set_realized = True
-                    log.info(
-                        "position.baseline_anchored_on_cross",
-                        tier=tier.tier,
-                        missed=tier.size_filled,
-                        fill_px=avg_fill_price,
-                        new_realized=new_realized,
-                        note="T1 GTD had partial fills before mid crossed "
-                             "into next-tier zone; rebasing T2+ trigger "
-                             "lines to realised avg",
-                    )
-
-                # H-NEW-2026-07-11 (audit v6-14): CROSSED must release the
-                # in-flight mutex for downstream strategy decisions.
-                #
-                # Production symptom (2026-07-11 13:32 round): when T2 BUY
-                # crossed into T3's zone and the watcher fell back to the
-                # CROSSED outcome, `tier.placed` stayed True forever. That
-                # made `position.has_inflight_tier` permanently True, so
-                # `_check_take_profit` would never fire even when mid moved
-                # back above `tp_target * (1 - margin)`. The position bled
-                # uPnL with no TP SELL ever posted.
-                #
-                # Without this reset, any averaging tier that crosses
-                # without filling deadlocks the take-profit path for the
-                # rest of the round. We keep `filled=False` to avoid
-                # double-counting with any post-cross on-chain fill that
-                # the WS path might still deliver, but we MUST release
-                # the placed mutex so TP / next-tier decisions can advance.
-                #
-                # Server_order_id is preserved intentionally — it lets
-                # late-arriving user_ws TRADE events still attribute fills
-                # to this tier for the M-2 dedupe / record_fill path.
-                tier.placed = False
-                log.info(
-                    "position.tier_cleared_after_cross",
-                    tier=tier.tier,
-                    server_order_id=tier.server_order_id[:16] if tier.server_order_id else None,
-                    note="tier.placed reset to False so downstream checks "
-                         "(has_inflight_tier / TP gating) release this slot",
-                )
             elif outcome in (TierOutcome.CANCELLED.value, TierOutcome.ERROR.value):
-                # External / unexpected — keep partial fills, close out.
-                # Same partial-fill baseline anchoring as EXPIRED/CROSSED.
+                # External cancel / watcher crash — keep partial fills, close
+                # out. Same partial-fill baseline anchoring as EXPIRED.
                 if (
                     tier.tier == 1
                     and tier.size_filled > 1e-9
@@ -1032,6 +1009,20 @@ class Position:
                         fill_px=avg_fill_price,
                         new_realized=new_realized,
                     )
+                # Release the in-flight slot. We keep `filled=False` so a
+                # late on-chain fill is still counted via record_fill, and
+                # keep server_order_id so it can still be attributed.
+                tier.placed = False
+                log.info(
+                    "position.tier_cleared_after_cancel",
+                    tier=tier.tier,
+                    server_order_id=(
+                        tier.server_order_id[:16] if tier.server_order_id else None
+                    ),
+                    outcome=outcome,
+                    note="tier.placed reset so downstream checks "
+                         "(has_inflight_tier / TP gating) release this slot",
+                )
 
             log.info(
                 "position.tier_watcher_done",
@@ -1130,6 +1121,10 @@ class RoundState:
 
     position: Position = field(default_factory=Position)
     finished: bool = False
+    # Set by main._on_new_round when the window pre-check (late boot /
+    # cross-window BTC gap) says "do not trade this round". The engine
+    # still runs housekeeping/cancels but never opens a position.
+    skip_reason: str | None = None
     binance_baseline: float | None = None
     gate_last_state: str = ""
 

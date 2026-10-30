@@ -119,41 +119,103 @@ class PolymarketClient:
                         continue
                     for m in ev.get("markets", []):
                         raw_ids = m.get("clobTokenIds") or "[]"
-                        try:
-                            token_ids = json.loads(raw_ids)
-                        except Exception:
+                        if isinstance(raw_ids, list):
+                            token_ids = raw_ids
+                        else:
+                            try:
+                                token_ids = json.loads(raw_ids)
+                            except Exception:
+                                token_ids = []
+                        if not isinstance(token_ids, list):
                             token_ids = []
 
                         raw_prices = m.get("outcomePrices") or '["0.5", "0.5"]'
-                        try:
-                            prices = json.loads(raw_prices)
-                        except Exception:
-                            prices = ["0.5", "0.5"]
+                        if isinstance(raw_prices, list):
+                            prices = raw_prices
+                        else:
+                            try:
+                                prices = json.loads(raw_prices)
+                            except Exception:
+                                prices = ["0.5", "0.5"]
+                        if not isinstance(prices, list):
+                            prices = []
 
-                        m["tokens"] = [
-                            {
-                                "token_id": token_ids[0] if len(token_ids) > 0 else "",
-                                "outcome": "Up",
-                                "price": prices[0] if prices else "0.5",
-                            },
-                            {
-                                "token_id": token_ids[1] if len(token_ids) > 1 else "",
-                                "outcome": "Down",
-                                "price": prices[1] if len(prices) > 1 else "0.5",
-                            },
-                        ]
-
-                        outcomes = [t.get("outcome", "").lower() for t in m["tokens"]]
-                        if outcomes[0] != "up" or outcomes[1] != "down":
+                        if len(token_ids) < 2:
                             log.warning(
-                                "get_asset_updown_markets unexpected outcome order",
-                                asset=asset, outcomes=outcomes,
+                                "get_asset_updown_markets missing token ids",
+                                asset=asset, slug=ev.get("slug", ""),
+                                token_count=len(token_ids),
                             )
                             continue
 
+                        # The previous code hard-coded outcome labels to
+                        # "Up"/"Down" and then "validated" them against
+                        # itself — a vacuous check. Read the real Gamma
+                        # `outcomes` array and map token/price indices from
+                        # it, so a server-side reorder cannot silently make
+                        # the bot buy the wrong side.
+                        raw_outcomes = m.get("outcomes")
+                        if isinstance(raw_outcomes, str):
+                            try:
+                                outcome_list = json.loads(raw_outcomes)
+                            except Exception:
+                                outcome_list = []
+                        elif isinstance(raw_outcomes, list):
+                            outcome_list = raw_outcomes
+                        else:
+                            outcome_list = []
+
+                        def _outcome_index(label: str) -> Optional[int]:
+                            aliases = ("up", "yes") if label == "up" else ("down", "no")
+                            for idx, outcome in enumerate(outcome_list):
+                                if str(outcome).strip().lower() in aliases:
+                                    return idx
+                            return None
+
+                        idx_up = _outcome_index("up")
+                        idx_down = _outcome_index("down")
+                        if idx_up is None or idx_down is None:
+                            if outcome_list:
+                                log.warning(
+                                    "get_asset_updown_markets unexpected outcomes",
+                                    asset=asset,
+                                    slug=ev.get("slug", ""),
+                                    outcomes=outcome_list,
+                                )
+                                continue
+                            # Gamma omitted `outcomes` entirely: fall back to
+                            # the historical positional order, but surface it.
+                            log.warning(
+                                "get_asset_updown_markets outcomes missing",
+                                asset=asset,
+                                slug=ev.get("slug", ""),
+                                note="assuming clobTokenIds[0]=Up, [1]=Down",
+                            )
+                            idx_up, idx_down = 0, 1
+
+                        def _price_at(idx: int) -> float:
+                            if idx >= len(prices):
+                                return 0.5
+                            try:
+                                return float(prices[idx])
+                            except (TypeError, ValueError):
+                                return 0.5
+
+                        m["tokens"] = [
+                            {
+                                "token_id": token_ids[idx_up],
+                                "outcome": "Up",
+                                "price": str(_price_at(idx_up)),
+                            },
+                            {
+                                "token_id": token_ids[idx_down],
+                                "outcome": "Down",
+                                "price": str(_price_at(idx_down)),
+                            },
+                        ]
                         m["_event_slug"] = ev.get("slug", "")
-                        m["_up_price"] = float(prices[0]) if prices else 0.5
-                        m["_down_price"] = float(prices[1]) if len(prices) > 1 else 0.5
+                        m["_up_price"] = _price_at(idx_up)
+                        m["_down_price"] = _price_at(idx_down)
                         m["_neg_risk"] = False
                         markets.append(m)
                 if not markets and asset:
@@ -181,53 +243,6 @@ class PolymarketClient:
             return None
 
     # ── CLOB price data ─────────────────────────────────────────────────────────
-
-    async def get_midpoint(self, token_id: str) -> float:
-        """Get current midpoint price for a token from CLOB."""
-        c = await self._client()
-        resp = await c.get(
-            f"{self.settings.polymarket_host}/midpoint",
-            params={"token_id": token_id},
-            timeout=3.0,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return float(data.get("mid", 0.0))
-
-    async def get_last_trade_prices_batch(
-        self, token_ids: list[str]
-    ) -> dict[str, float]:
-        """
-        Batch fetch last trade prices for tokens.
-        Polymarket CLOB: GET /last-trades-prices?token_ids=id1,id2,...
-        Returns: {token_id: price}
-        """
-        if not token_ids:
-            return {}
-        c = await self._client()
-        resp = await c.get(
-            f"{self.settings.polymarket_host}/last-trades-prices",
-            params={"token_ids": ",".join(token_ids)},
-            timeout=3.0,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        out: dict[str, float] = {}
-        if not isinstance(data, list):
-            return out
-        for entry in data:
-            if not isinstance(entry, dict):
-                continue
-            tid = entry.get("token_id") or entry.get("asset_id")
-            if not tid or tid not in token_ids:
-                continue
-            try:
-                out[tid] = float(entry.get("price", 0.0))
-            except (TypeError, ValueError):
-                continue
-        for tid in token_ids:
-            out.setdefault(tid, 0.0)
-        return out
 
     async def get_order_book(self, token_id: str) -> Optional[dict]:
         """
@@ -281,13 +296,33 @@ class PolymarketClient:
             )
             resp.raise_for_status()
             data = resp.json()
-            result = {}
+            result: dict[str, float] = {}
+            # The endpoint has returned both shapes across deployments:
+            #   {"<token_id>": "0.53", ...}  (dict)
+            #   [{"token_id": "...", "price": "0.53"}, ...]  (list)
+            # Support both; the previous duplicate definitions only handled
+            # one shape each, and the surviving one assumed a dict.
             if isinstance(data, dict):
                 for tid, price_val in data.items():
+                    if tid not in token_ids:
+                        continue
                     try:
                         result[tid] = float(price_val)
                     except (TypeError, ValueError):
                         result[tid] = 0.0
+            elif isinstance(data, list):
+                for entry in data:
+                    if not isinstance(entry, dict):
+                        continue
+                    tid = entry.get("token_id") or entry.get("asset_id")
+                    if not tid or tid not in token_ids:
+                        continue
+                    try:
+                        result[tid] = float(entry.get("price", 0.0))
+                    except (TypeError, ValueError):
+                        result[tid] = 0.0
+            for tid in token_ids:
+                result.setdefault(tid, 0.0)
             return result
         except Exception:
             return {tid: 0.0 for tid in token_ids}

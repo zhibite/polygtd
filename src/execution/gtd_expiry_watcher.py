@@ -22,7 +22,6 @@ from dataclasses import dataclass
 
 from src.execution.order_manager import OrderManager
 from src.infra.logging import get_logger
-from src.strategy.round_state import RoundState
 
 log = get_logger(__name__)
 

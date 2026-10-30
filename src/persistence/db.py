@@ -7,9 +7,8 @@ Schema:
 """
 from __future__ import annotations
 
+import os
 import sqlite3
-import threading
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -17,7 +16,14 @@ from src.infra.logging import get_logger
 
 log = get_logger(__name__)
 
-_DB_PATH = Path(__file__).parent.parent.parent / "polymarket.db"
+# Runtime data lives under <project>/data by default. In Docker that path is
+# /app/data, which is the volume mounted by docker-compose, so the DB survives
+# container recreation. Both env overrides are available for custom layouts.
+_DATA_DIR = Path(
+    os.getenv("POLYMARKET_DATA_DIR")
+    or (Path(__file__).parent.parent.parent / "data")
+)
+_DB_PATH = Path(os.getenv("POLYMARKET_DB_PATH") or (_DATA_DIR / "polymarket.db"))
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +80,8 @@ CREATE TABLE IF NOT EXISTS fills (
 # ---------------------------------------------------------------------------
 
 def init_db(db_path: Path = _DB_PATH) -> sqlite3.Connection:
+    db_path = Path(db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
