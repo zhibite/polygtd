@@ -152,10 +152,16 @@ def build_status(state: Any) -> dict[str, Any]:
         except Exception:
             orders = []
 
+    ks = getattr(state, "killswitch", None)
     now_ts = int(time.time())
     return {
         "server_time": now_ts,
         "asset": "BTC",
+        "killswitch": {
+            "active": bool(getattr(ks, "active", False)),
+            "since": getattr(ks, "since", 0.0) or None,
+            "reason": getattr(ks, "reason", "") or None,
+        },
         "round_start_ts": getattr(rs, "round_start_ts", None),
         "slug": getattr(rs, "slug", None) or getattr(mkt, "slug", None),
         "condition_id": getattr(mkt, "condition_id", None),

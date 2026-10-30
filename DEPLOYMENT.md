@@ -225,6 +225,25 @@ Coolify 中将 `polygtd.bquant.com` 指向本服务的 **8010** 端口即可；
   也要求登录会话（无密码时无法登录，页面会提示先配置 `WEB_PASSWORD`）
 - 登录入口：`/login`；导航栏右上角会显示当前用户和「退出」
 
+### 7. 紧急停止 / 恢复运行
+
+控制台顶部有「紧急停止」按钮（必须登录，公开看板下按钮会置灰）：
+
+- 立即冻结开仓 / 补仓 / 止盈：`StrategyEngine._evaluate` 直接返回
+- 撤销所有未成交挂单，并停止 TierWatcher
+- `OrderManager` 在所有 `place_*` 入口再次拦截，停止瞬间已在途的动作不会下单
+- **不会自动卖出已有持仓**——紧急停止只停止新订单，平仓由人工决定
+- 状态写入 `/app/data/emergency_stop.json`，**重启/重新部署后仍保持停止**，
+  必须从看板点「恢复运行」才恢复交易
+- 日志：`killswitch.engaged` / `killswitch.released`，STATUS 行会变成
+  `STATUS [STOPPED] ...`
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/control` | 当前停止状态 |
+| POST | `/api/control/stop` | 停止 + 撤销挂单 |
+| POST | `/api/control/start` | 恢复运行 |
+
 ---
 
 ## 七、日志与监控

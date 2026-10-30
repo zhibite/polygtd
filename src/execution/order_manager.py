@@ -86,11 +86,16 @@ class OrderManager:
         price_cache: PriceCache | None = None,
         pm_client: PolymarketClient | None = None,
         db: object | None = None,
+        killswitch: object | None = None,
     ) -> None:
         self._clob = clob
         self._s = _s()
         self._cache = price_cache
         self._pm = pm_client
+        # Shared emergency-stop flag (src/strategy/killswitch.py). Checked at
+        # the top of every place_* call: an action already in flight when the
+        # operator presses stop must never reach the CLOB.
+        self._kill = killswitch
         # Optional `src.persistence.db.DB`. When present, every order and
         # fill is mirrored into SQLite so the web dashboard can render
         # history. Kept optional and fully exception-guarded: a DB hiccup
@@ -180,6 +185,23 @@ class OrderManager:
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("order_manager.db_persist_fill_failed", error=str(exc))
+
+    def _blocked(self, action: str) -> bool:
+        """True when the emergency stop is engaged.
+
+        Defense in depth: the engine and router already check the switch,
+        but an action that entered the router before the flag flipped must
+        not reach the CLOB afterwards.
+        """
+        ks = getattr(self, "_kill", None)
+        if ks is not None and getattr(ks, "active", False):
+            log.warning(
+                "order_manager.blocked_by_killswitch",
+                action=action,
+                reason=getattr(ks, "reason", ""),
+            )
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # Public read access
@@ -429,6 +451,8 @@ class OrderManager:
         minimum). TierWatcher tracks balance + GTD expiry after this
         returns; no client-side poll loop here.
         """
+        if self._blocked("place_buy_by_strategy_price"):
+            return None
         from src.execution.clob_client import CLOBClient as _CC
         lifetime = max(int(lifetime_s or self._s.GTD_LIFETIME_S), _CC.GTD_MIN_SEC + 1)
 
@@ -488,6 +512,8 @@ class OrderManager:
         Used by the TP path: `price` = `tp_target` so the actual sell
         price equals the trigger-condition price.
         """
+        if self._blocked("place_gtd_sell_at_price"):
+            return None
         from src.execution.clob_client import CLOBClient as _CC
         gtd_lifetime = max(int(lifetime_s or TP_GTD_LIFETIME_S), _CC.GTD_MIN_SEC + 1)
         return await self.place_gtd_sell(
@@ -541,6 +567,8 @@ class OrderManager:
         callers that want to pass a precomputed `size` (legacy tests
         and any direct internal wiring).
         """
+        if self._blocked("place_buy"):
+            return None
         # H-3 fix: the CLOB client enforces a minimum GTD lifetime of
         # GTD_MIN_SEC+1 = 181 s (CLOB-side hard floor). The TrackedOrder
         # must expire at the *same* wall-clock time as the server-side
@@ -727,6 +755,8 @@ class OrderManager:
 
         Returns None on post failure.
         """
+        if self._blocked("place_gtd_sell"):
+            return None
         async with self._lock:
             # H-3 fix: enforce the same effective lifetime as the BUY path —
             # CLOBClient clamps to GTD_MIN_SEC+1 = 181 s. The tracked
@@ -877,6 +907,8 @@ class OrderManager:
         tick_size: float,
     ) -> TrackedOrder | None:
         """Place a FAK market SELL order."""
+        if self._blocked("place_sell"):
+            return None
         async with self._lock:
             cid = f"{round_start_ts}-{tier_name}-{uuid.uuid4().hex[:8]}"
 
@@ -1136,6 +1168,31 @@ class OrderManager:
                 not_cancelled_on_clob=len(not_cancelled),
             )
             return client_ids
+
+    async def cancel_all_open(self, reason: str = "killswitch") -> int:
+        """Cancel every non-terminal order across all rounds.
+
+        Used by the emergency stop. Returns the number of orders that were
+        in a cancellable state. Orders whose CLOB cancel is not confirmed
+        stay tracked (their late fills are still attributed) — the caller
+        should not assume all of them are gone.
+        """
+        rounds = {
+            o.round_start_ts
+            for o in list(self._orders.values())
+            if o.status in ("placed", "live")
+        }
+        cancelled = 0
+        for round_ts in rounds:
+            try:
+                cancelled += len(await self.cancel_market(round_start_ts=round_ts))
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "order_manager.cancel_all_open_failed",
+                    round_start_ts=round_ts,
+                    error=str(exc),
+                )
+        return cancelled
 
     # ------------------------------------------------------------------
     # Reconcile

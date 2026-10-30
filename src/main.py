@@ -59,6 +59,7 @@ from src.strategy.engine import (
     ActionTakeProfit,
     StrategyEngine,
 )
+from src.strategy.killswitch import KillSwitch
 from src.strategy.loop import DecisionLoop
 
 log = get_logger(__name__)
@@ -208,6 +209,9 @@ class AppState:
 
     def __init__(self) -> None:
         self.round_start_ts: int = 0
+        # Emergency stop. Loaded from disk so a restart/redeploy does not
+        # silently resume trading after the operator pressed stop.
+        self.killswitch = KillSwitch.load()
         self.binance_cache = BinanceCache()
         self.price_cache = PriceCache()
         self.ring = RingBuffer(retention_s=binance().BUFFER_RETENTION_S)
@@ -909,6 +913,18 @@ class ActionRouter:
         eng = self._state.engine
         om = self._state.order_manager
         if not eng or not om:
+            return
+
+        ks = getattr(self._state, "killswitch", None)
+        if ks is not None and getattr(ks, "active", False):
+            # Emergency stop engaged after the engine emitted this action.
+            # OrderManager refuses the placement too; drop it here so no
+            # watcher is spawned for an order that will never exist.
+            log.warning(
+                "router.blocked_by_killswitch",
+                action=type(action).__name__,
+                reason=getattr(ks, "reason", ""),
+            )
             return
 
         tick_size = eng._round.tick_size if eng._round else 0.01
@@ -1908,8 +1924,10 @@ async def _status_loop() -> None:
         # Runtime audit of the duplicate / over-allocation invariants.
         _audit_gtd_invariants(s)
 
+        ks = getattr(s, "killswitch", None)
+        stop_str = " [STOPPED]" if (ks is not None and ks.active) else ""
         log.info(
-            f"STATUS  binance={bc:,.1f}  {gate_str}"
+            f"STATUS{stop_str}  binance={bc:,.1f}  {gate_str}"
             f"  {window_str}  "
             f"UP={up_last:.4f}  DOWN={down_last:.4f}{pos_str}"
         )
@@ -2016,6 +2034,7 @@ async def main() -> None:
         price_cache=s.price_cache,
         pm_client=s.pm_client,
         db=s.db,
+        killswitch=s.killswitch,
     )
     # H-NEW-2026-07-11 (audit v6-12 production revisit): if a previous
     # bot process crashed (or `_safe_cancel` lost its race against SDK
@@ -2050,7 +2069,12 @@ async def main() -> None:
 
     # ── Action router + Strategy engine ──────────────────────────────────
     router = ActionRouter(s)
-    s.engine = StrategyEngine(s.binance_cache, s.price_cache, router)
+    s.engine = StrategyEngine(
+        s.binance_cache,
+        s.price_cache,
+        router,
+        killswitch=s.killswitch,
+    )
 
     # ── Decision loop — drives StrategyEngine._evaluate() on a fixed tick ──
     # Fixes audit B-1: before this loop existed, nothing invoked _evaluate,

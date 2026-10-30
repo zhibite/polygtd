@@ -21,6 +21,20 @@
 </nav>
 
 <div class="container">
+  <!-- Emergency stop -->
+  <div class="control-bar" id="control-bar">
+    <div class="control-status">
+      <span class="control-dot running" id="control-dot"></span>
+      <span class="control-label" id="control-label">策略运行中</span>
+      <span class="control-meta" id="control-meta"></span>
+    </div>
+    <div class="control-actions">
+      <button class="btn btn-danger" id="stop-btn" onclick="stopStrategy()">紧急停止</button>
+      <button class="btn btn-primary" id="start-btn" hidden onclick="startStrategy()">恢复运行</button>
+    </div>
+  </div>
+  <div id="control-banner"></div>
+
   <!-- Summary -->
   <div class="stats-row">
     <div class="stat-card">
@@ -153,7 +167,97 @@ async function getJSON(path) {
   return await r.json();
 }
 
+/* ── Emergency stop ─────────────────────────────────────────────────── */
+let AUTH = null;
+
+function updateControlAvailability() {
+  const ready = !!(AUTH && AUTH.credentials_configured);
+  $('stop-btn').disabled = !ready;
+  $('start-btn').disabled = !ready;
+  if (!ready) {
+    $('control-meta').textContent = '未设置 WEB_PASSWORD，控制功能不可用';
+  }
+}
+
+function renderKillswitch(ks) {
+  const active = !!(ks && ks.active);
+  const dot = $('control-dot');
+  const label = $('control-label');
+  const meta = $('control-meta');
+  const bar = $('control-bar');
+
+  $('stop-btn').hidden = active;
+  $('start-btn').hidden = !active;
+
+  if (active) {
+    dot.className = 'control-dot stopped';
+    label.textContent = '策略已紧急停止';
+    const since = ks.since
+      ? new Date(ks.since * 1000).toLocaleString('zh-CN', { hour12: false })
+      : '--';
+    meta.textContent = `停止于 ${since}${ks.reason ? ' · ' + ks.reason : ''}`;
+    bar.classList.add('stopped');
+    $('control-banner').innerHTML =
+      '<div class="alert warn"><b>策略已停止。</b>不会开新仓、不会补仓、不会止盈；' +
+      '未成交挂单已撤销。<b>已有持仓不会自动卖出</b>，需要手动处理。</div>';
+  } else {
+    dot.className = 'control-dot running';
+    label.textContent = '策略运行中';
+    meta.textContent = '';
+    bar.classList.remove('stopped');
+    $('control-banner').innerHTML = '';
+  }
+  updateControlAvailability();
+}
+
+async function loadAuth() {
+  try { AUTH = await getJSON('/api/auth/me'); } catch (e) { AUTH = null; }
+  updateControlAvailability();
+}
+
+async function controlCall(path, body) {
+  try {
+    const r = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {}),
+    });
+    if (r.status === 401) {
+      location.href = '/login?next=' + encodeURIComponent(location.pathname);
+      return;
+    }
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.detail || ('HTTP ' + r.status));
+    await refreshStatus();
+    if (path.endsWith('/stop')) {
+      alert('已紧急停止，撤销挂单 ' + (data.cancelled_orders || 0) + ' 笔。');
+    } else {
+      alert('已恢复运行。');
+    }
+  } catch (e) {
+    alert('操作失败：' + e.message);
+  }
+}
+
+async function stopStrategy() {
+  if (!confirm(
+    '确定紧急停止策略？\n\n' +
+    '· 立即冻结开仓 / 补仓 / 止盈动作\n' +
+    '· 撤销所有未成交挂单\n' +
+    '· 不会自动卖出已有持仓\n\n' +
+    '停止状态会写入磁盘，重启后仍保持停止。'
+  )) return;
+  await controlCall('/api/control/stop', { reason: 'dashboard' });
+}
+
+async function startStrategy() {
+  if (!confirm('确定恢复运行？\n策略会重新开始寻找入场和止盈机会。')) return;
+  await controlCall('/api/control/start', {});
+}
+
 function renderStatus(s) {
+  renderKillswitch(s.killswitch);
+
   // window
   const w = s.window || {};
   $('window-remain').textContent = Math.max(0, Math.round(w.remain_s || 0)) + 's';
@@ -291,6 +395,7 @@ async function refreshTrades() {
 $('clock').textContent = new Date().toISOString().slice(11, 19) + ' UTC';
 setInterval(() => { $('clock').textContent = new Date().toISOString().slice(11, 19) + ' UTC'; }, 1000);
 
+loadAuth();
 refreshStatus();
 refreshTrades();
 setInterval(refreshStatus, 3000);

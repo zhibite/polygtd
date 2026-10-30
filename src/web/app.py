@@ -31,6 +31,9 @@ Routes:
            PUT  /api/config          update strategy config (login only)
            POST /api/config/reset    reset strategy config (login only)
            GET  /api/wallet          funder balance snapshot (login only)
+           GET  /api/control         emergency-stop state (login only)
+           POST /api/control/stop    engage stop + cancel open orders (login only)
+           POST /api/control/start   release stop (login only)
 """
 from __future__ import annotations
 
@@ -128,8 +131,8 @@ async def _require_auth(request: Request) -> None:
         raise HTTPException(status_code=401, detail="需要登录")
 
 
-async def _require_config_auth(request: Request) -> str:
-    """The config surface ALWAYS needs a session, password or not."""
+async def _require_login(request: Request) -> str:
+    """Trading controls and config ALWAYS need a session, password or not."""
     user = auth.current_user(request)
     if user is None:
         raise HTTPException(status_code=401, detail="需要登录后才能访问策略配置")
@@ -326,7 +329,7 @@ async def api_round_fills(
 
 @app.get("/api/config")
 async def api_get_config(
-    _: str = Depends(_require_config_auth),
+    _: str = Depends(_require_login),
 ) -> dict[str, Any]:
     from src.web import runtime_config as rc
 
@@ -341,7 +344,7 @@ async def api_get_config(
 @app.put("/api/config")
 async def api_update_config(
     patch: dict[str, Any],
-    _: str = Depends(_require_config_auth),
+    _: str = Depends(_require_login),
 ) -> dict[str, Any]:
     from src.web import runtime_config as rc
 
@@ -354,7 +357,7 @@ async def api_update_config(
 
 @app.post("/api/config/reset")
 async def api_reset_config(
-    _: str = Depends(_require_config_auth),
+    _: str = Depends(_require_login),
 ) -> dict[str, Any]:
     from src.web import runtime_config as rc
 
@@ -364,9 +367,65 @@ async def api_reset_config(
 @app.get("/api/wallet")
 async def api_wallet(
     refresh: bool = False,
-    _: str = Depends(_require_config_auth),
+    _: str = Depends(_require_login),
 ) -> dict[str, Any]:
     """Funder wallet balance for the config page (login required)."""
     from src.web import wallet as wallet_mod
 
     return await wallet_mod.wallet_snapshot(_state(), force=refresh)
+
+
+# ---------------------------------------------------------------------------
+# Emergency stop (login required, always)
+# ---------------------------------------------------------------------------
+
+class ControlPayload(BaseModel):
+    reason: str = "dashboard"
+
+
+@app.get("/api/control")
+async def api_control(
+    _: str = Depends(_require_login),
+) -> dict[str, Any]:
+    ks = getattr(_state(), "killswitch", None)
+    return {
+        "killswitch": ks.snapshot() if ks is not None else {
+            "active": False, "since": None, "reason": None,
+        }
+    }
+
+
+@app.post("/api/control/stop")
+async def api_control_stop(
+    request: Request,
+    payload: ControlPayload | None = None,
+    _: str = Depends(_require_login),
+) -> dict[str, Any]:
+    """Engage the emergency stop and cancel every open order."""
+    from src.strategy import killswitch as ks_mod
+
+    actor = auth.current_user(request) or "unknown"
+    reason = ((payload.reason if payload else "") or "dashboard")[:120]
+    try:
+        result = await ks_mod.engage(_state(), reason=f"{reason} ({actor})")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None
+    log.warning("web.control.stop", actor=actor, reason=reason, **result)
+    return {"ok": True, **result}
+
+
+@app.post("/api/control/start")
+async def api_control_start(
+    request: Request,
+    _: str = Depends(_require_login),
+) -> dict[str, Any]:
+    """Release the emergency stop so the strategy may trade again."""
+    from src.strategy import killswitch as ks_mod
+
+    actor = auth.current_user(request) or "unknown"
+    try:
+        result = ks_mod.release(_state(), reason=f"dashboard ({actor})")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None
+    log.warning("web.control.start", actor=actor, **result)
+    return {"ok": True, **result}

@@ -98,10 +98,14 @@ class StrategyEngine:
         binance_cache: BinanceCache,
         price_cache: PriceCache,
         handler: ActionHandler,
+        killswitch: object | None = None,
     ) -> None:
         self._bc = binance_cache
         self._pc = price_cache
         self._handler = handler
+        # Shared emergency-stop flag. When engaged `_evaluate` returns
+        # immediately, so no T1 / averaging / TP action is emitted.
+        self._kill = killswitch
         self._round: RoundState | None = None
         self._gate: GateKeeper | None = None
         self._s = _s()
@@ -736,6 +740,11 @@ class StrategyEngine:
         if getattr(self._round, "skip_reason", None):
             # Window pre-check (late boot / cross-window BTC gap) — do not
             # open or average any position this round.
+            return
+        ks = getattr(self, "_kill", None)
+        if ks is not None and getattr(ks, "active", False):
+            # Emergency stop: emit nothing. The order manager has its own
+            # guard for actions already in flight.
             return
 
         # Single-flight: drop re-entry rather than queue it. The next tick
