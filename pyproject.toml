@@ -23,6 +23,9 @@ dependencies = [
     "poly-eip712-structs>=0.0.1",
     "py-order-utils>=0.3.2",
     "aiosqlite>=0.20",
+    # Web dashboard
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
 ]
 
 [project.optional-dependencies]

@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>交易记录 - PolyGTD</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<nav>
+  <span class="brand">PolyGTD</span>
+  <a href="/">控制台</a>
+  <a href="/trades" class="active">交易记录</a>
+  <div class="nav-right">
+    <span class="live-dot" id="live-dot"></span>
+    <span id="live-label">连接中</span>
+    <span id="clock" class="mono"></span>
+  </div>
+</nav>
+
+<div class="container">
+  <div class="stats-row">
+    <div class="stat-card">
+      <div class="stat-label">今日盈亏 (UTC)</div>
+      <div class="stat-value" id="today-pnl">--</div>
+      <div class="stat-sub" id="today-rounds">-- 轮</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">累计盈亏</div>
+      <div class="stat-value" id="total-pnl">--</div>
+      <div class="stat-sub" id="total-rounds">-- 轮已结算</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">胜率</div>
+      <div class="stat-value purple" id="win-rate">--</div>
+      <div class="stat-sub" id="win-loss">--</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">盈亏比 (Profit Factor)</div>
+      <div class="stat-value orange" id="profit-factor">--</div>
+      <div class="stat-sub" id="avg-win-loss">--</div>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>轮次记录 <span class="pill" id="round-count">0</span></h2>
+    <table>
+      <thead>
+        <tr>
+          <th>开始 (UTC)</th><th>轮次</th><th>买入成本</th><th>卖出收入</th>
+          <th>盈亏</th><th>盈亏 %</th><th>成交笔数</th><th>状态</th>
+        </tr>
+      </thead>
+      <tbody id="rounds-tbody"><tr><td colspan="8" class="no-data">加载中...</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="section">
+    <h2>成交明细 <span class="pill" id="fill-count">0</span></h2>
+    <table>
+      <thead>
+        <tr><th>时间 (UTC)</th><th>轮次</th><th>层</th><th>方向</th><th>价格</th><th>数量</th><th>金额</th></tr>
+      </thead>
+      <tbody id="fills-tbody"><tr><td colspan="7" class="no-data">加载中...</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<footer>PolyGTD · 数据来自 polymarket.db · 时间均为 UTC</footer>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const fmt = (n, d = 2) => (n === null || n === undefined || isNaN(n)) ? '--' : Number(n).toFixed(d);
+const money = (n) => (n === null || n === undefined || isNaN(n)) ? '--' : (n >= 0 ? '+$' : '-$') + Math.abs(n).toFixed(2);
+const cls = (n) => (n > 0 ? 'green' : n < 0 ? 'red' : '');
+const utc = (ts) => ts ? new Date(ts * 1000).toISOString().slice(11, 19) : '--';
+const iso = (s) => s ? new Date(s).toISOString().replace('T', ' ').slice(0, 19) : '--';
+
+function setLive(ok) {
+  $('live-dot').className = 'live-dot' + (ok ? '' : ' offline');
+  $('live-label').textContent = ok ? '在线' : '离线';
+}
+
+async function getJSON(path) {
+  const r = await fetch(path, { cache: 'no-store' });
+  if (!r.ok) throw new Error(path + ' ' + r.status);
+  return await r.json();
+}
+
+function renderStats(stats) {
+  if (!stats) return;
+  const today = stats.today_pnl_usd || 0;
+  $('today-pnl').textContent = money(today);
+  $('today-pnl').className = 'stat-value ' + cls(today);
+  $('today-rounds').textContent = (stats.today_rounds || 0) + ' 轮已结算';
+
+  const total = stats.total_pnl_usd || 0;
+  $('total-pnl').textContent = money(total);
+  $('total-pnl').className = 'stat-value ' + cls(total);
+  $('total-rounds').textContent = (stats.closed_rounds || 0) + ' 轮已结算 · ' + (stats.open_rounds || 0) + ' 轮未平';
+
+  $('win-rate').textContent = stats.win_rate === null ? '--' : (stats.win_rate * 100).toFixed(1) + '%';
+  $('win-loss').textContent = `${stats.wins || 0} 胜 / ${stats.losses || 0} 负`;
+  $('profit-factor').textContent = stats.profit_factor === null ? '--' : fmt(stats.profit_factor, 2);
+  $('avg-win-loss').textContent = `均赢 ${money(stats.avg_win_usd || 0)} · 均亏 ${money(stats.avg_loss_usd || 0)}`;
+}
+
+function renderRounds(rounds) {
+  $('round-count').textContent = rounds.length;
+  const body = $('rounds-tbody');
+  if (!rounds.length) {
+    body.innerHTML = '<tr><td colspan="8" class="no-data">暂无记录（下单成交后会出现在这里）</td></tr>';
+    return;
+  }
+  body.innerHTML = rounds.map(r => {
+    const pnl = r.pnl_usd;
+    const status = r.closed
+      ? '<span class="pill filled">已结算</span>'
+      : '<span class="pill watching">未平仓</span>';
+    return `<tr>
+      <td class="mono">${iso(r.started_at) === '--' ? utc(r.round_start_ts) : iso(r.started_at)}</td>
+      <td class="mono muted">${r.slug || r.round_start_ts}</td>
+      <td class="mono">$${fmt(r.buy_cost, 2)}</td>
+      <td class="mono">$${fmt(r.sell_proceeds, 2)}</td>
+      <td class="mono ${pnl === null ? '' : cls(pnl)}">${pnl === null ? '--' : money(pnl)}</td>
+      <td class="mono ${pnl === null ? '' : cls(pnl)}">${r.pnl_pct === null ? '--' : fmt(r.pnl_pct * 100, 2) + '%'}</td>
+      <td class="mono">${r.fill_count}</td>
+      <td>${status}</td>
+    </tr>`;
+  }).join('');
+}
+
+function renderFills(fills) {
+  $('fill-count').textContent = fills.length;
+  const body = $('fills-tbody');
+  if (!fills.length) {
+    body.innerHTML = '<tr><td colspan="7" class="no-data">暂无成交</td></tr>';
+    return;
+  }
+  body.innerHTML = fills.map(f => `<tr>
+    <td class="mono">${f.ts_ms ? new Date(f.ts_ms).toISOString().replace('T', ' ').slice(0, 19) : '--'}</td>
+    <td class="mono">${utc(f.round_start_ts)}</td>
+    <td>${f.tier || '--'}</td>
+    <td><span class="pill ${f.side === 'BUY' ? 'buy' : 'sell'}">${f.side}</span></td>
+    <td class="mono">${fmt(f.price, 4)}</td>
+    <td class="mono">${fmt(f.size, 2)}</td>
+    <td class="mono">$${fmt(f.notional, 2)}</td>
+  </tr>`).join('');
+}
+
+async function refresh() {
+  try {
+    const d = await getJSON('/api/trades?limit=300');
+    renderStats(d.stats);
+    renderRounds(d.rounds || []);
+    renderFills(d.fills || []);
+    setLive(true);
+  } catch (e) {
+    setLive(false);
+  }
+}
+
+$('clock').textContent = new Date().toISOString().slice(11, 19) + ' UTC';
+setInterval(() => { $('clock').textContent = new Date().toISOString().slice(11, 19) + ' UTC'; }, 1000);
+refresh();
+setInterval(refresh, 10000);
+</script>
+</body>
+</html>

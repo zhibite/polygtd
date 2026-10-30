@@ -85,11 +85,17 @@ class OrderManager:
         clob: CLOBClient,
         price_cache: PriceCache | None = None,
         pm_client: PolymarketClient | None = None,
+        db: object | None = None,
     ) -> None:
         self._clob = clob
         self._s = _s()
         self._cache = price_cache
         self._pm = pm_client
+        # Optional `src.persistence.db.DB`. When present, every order and
+        # fill is mirrored into SQLite so the web dashboard can render
+        # history. Kept optional and fully exception-guarded: a DB hiccup
+        # must never block order placement or cancellation.
+        self._db = db
         self._lock = asyncio.Lock()
         self._orders: dict[str, TrackedOrder] = {}          # client_order_id -> order
         self._by_server: dict[str, str] = {}               # server_id -> client_id
@@ -110,6 +116,70 @@ class OrderManager:
         # repeatedly; logging-only on cancellation failure.
         self._startup_reconciled: bool = False
 
+    # ------------------------------------------------------------------
+    # Persistence hooks (optional — see `db` in __init__)
+    # ------------------------------------------------------------------
+
+    def _persist_order(self, order: TrackedOrder) -> None:
+        """Mirror a freshly created TrackedOrder into SQLite (best effort)."""
+        db = getattr(self, "_db", None)
+        if db is None:
+            return
+        try:
+            db.insert_order(
+                client_order_id=order.client_order_id,
+                server_order_id=order.server_order_id,
+                round_start_ts=order.round_start_ts,
+                side=order.side,
+                token_id=order.token_id,
+                tier_name=order.tier_name,
+                price=order.price,
+                size=order.placed_size if order.placed_size > 0 else order.size,
+                lifetime_s=int(order.lifetime_s),
+                expires_at=int(order.expires_at),
+                placed_at=int(order.placed_at),
+            )
+            if order.status != "placed" or order.size_matched > 0:
+                self._persist_status(order)
+        except Exception as exc:  # noqa: BLE001
+            # Never let dashboard persistence break the trading path.
+            log.warning("order_manager.db_persist_order_failed", error=str(exc))
+
+    def _persist_status(self, order: TrackedOrder) -> None:
+        """Mirror status / size_matched changes into SQLite (best effort)."""
+        db = getattr(self, "_db", None)
+        if db is None:
+            return
+        try:
+            db.update_order_status(
+                order.client_order_id, order.status, order.size_matched
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("order_manager.db_persist_status_failed", error=str(exc))
+
+    def _persist_fill(
+        self, order: TrackedOrder, delta_size: float, fill_price: float
+    ) -> None:
+        """Record an incremental fill (best effort, idempotent by fill_id)."""
+        db = getattr(self, "_db", None)
+        if db is None or delta_size <= 0:
+            return
+        try:
+            db.insert_fill(
+                # Cumulative matched size makes the id stable across the
+                # WS UPDATE / TierWatcher-resync feeds that both mirror
+                # the same fill into `apply_fill_event`.
+                fill_id=f"{order.client_order_id}:{order.size_matched:.6f}",
+                order_id=order.client_order_id,
+                round_start_ts=order.round_start_ts,
+                token_id=order.token_id,
+                side=order.side,
+                price=fill_price,
+                size=delta_size,
+                ts_ms=int(time.time() * 1000),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("order_manager.db_persist_fill_failed", error=str(exc))
 
     # ------------------------------------------------------------------
     # Public read access
@@ -602,6 +672,7 @@ class OrderManager:
                 status="live",
             )
             self._orders[cid] = order
+            self._persist_order(order)
             # H-NEW-1 fix: re-point the sentinel mapping (if any) to the real
             # client_order_id. If the CLOBClient already pre-registered the
             # server_id via register_pending_server_id(), _by_server already
@@ -754,6 +825,7 @@ class OrderManager:
                 size_matched=result.tokens,
             )
             self._orders[cid] = order
+            self._persist_order(order)
             # H-NEW-1 fix: same as place_buy — resolve the sentinel mapping
             # pre-registered by CLOBClient when the post-response first
             # arrived. If no fill callback raced us, this is just a plain
@@ -847,6 +919,7 @@ class OrderManager:
                 status="filled",
             )
             self._orders[cid] = order
+            self._persist_order(order)
             # H-NEW-1 fix: same resolve — FAK sells also race against the
             # synchronous _fire_fill_callback inside place_fak_sell (which
             # fires immediately on the post-response). resolve_pending here
@@ -903,6 +976,7 @@ class OrderManager:
             ok = await self._clob.cancel_order(server_id)
             if ok:
                 order.status = "cancelled"
+                self._persist_status(order)
                 # M-V4-3 fix: drop any queued pending fills for this
                 # server_id (partial fills that arrived before the
                 # cancel request would otherwise sit in `_pending_fills`
@@ -936,6 +1010,7 @@ class OrderManager:
             return False
 
         order.status = "cancelled"
+        self._persist_status(order)
         log.info(
             "order_manager.cancelled.no_server_id",
             client_id=client_order_id,
@@ -1049,6 +1124,10 @@ class OrderManager:
                 if o.server_order_id and o.status == "cancelled":
                     self.drain_pending_fills(o.server_order_id)
 
+            # Mirror the final status (cancelled / still-live) into SQLite.
+            for o in to_cancel:
+                self._persist_status(o)
+
             log.info(
                 "order_manager.cancel_market",
                 round_start_ts=round_start_ts,
@@ -1092,6 +1171,7 @@ class OrderManager:
                     sid = co.server_order_id
                     if sid and sid not in live_server_ids:
                         co.status = "cancelled"
+                        self._persist_status(co)
                         log.info(
                             "order_manager.reconcile.gone",
                             client_id=co.client_order_id,
@@ -1378,6 +1458,7 @@ class OrderManager:
             )
             return False
         order.status = "filled"
+        self._persist_status(order)
         log.info(
             "order_manager.mark_filled",
             client_id=order.client_order_id,
@@ -1454,6 +1535,19 @@ class OrderManager:
         if size_matched > order.size_matched:
             prev_matched = order.size_matched
             order.size_matched = size_matched
+            # Dashboard history: record the delta. This method is the single
+            # mirror point for the WS-UPDATE and TierWatcher-resync feeds,
+            # and the fill_id is keyed on the cumulative size, so a duplicate
+            # observation of the same fill is dropped by the INSERT OR IGNORE.
+            self._persist_fill(
+                order,
+                delta_size=size_matched - prev_matched,
+                fill_price=(
+                    fill_price if fill_price is not None and fill_price > 0
+                    else order.price
+                ),
+            )
+            self._persist_status(order)
             # H-V6-2 fix: log every incremental fill so operators can see
             # GTD lifetime progress (previously this method only updated
             # `size_matched` silently; the only fill records were

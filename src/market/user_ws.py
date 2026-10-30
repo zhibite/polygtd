@@ -176,11 +176,25 @@ class UserWS:
         self._running = False
         self._task: asyncio.Task[None] | None = None
         self._url = USER_WS_URL
+        # Condition IDs whose order/trade events we need. Polymarket's user
+        # channel only streams events for markets named in the subscribe
+        # payload, so `main._on_market_discovered` calls `subscribe_markets`
+        # on every newly discovered window.
         self._pending_markets: set[str] = set()
+        # Live socket, kept so `subscribe_markets()` can push an updated
+        # payload mid-connection. Cleared on disconnect; the next connect
+        # frame always carries the current set.
+        self._ws: websockets.WebSocketClientProtocol | None = None
         # H-V6-12 fix (audit M-1): init here instead of relying on the
         # AttributeError-as-init pattern in _process. Allows us to also
         # reset the counter explicitly on each successful WS reconnect.
         self._trade_dump_count = 0
+        # One-shot diagnostic per connection: log the first frame the user
+        # channel delivers. If this never appears after an order is placed,
+        # the subscription is still wrong (missing markets / auth rejected)
+        # — previously there was no way to tell a silent-but-healthy socket
+        # from a dead one.
+        self._first_msg_logged = False
         # H-V6-12 fix (audit M-2): track the cumulative fill size we last saw
         # via REST for each order_id. Used to convert REST's cumulative
         # `size_matched` into a true delta before forwarding to the
@@ -206,8 +220,23 @@ class UserWS:
     # ------------------------------------------------------------------
 
     def subscribe_markets(self, condition_ids: list[str]) -> None:
-        for cid in condition_ids:
-            self._pending_markets.add(cid)
+        """Subscribe the user channel to these markets' order/trade events.
+
+        Polymarket's user channel only pushes events for markets listed in
+        the subscribe frame, so this MUST be called for every newly
+        discovered window. Previously nothing ever called it: the socket
+        authenticated and then stayed silent for the whole process, leaving
+        fills to the 1.5 s TierWatcher REST polling path.
+
+        The set is replaced, not accumulated — the previous window's orders
+        are cancelled at round start, so keeping their condition IDs would
+        only grow the payload forever.
+        """
+        new = {cid for cid in condition_ids if cid}
+        if not new or new == self._pending_markets:
+            return
+        self._pending_markets = new
+        self._push_subscription()
 
     async def start(self) -> None:
         self._running = True
@@ -236,23 +265,26 @@ class UserWS:
             try:
                 async with websockets.connect(self._url, ping_interval=10) as ws:
                     delay = 1.0
-                    log.debug("user_ws.connected")
+                    self._ws = ws
+                    try:
+                        log.debug("user_ws.connected")
 
-                    # H-V6-12 fix (audit M-1 + M-2): on each fresh WS
-                    # connection, reset the raw-dump counter and the
-                    # cumulative tracker. Without this, after one
-                    # reconnect neither dump nor dedup state re-arms.
-                    self._trade_dump_count = 0
-                    self._last_rest_cumulative = {}
+                        # H-V6-12 fix (audit M-1 + M-2): on each fresh WS
+                        # connection, reset the raw-dump counter and the
+                        # cumulative tracker. Without this, after one
+                        # reconnect neither dump nor dedup state re-arms.
+                        self._trade_dump_count = 0
+                        self._last_rest_cumulative = {}
+                        self._first_msg_logged = False
 
-                    await self._authenticate(ws)
-                    if self._pending_markets:
-                        await self._subscribe(ws, list(self._pending_markets))
+                        await self._authenticate(ws)
 
-                    async for raw in ws:
-                        if not self._running:
-                            break
-                        await self._process(raw)
+                        async for raw in ws:
+                            if not self._running:
+                                break
+                            await self._process(raw)
+                    finally:
+                        self._ws = None
 
             except asyncio.CancelledError:
                 break
@@ -261,25 +293,58 @@ class UserWS:
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, max_delay)
 
-    async def _authenticate(self, ws: websockets.WebSocketClientProtocol) -> None:
-        await ws.send(json.dumps({
+    def _subscribe_payload(self) -> dict:
+        """Build the user-channel frame: auth always, markets when known.
+
+        Polymarket carries both in one frame (`{"type":"user","auth":...,
+        "markets":[...]}`); the market list is what makes the server push
+        order/trade events. When no market is known yet we omit the key and
+        send the auth-only frame, which is what the pre-fix code always
+        sent.
+        """
+        payload: dict = {
             "type": "user",
             "auth": {
                 "apiKey": self._api_key,
                 "secret": self._api_secret,
                 "passphrase": self._api_passphrase,
             },
-        }))
-        log.info("user_ws.auth_sent")
+        }
+        if self._pending_markets:
+            payload["markets"] = sorted(self._pending_markets)
+        return payload
 
-    async def _subscribe(
-        self, ws: websockets.WebSocketClientProtocol, condition_ids: list[str]
+    async def _authenticate(self, ws: websockets.WebSocketClientProtocol) -> None:
+        await ws.send(json.dumps(self._subscribe_payload()))
+        log.info(
+            "user_ws.auth_sent",
+            markets=[c[:16] for c in sorted(self._pending_markets)],
+        )
+
+    def _push_subscription(self) -> None:
+        """Push an updated market list on the live socket (no-op if down)."""
+        ws = self._ws
+        if ws is None:
+            # Not connected — the next `_authenticate` carries the new list.
+            return
+        try:
+            asyncio.get_running_loop().create_task(self._send_subscription(ws))
+        except RuntimeError:
+            # No running loop (shutdown path) — reconnect will cover it.
+            pass
+
+    async def _send_subscription(
+        self, ws: websockets.WebSocketClientProtocol
     ) -> None:
-        await ws.send(json.dumps({
-            "type": "user",
-            "markets": condition_ids,
-        }))
-        log.info("user_ws.subscribed", markets=[c[:16] for c in condition_ids])
+        payload = self._subscribe_payload()
+        try:
+            await ws.send(json.dumps(payload))
+            log.info(
+                "user_ws.subscribed",
+                markets=[c[:16] for c in payload.get("markets", [])],
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("user_ws.subscribe_failed", error=str(exc))
 
     async def _process(self, raw: str) -> None:
         try:
@@ -288,9 +353,24 @@ class UserWS:
             return
         # The user channel can emit JSON arrays (batched events) as well as
         # objects. The old code called `msg.get(...)` unconditionally, which
-        # raised AttributeError and forced a WS reconnect on every array.
+        # raised AttributeError and forced a WS reconnect on every array. The
+        # crash fix then simply DROPPED arrays — silently losing every
+        # batched fill. Unwrap them instead.
+        if isinstance(msg, list):
+            for item in msg:
+                if isinstance(item, dict):
+                    await self._process(json.dumps(item))
+            return
         if not isinstance(msg, dict):
             return
+
+        if not self._first_msg_logged:
+            self._first_msg_logged = True
+            log.info(
+                "user_ws.first_message",
+                event_type=msg.get("event_type") or msg.get("type") or "",
+                keys=sorted(msg.keys()),
+            )
 
         event_type = msg.get("event_type", "")
         type_ = msg.get("type", "")

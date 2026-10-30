@@ -1065,11 +1065,14 @@ class StrategyEngine:
             # This prevents chasing at the very end of the 15-min window.
             elapsed_in_window = time.time() - self._round.round_start_ts
             if elapsed_in_window > s.T1_ENTRY_WINDOW_S:
-                # Throttle: log once when gate closes, then stay quiet
-                now = time.time()
-                last = getattr(self, "_t1_gate_closed_log_ts", 0.0)
-                if now - last > 60:
-                    self._t1_gate_closed_log_ts = now
+                # Log exactly ONCE per round. This check runs on every
+                # decision tick (~4 Hz); the old 60 s throttle still emitted
+                # one INFO line per minute for the rest of the window
+                # (production 2026-10-30: 8 identical lines in one round),
+                # contradicting the "log once" intent.
+                round_ts = self._round.round_start_ts
+                if getattr(self, "_t1_gate_closed_round_ts", None) != round_ts:
+                    self._t1_gate_closed_round_ts = round_ts
                     log.info(
                         "engine.t1_gate_closed",
                         elapsed_s=int(elapsed_in_window),

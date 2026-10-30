@@ -200,6 +200,17 @@ class StrategySettings(BaseSettings):
     # `max(0.5, ...)` 的下限——再低也不会生效。
     TIER_WATCHER_POLL_S: float = 1.5
 
+    # ── Web dashboard ─────────────────────────────────────────────────────
+    # FastAPI app served in-process on WEB_PORT (default 8010). Set
+    # WEB_PASSWORD (secret — Coolify panel / process env) to require HTTP
+    # Basic auth; leaving it empty exposes the dashboard publicly.
+    WEB_ENABLED: bool = True
+    WEB_HOST: str = "0.0.0.0"
+    WEB_PORT: int = 8010
+    WEB_LOG_LEVEL: str = "warning"
+    WEB_USERNAME: str = "admin"
+    WEB_PASSWORD: str = ""
+
     # ── Derived helpers ───────────────────────────────────────────────────
 
     @property

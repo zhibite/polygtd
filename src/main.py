@@ -65,10 +65,99 @@ log = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Web dashboard server
+# ---------------------------------------------------------------------------
+
+class _DashboardServer:
+    """uvicorn.Server subclass that keeps the bot's signal handlers.
+
+    Imported lazily (inside `_start_dashboard`) so the bot still runs if
+    FastAPI/uvicorn are not installed. The default `uvicorn.Server.serve()`
+    replaces SIGINT/SIGTERM handlers; the bot registers its own via
+    `loop.add_signal_handler` and relies on them for a graceful round
+    shutdown (cancel open GTDs), so signal capture must be disabled.
+    """
+
+    @staticmethod
+    def build():  # -> uvicorn.Server
+        import contextlib
+
+        import uvicorn
+
+        class _Server(uvicorn.Server):
+            def capture_signals(self):  # type: ignore[override]
+                return contextlib.nullcontext()
+
+        cfg = strategy()
+        return _Server(
+            uvicorn.Config(
+                _web_app(),
+                host=cfg.WEB_HOST,
+                port=int(cfg.WEB_PORT),
+                log_level=cfg.WEB_LOG_LEVEL,
+                access_log=False,
+                lifespan="off",
+            )
+        )
+
+
+def _web_app():
+    from src.web.app import app, set_state
+
+    # Bind the LIVE state object. The bot runs as `python -m src.main`, so
+    # `import src.main` inside the web package would re-execute the module
+    # under a different name and hand the routes an empty AppState.
+    set_state(STATE)
+    return app
+
+
+def _start_dashboard() -> "asyncio.Task | None":
+    """Start the FastAPI dashboard on the bot's event loop.
+
+    Returns the server task, or None when disabled / failed to start.
+    Failures are logged and never abort the trading process.
+    """
+    cfg = strategy()
+    if not cfg.WEB_ENABLED:
+        log.info("web.disabled", note="WEB_ENABLED=0")
+        return None
+    try:
+        server = _DashboardServer.build()
+        task = asyncio.create_task(server.serve(), name="web-dashboard")
+
+        def _on_done(t: asyncio.Task) -> None:
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                log.error("web.server_exited", error=str(exc))
+
+        task.add_done_callback(_on_done)
+        log.info(
+            "web.started",
+            host=cfg.WEB_HOST,
+            port=int(cfg.WEB_PORT),
+            auth=bool(cfg.WEB_PASSWORD),
+        )
+        if not cfg.WEB_PASSWORD:
+            log.warning(
+                "web.auth_disabled",
+                note="set WEB_PASSWORD (and optionally WEB_USERNAME) to "
+                     "require HTTP Basic auth on the dashboard",
+            )
+        return task
+    except Exception as exc:  # noqa: BLE001
+        log.warning("web.start_failed", error=str(exc))
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Window-open BTC baseline plumbing
 # ---------------------------------------------------------------------------
 
-def _on_window_baseline(asset: str, price: float, source: str) -> None:
+def _on_window_baseline(
+    asset: str, price: float, source: str, round_start_ts: int = 0
+) -> None:
     """WindowManager -> GateKeeper bridge.
 
     Receives the BTC spot captured at each window's open (K-line backtrack),
@@ -86,20 +175,26 @@ def _on_window_baseline(asset: str, price: float, source: str) -> None:
     eng = STATE.engine
     if not eng:
         return
-    # Idempotency: only apply when the engine's current round round_start_ts
-    # differs from the last baseline we applied. Without this, every
+    # `round_start_ts` comes from the market the price belongs to; fall back
+    # to STATE for older callers. Using STATE.round_start_ts alone was wrong:
+    # WindowManager.tick() runs BEFORE `_on_new_round`, so at boot it was
+    # still 0 (production log 2026-10-30 showed `round_start_ts=0`) and the
+    # dedupe key then mismatched the real round, re-applying the same
+    # baseline on the next discovery.
+    target_round_ts = round_start_ts or STATE.round_start_ts
+    # Idempotency: only apply once per round. Without this, every
     # window_discovery within the same 15-min window would reset the
     # baseline to the same K-line value and re-flush logs.
-    if getattr(eng, "_last_applied_baseline_round_ts", None) == STATE.round_start_ts:
+    if getattr(eng, "_last_applied_baseline_round_ts", None) == target_round_ts:
         return
     eng.set_binance_baseline(price)
-    eng._last_applied_baseline_round_ts = STATE.round_start_ts
+    eng._last_applied_baseline_round_ts = target_round_ts
     log.info(
         "gate.baseline_applied",
         asset=asset,
         baseline=price,
         source=source,
-        round_start_ts=STATE.round_start_ts,
+        round_start_ts=target_round_ts,
         btc_now=STATE.binance_cache.last_price,
     )
 
@@ -1395,6 +1490,19 @@ def _on_market_discovered(asset: str, mkt) -> None:
                      "re-subscribe on its next reconnect",
             )
 
+    # User channel: Polymarket only pushes order/trade events for markets in
+    # the subscribe frame, so every window must be registered here. Without
+    # this the socket authenticated but never delivered a single fill event.
+    if state.user_ws and mkt.condition_id:
+        try:
+            state.user_ws.subscribe_markets([mkt.condition_id])
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "user_ws.subscribe_markets_failed",
+                cid=mkt.condition_id[:16],
+                error=str(exc),
+            )
+
     # Late discovery: the round may have started before this market was
     # available (Gamma lag at the boundary). Bind the tokens to the
     # already-created RoundState so the engine can trade this window.
@@ -1893,7 +2001,12 @@ async def main() -> None:
     )
 
     # ── Execution layer ─────────────────────────────────────────────────
-    s.order_manager = OrderManager(s.clob, price_cache=s.price_cache, pm_client=s.pm_client)
+    s.order_manager = OrderManager(
+        s.clob,
+        price_cache=s.price_cache,
+        pm_client=s.pm_client,
+        db=s.db,
+    )
     # H-NEW-2026-07-11 (audit v6-12 production revisit): if a previous
     # bot process crashed (or `_safe_cancel` lost its race against SDK
     # signature bugs), dangling GTDs on the CLOB still occupy the maker
@@ -1989,6 +2102,9 @@ async def main() -> None:
                 "Set API_KEY / API_SECRET / API_PASSPHRASE in .env",
         )
 
+    # ── Web dashboard (FastAPI on the bot's event loop) ─────────────────
+    web_task = _start_dashboard()
+
     # Status printer + REST midpoint poller
     status_task = asyncio.create_task(_status_loop())
     midpoint_task = asyncio.create_task(_midpoint_poll_loop())
@@ -2011,6 +2127,16 @@ async def main() -> None:
     log.info("bot.shutdown_initiated")
     status_task.cancel()
     midpoint_task.cancel()
+    # Stop the dashboard first: its routes read `db_conn`, which is closed
+    # at the very end of shutdown.
+    if web_task is not None:
+        web_task.cancel()
+        try:
+            await web_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            log.warning("web.stop_failed", error=str(exc))
 
     # B-3 v2 fix: drain in-flight TP runners / watchers before tearing down
     # dependencies (clob / order_manager). Watchers must be stopped first:

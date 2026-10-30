@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>控制台 - PolyGTD</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<nav>
+  <span class="brand">PolyGTD</span>
+  <a href="/" class="active">控制台</a>
+  <a href="/trades">交易记录</a>
+  <div class="nav-right">
+    <span class="live-dot" id="live-dot"></span>
+    <span id="live-label">连接中</span>
+    <span id="clock" class="mono"></span>
+  </div>
+</nav>
+
+<div class="container">
+  <!-- Summary -->
+  <div class="stats-row">
+    <div class="stat-card">
+      <div class="stat-label">今日盈亏 (UTC)</div>
+      <div class="stat-value" id="today-pnl">--</div>
+      <div class="stat-sub" id="today-rounds">-- 轮</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">累计盈亏</div>
+      <div class="stat-value" id="total-pnl">--</div>
+      <div class="stat-sub" id="total-rounds">-- 轮已结算</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">胜率</div>
+      <div class="stat-value purple" id="win-rate">--</div>
+      <div class="stat-sub" id="win-loss">--</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">当前窗口剩余</div>
+      <div class="stat-value orange" id="window-remain">--</div>
+      <div class="stat-sub" id="window-phase">--</div>
+    </div>
+  </div>
+
+  <!-- BTC price card -->
+  <div class="price-card">
+    <div class="price-head">
+      <div class="price-title">BTC / USDT · 15m Up/Down</div>
+      <div>
+        <span class="badge pending" id="phase-badge">--</span>
+        <span class="badge pending" id="gate-badge">--</span>
+      </div>
+    </div>
+    <div class="price-bar-wrap">
+      <div class="price-bar-label">
+        <span>UP <b id="up-price">--</b></span>
+        <span>DOWN <b id="down-price">--</b></span>
+      </div>
+      <div class="price-bar">
+        <div class="bar-up" id="bar-up" style="width:50%"></div>
+        <div class="bar-down" id="bar-down" style="width:50%"></div>
+      </div>
+    </div>
+    <div class="tokens">
+      <div class="token-item up">
+        <div class="token-label">UP 概率</div>
+        <div class="token-price green" id="up-pct">--</div>
+      </div>
+      <div class="token-item down">
+        <div class="token-label">DOWN 概率</div>
+        <div class="token-price red" id="down-pct">--</div>
+      </div>
+    </div>
+    <div class="gate-row">
+      <span>Binance <b id="binance">--</b></span>
+      <span>基线 <b id="baseline">--</b></span>
+      <span>漂移 <b id="drift">--</b></span>
+      <span>轮次 <b id="round-ts">--</b></span>
+      <span>跳过原因 <b id="skip-reason">无</b></span>
+    </div>
+  </div>
+
+  <!-- Position -->
+  <div class="section">
+    <h2>当前持仓</h2>
+    <table>
+      <thead>
+        <tr><th>方向</th><th>数量</th><th>均价</th><th>成本</th><th>中间价</th><th>浮动盈亏</th><th>止盈目标</th></tr>
+      </thead>
+      <tbody id="position-tbody"><tr><td colspan="7" class="no-data">无持仓</td></tr></tbody>
+    </table>
+  </div>
+
+  <!-- Tiers -->
+  <div class="section">
+    <h2>分层状态</h2>
+    <table>
+      <thead>
+        <tr><th>层</th><th>状态</th><th>名义金额</th><th>已成交/预期</th><th>均价</th><th>服务端订单</th></tr>
+      </thead>
+      <tbody id="tiers-tbody"><tr><td colspan="6" class="no-data">本轮无分层数据</td></tr></tbody>
+    </table>
+  </div>
+
+  <!-- Open orders -->
+  <div class="section">
+    <h2>当前挂单</h2>
+    <table>
+      <thead>
+        <tr><th>层</th><th>方向</th><th>价格</th><th>数量</th><th>已成交</th><th>状态</th><th>存活</th></tr>
+      </thead>
+      <tbody id="orders-tbody"><tr><td colspan="7" class="no-data">无挂单</td></tr></tbody>
+    </table>
+  </div>
+
+  <!-- Recent fills -->
+  <div class="section">
+    <h2>最近成交</h2>
+    <table>
+      <thead>
+        <tr><th>时间 (UTC)</th><th>轮次</th><th>层</th><th>方向</th><th>价格</th><th>数量</th><th>金额</th></tr>
+      </thead>
+      <tbody id="fills-tbody"><tr><td colspan="7" class="no-data">暂无成交</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<footer>PolyGTD · 数据每 3 秒刷新 · 时间均为 UTC</footer>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const fmt = (n, d = 2) => (n === null || n === undefined || isNaN(n)) ? '--' : Number(n).toFixed(d);
+const money = (n) => (n === null || n === undefined || isNaN(n)) ? '--' : (n >= 0 ? '+$' : '-$') + Math.abs(n).toFixed(2);
+const cls = (n) => (n > 0 ? 'green' : n < 0 ? 'red' : '');
+const utc = (ts) => ts ? new Date(ts * 1000).toISOString().slice(11, 19) : '--';
+const iso = (s) => s ? new Date(s).toISOString().replace('T', ' ').slice(0, 19) : '--';
+
+function setLive(ok) {
+  $('live-dot').className = 'live-dot' + (ok ? '' : ' offline');
+  $('live-label').textContent = ok ? '在线' : '离线';
+}
+
+async function getJSON(path) {
+  const r = await fetch(path, { cache: 'no-store' });
+  if (!r.ok) throw new Error(path + ' ' + r.status);
+  return await r.json();
+}
+
+function renderStatus(s) {
+  // window
+  const w = s.window || {};
+  $('window-remain').textContent = Math.max(0, Math.round(w.remain_s || 0)) + 's';
+  const phaseMap = { IN_T1: 'T1 可入场', PAST_T1: '已过 T1', END: '即将结算' };
+  $('window-phase').textContent = (phaseMap[w.phase] || '--') + ' · ' + Math.round(w.period_s || 0) + 's 窗口';
+  $('phase-badge').textContent = phaseMap[w.phase] || '--';
+  $('phase-badge').className = 'badge ' + ((w.phase || '').toLowerCase());
+
+  // gate
+  const g = s.gate || {};
+  $('gate-badge').textContent = g.state || '--';
+  $('gate-badge').className = 'badge ' + ((g.state || 'pending').toLowerCase());
+  $('binance').textContent = fmt(g.binance, 1);
+  $('baseline').textContent = fmt(g.baseline, 1);
+  $('drift').textContent = g.drift === null || g.drift === undefined ? '--' : (g.drift * 100).toFixed(3) + '%';
+  $('drift').className = g.state === 'FAIL' ? 'red' : (g.state === 'PASS' ? 'green' : '');
+  $('round-ts').textContent = s.round_start_ts ? utc(s.round_start_ts) : '--';
+  $('skip-reason').textContent = s.skip_reason || '无';
+  $('skip-reason').className = s.skip_reason ? 'orange' : 'muted';
+
+  // prices
+  const p = s.prices || {};
+  $('up-price').textContent = fmt(p.up_mid, 4);
+  $('down-price').textContent = fmt(p.down_mid, 4);
+  const upPct = (p.up_mid || 0) * 100, downPct = (p.down_mid || 0) * 100;
+  $('up-pct').textContent = fmt(upPct, 1) + '%';
+  $('down-pct').textContent = fmt(downPct, 1) + '%';
+  const total = (p.up_mid || 0) + (p.down_mid || 0);
+  const upShare = total > 0 ? (p.up_mid / total) * 100 : 50;
+  $('bar-up').style.width = upShare.toFixed(1) + '%';
+  $('bar-down').style.width = (100 - upShare).toFixed(1) + '%';
+
+  // position
+  const pos = s.position;
+  const pBody = $('position-tbody');
+  if (!pos || !(pos.qty > 0)) {
+    pBody.innerHTML = '<tr><td colspan="7" class="no-data">无持仓</td></tr>';
+  } else {
+    const pnlCls = cls(pos.upnl_usd);
+    const sideCls = pos.side === 'UP' ? 'buy' : 'sell';
+    pBody.innerHTML = `<tr>
+      <td><span class="pill ${sideCls}">${pos.side || '--'}</span></td>
+      <td class="mono">${fmt(pos.qty, 2)}</td>
+      <td class="mono">${fmt(pos.avg_cost, 4)}</td>
+      <td class="mono">$${fmt(pos.cost, 2)}</td>
+      <td class="mono">${fmt(pos.mid, 4)}</td>
+      <td class="mono ${pnlCls}">${money(pos.upnl_usd)} (${fmt((pos.upnl_pct || 0) * 100, 1)}%)</td>
+      <td class="mono">${pos.tp_target === null || pos.tp_target === undefined ? '--' : fmt(pos.tp_target, 4)}</td>
+    </tr>`;
+  }
+
+  // tiers
+  const tBody = $('tiers-tbody');
+  if (pos && pos.tiers && pos.tiers.length) {
+    tBody.innerHTML = pos.tiers.map(t => `<tr>
+      <td>T${t.tier}</td>
+      <td><span class="pill ${t.status}">${t.status}</span></td>
+      <td class="mono">$${fmt(t.notional, 2)}</td>
+      <td class="mono">${fmt(t.size_filled, 2)} / ${fmt(t.size_expected, 2)}</td>
+      <td class="mono">${t.avg_fill_price === null || t.avg_fill_price === undefined ? '--' : fmt(t.avg_fill_price, 4)}</td>
+      <td class="mono muted">${t.server_order_id ? t.server_order_id.slice(0, 16) : '--'}</td>
+    </tr>`).join('');
+  } else {
+    tBody.innerHTML = '<tr><td colspan="6" class="no-data">本轮无分层数据</td></tr>';
+  }
+
+  // open orders
+  const oBody = $('orders-tbody');
+  if (s.orders && s.orders.length) {
+    oBody.innerHTML = s.orders.map(o => `<tr>
+      <td>${o.tier}</td>
+      <td><span class="pill ${o.side === 'BUY' ? 'buy' : 'sell'}">${o.side}</span></td>
+      <td class="mono">${fmt(o.price, 4)}</td>
+      <td class="mono">${fmt(o.size, 2)}</td>
+      <td class="mono">${fmt(o.size_matched, 2)}</td>
+      <td><span class="pill ${o.status}">${o.status}</span></td>
+      <td class="mono muted">${Math.round(o.age_s || 0)}s</td>
+    </tr>`).join('');
+  } else {
+    oBody.innerHTML = '<tr><td colspan="7" class="no-data">无挂单</td></tr>';
+  }
+}
+
+function renderFills(fills) {
+  const body = $('fills-tbody');
+  if (!fills || !fills.length) {
+    body.innerHTML = '<tr><td colspan="7" class="no-data">暂无成交</td></tr>';
+    return;
+  }
+  body.innerHTML = fills.slice(0, 15).map(f => `<tr>
+    <td class="mono">${f.ts_ms ? new Date(f.ts_ms).toISOString().slice(11, 19) : '--'}</td>
+    <td class="mono">${utc(f.round_start_ts)}</td>
+    <td>${f.tier || '--'}</td>
+    <td><span class="pill ${f.side === 'BUY' ? 'buy' : 'sell'}">${f.side}</span></td>
+    <td class="mono">${fmt(f.price, 4)}</td>
+    <td class="mono">${fmt(f.size, 2)}</td>
+    <td class="mono">$${fmt(f.notional, 2)}</td>
+  </tr>`).join('');
+}
+
+function renderStats(stats) {
+  if (!stats) return;
+  const today = stats.today_pnl_usd || 0;
+  $('today-pnl').textContent = money(today);
+  $('today-pnl').className = 'stat-value ' + cls(today);
+  $('today-rounds').textContent = (stats.today_rounds || 0) + ' 轮已结算';
+
+  const total = stats.total_pnl_usd || 0;
+  $('total-pnl').textContent = money(total);
+  $('total-pnl').className = 'stat-value ' + cls(total);
+  $('total-rounds').textContent = (stats.closed_rounds || 0) + ' 轮已结算 · ' + (stats.open_rounds || 0) + ' 轮未平';
+
+  $('win-rate').textContent = stats.win_rate === null ? '--' : (stats.win_rate * 100).toFixed(1) + '%';
+  $('win-loss').textContent = `${stats.wins || 0} 胜 / ${stats.losses || 0} 负`;
+}
+
+async function refreshStatus() {
+  try {
+    const s = await getJSON('/api/status');
+    renderStatus(s);
+    setLive(true);
+  } catch (e) {
+    setLive(false);
+  }
+}
+
+async function refreshTrades() {
+  try {
+    const d = await getJSON('/api/trades?limit=100');
+    renderStats(d.stats);
+    renderFills(d.fills);
+  } catch (e) { /* status poll handles the indicator */ }
+}
+
+$('clock').textContent = new Date().toISOString().slice(11, 19) + ' UTC';
+setInterval(() => { $('clock').textContent = new Date().toISOString().slice(11, 19) + ' UTC'; }, 1000);
+
+refreshStatus();
+refreshTrades();
+setInterval(refreshStatus, 3000);
+setInterval(refreshTrades, 10000);
+</script>
+</body>
+</html>

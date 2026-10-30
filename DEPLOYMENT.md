@@ -163,10 +163,32 @@ volumes:
 
 ### 4. 运行检查
 
-- 本服务**没有 HTTP 服务/健康检查端点**，不要配置 HTTP 探针
-- 容器端口：8010（仅用于与外部系统对齐，程序本身不监听端口）
+- 内置 Web 看板（FastAPI），监听容器端口 **8010**
+- 健康检查端点：`GET /api/health`（无需鉴权，可用于 Coolify HTTP 探针）
+- 看板页面：`/`（控制台）、`/trades`（交易记录）
 - 启动命令：`python -m src.main`
-- 存活判断：`docker logs` 中每 5 秒输出一行 `STATUS ...`
+- 日志存活判断：`docker logs` 中每 5 秒输出一行 `STATUS ...`
+- 启动日志应出现 `web.started port=8010 auth=True/False`
+
+### 5. Web 看板配置
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `WEB_ENABLED` | `true` | 设为 `false` 关闭 HTTP 服务 |
+| `WEB_HOST` | `0.0.0.0` | 监听地址 |
+| `WEB_PORT` | `8010` | 监听端口（需与 Coolify 域名映射的端口一致） |
+| `WEB_USERNAME` | `admin` | HTTP Basic 用户名 |
+| `WEB_PASSWORD` | 空 | HTTP Basic 密码；**留空 = 无鉴权** |
+
+`WEB_PASSWORD` 属于密钥，请放在 Coolify 面板的环境变量里，不要写进
+`.env.docker`。看板数据来源：
+
+- `/api/status`：进程内存中的实时状态（当前轮次、BTC 基准/漂移、持仓、分层、挂单）
+- `/api/trades`、`/api/rounds`、`/api/fills`：`/app/data/polymarket.db` 中的
+  `rounds` / `orders` / `fills` 表（由 `OrderManager` 实时写入）
+
+Coolify 中将 `polygtd.bquant.com` 指向本服务的 **8010** 端口即可；
+若仍出现 502，请检查 `docker logs` 是否有 `web.started`。
 
 ---
 
@@ -291,7 +313,8 @@ python -m src.main
 - [ ] 环境变量已填入 API Key
 - [ ] `GAMMA_API`、`POLYMARKET_HOST`、`POLYGON_RPC_URL` 已配置
 - [ ] 马丁格尔参数已调优
-- [ ] 端口 8010 已暴露（无 HTTP 服务，仅供编排系统占位）
+- [ ] 端口 8010 已暴露，`/api/health` 返回 200，看板 `/` 可访问
+- [ ] 已设置 `WEB_PASSWORD`（公网域名必做）
 - [ ] 数据目录 `/app/data` 已持久化（数据库路径 `/app/data/polymarket.db`）
 - [ ] 日志正常输出（无 ERROR）
 - [ ] 看到 `engine.trigger_t1` 或等待 baseline 的日志

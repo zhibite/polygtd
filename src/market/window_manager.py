@@ -27,10 +27,14 @@ log = get_logger(__name__)
 WindowCallback = Callable[[int], Awaitable[None]]
 # int = round_start_ts (Unix seconds, UTC)
 
-WindowBaselineCallback = Callable[[str, float, str], None]
-# (asset, baseline_price, source_tag) — source_tag is e.g. "window_open_kline",
-# "boot_now", or "retry_now". Synchronous callback (called from tick()); the
-# strategy layer should make any state mutation atomic.
+WindowBaselineCallback = Callable[[str, float, str, int], None]
+# (asset, baseline_price, source_tag, round_start_ts) — source_tag is e.g.
+# "window_open_kline", "boot_now", or "retry_now". Synchronous callback (called
+# from tick()); the strategy layer should make any state mutation atomic.
+# `round_start_ts` is the round the price belongs to. It is passed explicitly
+# because WindowManager.tick() runs BEFORE `_on_new_round` at boot and on every
+# boundary, so the consumer's own "current round" state still points at the
+# previous round (or 0) at that moment.
 
 WindowContextCallback = Callable[[str, "WindowContext", "MarketInfo"], Awaitable[None]]
 
@@ -396,8 +400,18 @@ class WindowManager:
                 # Always update ctx.market on discovery (refreshes token IDs, prices, etc.)
                 ctx.market = mkt
 
-                # Detect window switch by condition_id change (more reliable than window_end)
-                cid_changed = ctx.condition_id and ctx.condition_id != mkt.condition_id
+                # Detect window switch by condition_id change (more reliable
+                # than window_end). An empty `ctx.condition_id` means "first
+                # discovery after boot" and must also count as a switch:
+                # `_on_new_window()` is the ONLY place that writes
+                # `ctx.condition_id`, so requiring a truthy value here made
+                # the method unreachable for the life of the process — the
+                # boot-time late-window guard, the cross-window BTC drift
+                # guard and `reset_for_new_window()` never ran. Production
+                # 2026-10-30: bot booted 356 s into the window and silently
+                # idled instead of logging `window_mgr boot-time window is
+                # late → SKIP this window`.
+                cid_changed = ctx.condition_id != mkt.condition_id
 
                 # Previous window's closing price, sampled by `_run` at the
                 # boundary (`prev_window_btc_close`). Fall back to the old
@@ -459,7 +473,10 @@ class WindowManager:
                         # fire as soon as the K-line value is backfilled.
                         if self._on_baseline is not None:
                             try:
-                                self._on_baseline(asset, btc_price, "window_open_kline")
+                                self._on_baseline(
+                                    asset, btc_price, "window_open_kline",
+                                    mkt.round_start_ts,
+                                )
                             except Exception as exc:
                                 log.warning(
                                     "window_mgr.baseline_callback_failed",
