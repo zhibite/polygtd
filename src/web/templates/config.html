@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>策略配置 - PolyGTD</title>
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/style.css?v=__ASSET_VERSION__">
 </head>
 <body>
 <nav>
@@ -144,8 +144,12 @@ function renderWallet(w) {
     ? new Date(w.updated_at * 1000).toLocaleTimeString('zh-CN', { hour12: false })
     : '--';
   let text = `更新于 ${ts} · 缓存 15 秒`;
+  const t1 = (DATA && DATA.values) ? Number(DATA.values.TIER1_NOTIONAL || 0) : 0;
   const need = maxNotional();
-  if (bal !== null && bal !== undefined && need !== null && bal < need) {
+  if (bal !== null && bal !== undefined && t1 > 0 && bal < t1) {
+    text += ` · ⚠️ 余额不足以覆盖 T1 名义金额 $${fmtMoney(t1, 2)}，当前无法开仓`;
+    sub.className = 'wallet-sub err';
+  } else if (bal !== null && bal !== undefined && need !== null && bal < need) {
     text += ` · ⚠️ 低于单轮最大名义金额 $${fmtMoney(need, 0)}`;
     sub.className = 'wallet-sub warn';
   } else {
@@ -347,6 +351,6 @@ load();
 refreshWallet(false);
 setInterval(() => refreshWallet(false), 30000);
 </script>
-<script src="/static/auth-nav.js"></script>
+<script src="/static/auth-nav.js?v=__ASSET_VERSION__"></script>
 </body>
 </html>

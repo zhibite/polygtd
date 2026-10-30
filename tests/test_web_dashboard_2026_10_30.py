@@ -250,6 +250,30 @@ def test_order_manager_without_db_is_noop() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_static_assets_are_cache_busted() -> None:
+    """Templates must pin a content-hash version on CSS/JS.
+
+    Browsers heuristically cache StaticFiles responses (no Cache-Control),
+    which produced new HTML + stale CSS after a redeploy (production
+    2026-10-30: the wallet card rendered unstyled until a hard refresh).
+    """
+    from fastapi.testclient import TestClient
+
+    from src.web import app as app_mod
+
+    client = TestClient(app_mod.app)
+
+    r = client.get("/login")
+    assert r.status_code == 200
+    assert "__ASSET_VERSION__" not in r.text
+    assert f"style.css?v={app_mod.ASSET_VERSION}" in r.text
+
+    # Static responses must ask the browser to revalidate.
+    r = client.get("/static/style.css")
+    assert r.status_code == 200
+    assert r.headers["cache-control"] == "no-cache, must-revalidate"
+
+
 def test_http_routes_serve_pages_and_health() -> None:
     from fastapi.testclient import TestClient
 

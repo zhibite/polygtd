@@ -34,6 +34,7 @@ Routes:
 """
 from __future__ import annotations
 
+import hashlib
 import time
 from pathlib import Path
 from typing import Any
@@ -60,6 +61,39 @@ app = FastAPI(
 )
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+def _asset_version() -> str:
+    """Short content hash of the static assets.
+
+    Browsers cache CSS/JS heuristically (StaticFiles sends no
+    Cache-Control), so a redeploy could pair new HTML with a stale
+    stylesheet — production 2026-10-30: the wallet card rendered
+    unstyled until a hard refresh. Templates link
+    ``/static/style.css?v=__ASSET_VERSION__`` and this hash changes
+    whenever the files do.
+    """
+    digest = hashlib.md5()
+    try:
+        for name in ("style.css", "auth-nav.js"):
+            path = STATIC_DIR / name
+            if path.exists():
+                digest.update(path.read_bytes())
+    except Exception:  # noqa: BLE001
+        return "1"
+    return digest.hexdigest()[:10] or "1"
+
+
+ASSET_VERSION = _asset_version()
+
+
+@app.middleware("http")
+async def _static_revalidate(request: Request, call_next):  # type: ignore[no-untyped-def]
+    """Make browsers revalidate static files instead of guessing."""
+    response = await call_next(request)
+    if request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +168,8 @@ def _conn() -> Any:
 def _read_template(name: str) -> str:
     path = TEMPLATES_DIR / name
     if path.exists():
-        return path.read_text(encoding="utf-8")
+        content = path.read_text(encoding="utf-8")
+        return content.replace("__ASSET_VERSION__", ASSET_VERSION)
     return f"<h1>{name} not found</h1>"
 
 
