@@ -1947,11 +1947,16 @@ async def main() -> None:
     )
 
     # ── User WebSocket (order events) ────────────────────────────────────
-    if cfg_strategy.API_KEY and cfg_strategy.API_SECRET:
+    # Use the RESOLVED credentials, not cfg_strategy.*: when the operator
+    # supplies only WALLET_PRIVATE_KEY, the L2 creds are derived above into
+    # the local variables and cfg_strategy.API_KEY stays empty. The old
+    # check therefore disabled UserWS for every private-key-only setup —
+    # exactly the configuration that needs the WS fill feed most.
+    if api_key and api_secret and api_passphrase:
         s.user_ws = UserWS(
-            api_key=cfg_strategy.API_KEY,
-            api_secret=cfg_strategy.API_SECRET,
-            api_passphrase=cfg_strategy.API_PASSPHRASE,
+            api_key=api_key,
+            api_secret=api_secret,
+            api_passphrase=api_passphrase,
             on_maker_fill=_make_maker_fill_callback(s),
             on_order=_make_user_ws_order_callback(s),
             clob=s.clob,  # H-V6-12: REST fallback when WS size=0
@@ -1959,7 +1964,8 @@ async def main() -> None:
     else:
         log.warning(
             "bot.no_credentials",
-            msg="API_KEY not set — UserWS disabled, fill events will not be received"
+            msg="L2 credentials unavailable — UserWS disabled, fill events "
+                "will only arrive via TierWatcher REST polling"
         )
         s.user_ws = None
 
