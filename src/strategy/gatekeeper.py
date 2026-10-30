@@ -115,7 +115,10 @@ class GateKeeper:
         (e.g. checking T2 but price has already hit T3's -40% line), the trade
         is justified by price momentum itself and drift is ignored.
 
-        T4 has no next tier — drift is always checked.
+        T4 has no next tier — drift is always checked here, EXCEPT for the
+        engine-level time-based bypass (`T4_DRIFT_BYPASS_MIN_REMAINING_S`):
+        when the window still has enough time left, `_check_average_down`
+        places T4 even if this method returns False.
         """
         if next_tier_drop_pct is not None:
             next_trigger = t1_entry * (1 - next_tier_drop_pct)

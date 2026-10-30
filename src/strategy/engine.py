@@ -179,6 +179,8 @@ class StrategyEngine:
         self._btc_vol_last_log_ts: float = 0.0
         self._btc_stale_last_log_ts: float = 0.0
         self._btc_guard_last_log_ts: dict[tuple[str, str], float] = {}
+        # One `engine.t4_time_bypass` breadcrumb per round.
+        self._t4_bypass_logged_round: int | None = None
 
     # H-NEW-2026-07-11: helper that reads PRICE_PRE_MARGIN safely even for
     # tests that construct engine via __new__ (bypassing __init__).
@@ -296,6 +298,52 @@ class StrategyEngine:
             return
         table[key] = now
         log.info("engine.btc_guard_skip", scope=scope, reason=reason)
+
+    # ── T4 time-based drift bypass (2026-10-31) ──────────────────────────
+
+    def _window_remaining_s(self) -> float | None:
+        """Seconds left in the current window (None when unknown)."""
+        rnd = getattr(self, "_round", None)
+        market = getattr(rnd, "market", None) if rnd is not None else None
+        end = getattr(market, "window_end", None) if market is not None else None
+        if end is None:
+            return None
+        try:
+            end_ts = end.timestamp() if hasattr(end, "timestamp") else float(end)
+        except Exception:  # noqa: BLE001
+            return None
+        return max(0.0, end_ts - time.time())
+
+    def _t4_time_bypass_active(self) -> bool:
+        """True when T4 may ignore a failing BTC drift gate.
+
+        T4 is the last/largest tier and has no momentum bypass, so a
+        trending window blocks it exactly when the token crashes into its
+        zone. When the window still has enough time for a recovery, the
+        operator wants T4 to average in anyway.
+        """
+        min_remaining = self._cfg_float(
+            "T4_DRIFT_BYPASS_MIN_REMAINING_S", 540.0
+        )
+        if min_remaining <= 0:
+            return False
+        remaining = self._window_remaining_s()
+        return remaining is not None and remaining >= min_remaining
+
+    def _log_t4_time_bypass(self, mid: float, t1_entry: float) -> None:
+        rnd = getattr(self, "_round", None)
+        round_ts = getattr(rnd, "round_start_ts", 0) if rnd is not None else 0
+        if getattr(self, "_t4_bypass_logged_round", None) == round_ts:
+            return
+        self._t4_bypass_logged_round = round_ts
+        remaining = self._window_remaining_s()
+        log.info(
+            "engine.t4_time_bypass",
+            mid=mid,
+            t1_entry=t1_entry,
+            remaining_s=round(remaining, 1) if remaining is not None else None,
+            note="T4 drift gate bypassed: enough window time left to recover",
+        )
 
     async def _cancel_placed_buys(self, reason: str) -> None:
         """Cancel every resting BUY GTD (T1..T4) during a volatility blackout.
@@ -1619,18 +1667,27 @@ class StrategyEngine:
             # BTC drift gate for averaging.
             next_drop = TierSnapshot._next_tier_drop(tier.tier)
             if not self._gate.can_double_down(bc_now, mid_price, tier.tier, next_drop, t1_entry):
-                # H-NEW-2026-07-11 (audit v6-12): was silent. Drift
-                # blocking averaging is rare (the gate has a bypass once
-                # price has dropped past the next-tier zone) but when it
-                # happens the operator needs to see why.
-                gs = self._gate.state(bc_now)
-                self._tN_skip_log(
-                    "engine.tN_skip_drift_gate",
-                    tier=tier.tier, mid=mid_price, t1_entry=t1_entry,
-                    drift=gs.drift, within_limit=gs.within_limit,
-                    bc_now=bc_now, next_drop=next_drop,
-                )
-                continue
+                # T4-only time-based bypass (operator decision 2026-10-31):
+                # T4 has no momentum bypass, so a trending window blocks the
+                # last/largest tier exactly when the token crashes into its
+                # zone. With enough window time left for a recovery, place
+                # T4 at its normal 60%-drop trigger despite the drift FAIL.
+                if tier.tier == 4 and self._t4_time_bypass_active():
+                    self._log_t4_time_bypass(mid_price, t1_entry)
+                    # fall through: budget / min-size / stake-cap checks below
+                else:
+                    # H-NEW-2026-07-11 (audit v6-12): was silent. Drift
+                    # blocking averaging is rare (the gate has a bypass once
+                    # price has dropped past the next-tier zone) but when it
+                    # happens the operator needs to see why.
+                    gs = self._gate.state(bc_now)
+                    self._tN_skip_log(
+                        "engine.tN_skip_drift_gate",
+                        tier=tier.tier, mid=mid_price, t1_entry=t1_entry,
+                        drift=gs.drift, within_limit=gs.within_limit,
+                        bc_now=bc_now, next_drop=next_drop,
+                    )
+                    continue
 
             # Budget for THIS placement = the tier's planned USD minus what
             # has already been filled on it. This is the invariant that makes

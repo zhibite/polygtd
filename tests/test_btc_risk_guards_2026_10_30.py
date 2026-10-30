@@ -203,3 +203,83 @@ async def test_vol_blackout_does_not_block_take_profit() -> None:
 
     assert len(eng._actions) == 1
     assert isinstance(eng._actions[0], ActionTakeProfit)
+
+
+# ---------------------------------------------------------------------------
+# T4 time-based drift bypass
+# ---------------------------------------------------------------------------
+
+
+def _t4_position() -> Position:
+    pos = Position()
+    pos.entry_token = "UP"
+    pos.entry_side = "UP"
+    pos.baseline_realized_price = 0.38
+    pos.baseline_set_realized = True
+    pos._total_qty = 36.77
+    pos._total_cost = 9.68
+    pos._avg_cost = 9.68 / 36.77
+    for tier, filled, cost in (
+        (pos.tier1, 5.0, 1.90),
+        (pos.tier2, 9.86, 2.958),
+        (pos.tier3, 21.92, 4.822),
+    ):
+        tier.size_filled = filled
+        tier.cost_filled = cost
+        tier.filled = True
+    return pos
+
+
+def _round_with_end(pos: Position, seconds_left: float):
+    from datetime import datetime, timedelta, timezone
+
+    return SimpleNamespace(
+        position=pos,
+        round_start_ts=int(time.time() - 300),
+        up_token="UP",
+        down_token="DOWN",
+        market=SimpleNamespace(
+            window_end=datetime.now(timezone.utc) + timedelta(seconds=seconds_left)
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_t4_time_bypass_places_t4_despite_drift_fail() -> None:
+    """Window has 10 min left → T4 may fire even though drift FAILs."""
+    eng = _engine()
+    eng._gate.can_double_down = lambda *a, **k: False
+    eng._pc = SimpleNamespace(get_midpoint=lambda tok: 0.10)  # below T4 fire line
+    eng._round = _round_with_end(_t4_position(), 600)
+
+    await eng._check_average_down(bc_now=100_000.0)
+
+    assert len(eng._actions) == 1
+    assert eng._actions[0].tier == 4
+    assert eng._actions[0].price == pytest.approx(0.152)
+
+
+@pytest.mark.asyncio
+async def test_t4_time_bypass_does_not_apply_with_little_time_left() -> None:
+    """Window has only 5 min left → T4 stays blocked by the drift gate."""
+    eng = _engine()
+    eng._gate.can_double_down = lambda *a, **k: False
+    eng._pc = SimpleNamespace(get_midpoint=lambda tok: 0.10)
+    eng._round = _round_with_end(_t4_position(), 300)
+
+    await eng._check_average_down(bc_now=100_000.0)
+
+    assert eng._actions == []
+
+
+@pytest.mark.asyncio
+async def test_t4_time_bypass_can_be_disabled() -> None:
+    eng = _engine()
+    eng._s.T4_DRIFT_BYPASS_MIN_REMAINING_S = 0.0
+    eng._gate.can_double_down = lambda *a, **k: False
+    eng._pc = SimpleNamespace(get_midpoint=lambda tok: 0.10)
+    eng._round = _round_with_end(_t4_position(), 600)
+
+    await eng._check_average_down(bc_now=100_000.0)
+
+    assert eng._actions == []

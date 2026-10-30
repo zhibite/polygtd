@@ -166,6 +166,15 @@ class StrategySettings(BaseSettings):
     BTC_VOL_MAX_MOVE_PCT: float = 0.3
     BTC_VOL_COOLDOWN_S: float = 60.0
 
+    # T4 time-based drift bypass (operator decision 2026-10-31).
+    # T4 is the last/largest tier and has no momentum bypass, so a trending
+    # window (drift > BASELINE_DRIFT_LIMIT) blocks it exactly when the token
+    # crashes into its zone. When the window still has at least this many
+    # seconds left, allow T4 at its normal 60%-drop trigger even if the BTC
+    # drift gate fails — there is still time for the position to recover.
+    # 0 disables (T4 always requires drift within limit).
+    T4_DRIFT_BYPASS_MIN_REMAINING_S: float = 540.0
+
     # ── Order settings ────────────────────────────────────────────────────
     # GTD lifetime in seconds. CLOB enforces a 180-second hard floor
     # (`CLOBClient.GTD_MIN_SEC = 180`); values below that are clamped to
