@@ -30,6 +30,12 @@ nav .nav-right { margin-left: auto; display: flex; align-items: center; gap: 8px
 .price-card { background: #12122a; border: 1px solid #1e1e3a; border-radius: 10px; padding: 20px; margin-bottom: 24px; }
 .price-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .price-title { font-size: 15px; font-weight: 700; }
+a.price-title { color: inherit; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; }
+a.price-title:hover { color: #a78bfa; }
+a.price-title .ext { font-size: 12px; color: #6b7280; }
+a.price-title:hover .ext { color: #a78bfa; }
+a.price-title.disabled { pointer-events: none; cursor: default; }
+a.price-title.disabled .ext { display: none; }
 .price-bar-wrap { margin: 12px 0; }
 .price-bar-label { display: flex; justify-content: space-between; font-size: 12px; color: #6b7280; margin-bottom: 4px; }
 .price-bar-label b { color: #9ca3af; }

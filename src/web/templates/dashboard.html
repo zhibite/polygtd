@@ -62,7 +62,8 @@
   <!-- BTC price card -->
   <div class="price-card">
     <div class="price-head">
-      <div class="price-title">BTC / USDT · 15m Up/Down</div>
+      <a class="price-title disabled" id="market-link" target="_blank"
+         rel="noopener noreferrer" title="市场加载中">BTC / USDT · 15m Up/Down<span class="ext">↗</span></a>
       <div>
         <span class="badge pending" id="phase-badge">--</span>
         <span class="badge pending" id="gate-badge">--</span>
@@ -188,6 +189,20 @@ const dur = (s) => {
 function setLive(ok) {
   $('live-dot').className = 'live-dot' + (ok ? '' : ' offline');
   $('live-label').textContent = ok ? '在线' : '离线';
+}
+
+// 卡片标题指向当前轮次对应的 Polymarket 实时市场页。
+function renderMarketLink(slug) {
+  const el = $('market-link');
+  if (slug) {
+    el.href = 'https://polymarket.com/event/' + encodeURIComponent(slug);
+    el.classList.remove('disabled');
+    el.title = '在 Polymarket 查看实时市场';
+  } else {
+    el.removeAttribute('href');
+    el.classList.add('disabled');
+    el.title = '市场加载中';
+  }
 }
 
 async function getJSON(path) {
@@ -336,6 +351,7 @@ async function startStrategy() {
 
 function renderStatus(s) {
   renderKillswitch(s.killswitch);
+  renderMarketLink(s.slug);
 
   // window
   const w = s.window || {};
