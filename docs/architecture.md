@@ -133,6 +133,11 @@ T4 是最大的一层（8/15 USD），触发价只有 T1 成交均价的 40%。�
 z、剩余时间、σ 等指标写进 `engine.trigger_tN` / `engine.tN_skip_t4_*`
 日志，用于后续校准阈值。
 
+这些事件还会由 `src/infra/t4_journal.py` 镜像到
+`<data dir>/t4_journal.jsonl`（`T4_JOURNAL_ENABLED` 开关，路径可用
+`T4_JOURNAL_PATH` 覆盖）：T4 决策、成交、止盈/止损出场、回合结算各一行
+JSON，方便长期积累后回看。注意 `/app/data` 需要持久卷才能跨部署保留。
+
 ### T4 后止损
 
 T4 成交代表本轮已经打满计划仓位，之后继续下跌不再是马丁格尔可以摊薄的

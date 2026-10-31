@@ -2239,6 +2239,7 @@ class OrderManager:
             log.info(
                 "order_manager.fill_record",
                 client_id=order.client_order_id,
+                round_start_ts=order.round_start_ts,
                 side=order.side,
                 tier=order.tier_name,
                 token=order.token_id[:16],

@@ -288,6 +288,47 @@ UP(last=0.35 bid=0.35)  DOWN(last=0.65 bid=0.65)
 | tiers=[T1=✓ T2=○ T3=○ T4=○] qty=10.53 cost=$2.00
 ```
 
+### T4 决策日志（JSONL）
+
+T4 入场/出场的关键字段除了打印到 stdout，还会追加写入：
+
+```
+/app/data/t4_journal.jsonl        # 可用 T4_JOURNAL_PATH 覆盖；T4_JOURNAL_ENABLED=false 关闭
+```
+
+每行一个 JSON，包含 `event`、`timestamp`、`ts_ms`、`round_start_ts`、
+`t4_z`、`t4_remaining_s`、`t4_sigma_1m_pct`、`mid`、`tier` 等字段。
+覆盖的事件：
+
+| 事件 | 内容 |
+|------|------|
+| `engine.trigger_tN`（`tier=4`） | T4 补仓决策，带 z / 剩余时间 / σ |
+| `engine.tN_skip_t4_*` | T4 被时间 / 行权价距离 / gap 闸门拦下 |
+| `engine.tier_filled`（`tier=4`） | T4 成交 |
+| `engine.tp_*` / `position.tp_*` | 止盈触发与成交（出场） |
+| `engine.*stop_loss*` | 止损触发与成交（出场） |
+| `order_manager.fill_record`（T4/TP/SL） | 成交明细（价格、数量、手续费、maker/taker） |
+| `round.resolved` | 回合最终 UP/DOWN 结果，可按 `round_start_ts` join |
+
+导出与分析：
+
+```bash
+docker cp <container>:/app/data/t4_journal.jsonl ./
+# 或
+docker exec <container> cat /app/data/t4_journal.jsonl > t4_journal.jsonl
+```
+
+```python
+import pandas as pd
+df = pd.read_json("t4_journal.jsonl", lines=True)
+t4 = df[df["event"] == "engine.trigger_tN"]
+```
+
+**持久化**：`/app/data` 目前没有挂载卷，Coolify 重新部署会连同 DB 一起清空。
+要跨部署长期积累，请在 Coolify 的 Persistent Storage 里给应用加一个挂载
+路径 `/app/data`（或用 bind mount 指到宿主机）。启动日志里的
+`t4_journal.started persistent=False` 和 `t4_journal.ephemeral` 会提示这一点。
+
 ---
 
 ## 八、故障排查

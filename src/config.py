@@ -244,6 +244,15 @@ class StrategySettings(BaseSettings):
     # 0 = arm at any mid at/below the fire line (old behaviour).
     T4_MAX_GAP_BELOW_TRIGGER_PCT: float = 0.05
 
+    # ── T4 decision journal (2026-10-31) ─────────────────────────────────
+    # Append-only JSONL of T4 entry/exit events (decisions with z/time/
+    # sigma, fills, TP/stop exits, round resolution) used to tune the
+    # gates after a few weeks of data. Empty path = <data dir>/
+    # t4_journal.jsonl. Not a runtime-config knob (the path is
+    # filesystem-bound), but env/.env.docker work.
+    T4_JOURNAL_ENABLED: bool = True
+    T4_JOURNAL_PATH: str = ""
+
     # NOTE: Same-window T1 re-entry after a take-profit is deliberately NOT
     # supported (operator decision 2026-10-31). Once a round has taken
     # profit, `entry_token` is kept until the next window so a fresh

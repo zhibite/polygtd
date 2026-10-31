@@ -350,6 +350,11 @@ class StrategyEngine:
             return None
         return max(0.0, end_ts - time.time())
 
+    def _current_round_ts(self) -> int | None:
+        """Current round key, tolerant of __new__-constructed test stubs."""
+        rnd = getattr(self, "_round", None)
+        return getattr(rnd, "round_start_ts", None) if rnd is not None else None
+
     def _t4_time_bypass_active(self) -> bool:
         """True when T4 may ignore a failing BTC drift gate.
 
@@ -908,6 +913,7 @@ class StrategyEngine:
                 pos.record_fill(tier, fill_price, fill_size)
                 log.info(
                     "engine.tier_filled",
+                    round_start_ts=self._current_round_ts(),
                     tier=tier.tier,
                     token_id=token_id[:16],
                     fill_price=fill_price,
@@ -924,6 +930,7 @@ class StrategyEngine:
         if pos.record_tp_fill(server_order_id, fill_price, fill_size):
             log.info(
                 "engine.tp_filled",
+                round_start_ts=self._current_round_ts(),
                 server_order_id=server_order_id[:16],
                 token_id=token_id[:16],
                 fill_price=fill_price,
@@ -1838,6 +1845,7 @@ class StrategyEngine:
                         min_remaining_s=self._cfg_float(
                             "T4_MIN_REMAINING_S", 240.0
                         ),
+                        round_start_ts=self._current_round_ts(),
                     )
                     continue
                 ok, t4_metrics = self._t4_strike_gate(
@@ -1847,6 +1855,7 @@ class StrategyEngine:
                     self._tN_skip_log(
                         "engine.tN_skip_t4_strike",
                         tier=4, mid=mid_price, side=snap.entry_side,
+                        round_start_ts=self._current_round_ts(),
                         **t4_metrics,
                     )
                     continue
@@ -1860,6 +1869,7 @@ class StrategyEngine:
                         gap_pct=self._cfg_float(
                             "T4_MAX_GAP_BELOW_TRIGGER_PCT", 0.05
                         ),
+                        round_start_ts=self._current_round_ts(),
                     )
                     continue
 
@@ -1931,6 +1941,7 @@ class StrategyEngine:
 
             log.info(
                 "engine.trigger_tN",
+                round_start_ts=self._current_round_ts(),
                 tier=tier.tier,
                 mid=mid_price,
                 fire_line=fire_line,
@@ -2240,6 +2251,7 @@ class StrategyEngine:
             pos._tp_inflight = True
             log.info(
                 "engine.trigger_tp_taker",
+                round_start_ts=self._current_round_ts(),
                 mid=mid_price,
                 tp_target=tp_target,
                 qty=snap.total_qty,
@@ -2265,6 +2277,7 @@ class StrategyEngine:
 
         log.info(
             "engine.trigger_tp",
+            round_start_ts=self._current_round_ts(),
             mid=mid_price,
             fire_line=fire_line,
             tp_target=tp_target,
@@ -2390,6 +2403,7 @@ class StrategyEngine:
             self._stop_loss_inflight = True
             log.warning(
                 "engine.trigger_stop_loss",
+                round_start_ts=round_ts,
                 stage=1,
                 mid=mid,
                 line=line,
@@ -2437,6 +2451,7 @@ class StrategyEngine:
         self._stop_loss_inflight = True
         log.warning(
             "engine.trigger_stop_loss",
+            round_start_ts=round_ts,
             stage=2,
             mid=mid,
             line=stage2_line,
@@ -2468,6 +2483,7 @@ class StrategyEngine:
         remaining = self._round.position.total_qty if self._round else 0.0
         log.warning(
             "engine.stop_loss_filled",
+            round_start_ts=self._current_round_ts(),
             stage=stage,
             sold_qty=qty,
             remaining_qty=remaining,
