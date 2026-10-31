@@ -10,6 +10,7 @@ Covers:
 """
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -211,6 +212,58 @@ def test_round_with_order_but_no_fill_is_unfilled(conn) -> None:
     stats = status_mod.compute_stats(rounds)
     assert stats["open_rounds"] == 0
     assert stats["unfilled_rounds"] == 1
+
+
+def test_realized_pnl_books_each_sell_and_ignores_open_reentry(conn) -> None:
+    """A same-window re-entry must not turn a realised win into a fake loss.
+
+    Cycle 1: buy 5 @0.40, sell 5 @0.48  -> +$0.40 realised.
+    Cycle 2: buy 5 @0.40, still open.
+    Old logic: pnl = sell_proceeds - all_buys = 2.40 - 4.00 = -1.60 and the
+    dashboard showed a loss right after the re-entry buy.
+    New logic: each SELL books its realised PnL immediately; the open buy
+    is ignored.
+    """
+    db = DB(conn)
+    now = int(time.time())
+    now_ms = now * 1000
+    round_ts = now - 60
+    db.upsert_round(round_start_ts=round_ts, slug="r-reentry")
+    db.insert_order(
+        client_order_id="c1", server_order_id="s1", round_start_ts=round_ts,
+        side="BUY", token_id="tok", tier_name="T1", price=0.40, size=5.0,
+        lifetime_s=300, expires_at=round_ts + 300, placed_at=round_ts,
+    )
+    db.insert_fill("f1", "c1", round_ts, "tok", "BUY", 0.40, 5.0,
+                   ts_ms=now_ms - 3000)
+    db.insert_fill("f2", "c1", round_ts, "tok", "SELL", 0.48, 5.0,
+                   ts_ms=now_ms - 2000)
+    db.insert_order(
+        client_order_id="c2", server_order_id="s2", round_start_ts=round_ts,
+        side="BUY", token_id="tok", tier_name="T1", price=0.40, size=5.0,
+        lifetime_s=300, expires_at=round_ts + 300, placed_at=round_ts,
+    )
+    db.insert_fill("f3", "c2", round_ts, "tok", "BUY", 0.40, 5.0,
+                   ts_ms=now_ms - 1000)
+
+    rounds = status_mod.rounds_with_pnl(conn)
+    r = rounds[0]
+    assert r["status"] == "holding"
+    assert r["closed"] is False
+    assert r["buy_cost"] == pytest.approx(4.0)
+    assert r["sell_proceeds"] == pytest.approx(2.4)
+    assert r["pnl_usd"] == pytest.approx(0.40)
+    assert r["pnl_pct"] == pytest.approx(0.20)
+    assert r["open_qty"] == pytest.approx(5.0)
+
+    stats = status_mod.compute_stats(rounds)
+    assert stats["today_pnl_usd"] == pytest.approx(0.40)
+    assert stats["total_pnl_usd"] == pytest.approx(0.40)
+    assert stats["wins"] == 1
+    assert stats["losses"] == 0
+    assert stats["open_rounds"] == 1
+    assert stats["closed_rounds"] == 0
+    assert stats["today_rounds"] == 1
 
 
 # ---------------------------------------------------------------------------

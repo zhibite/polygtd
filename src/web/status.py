@@ -236,14 +236,93 @@ LIMIT ?
 """
 
 
+def _round_realized_pnl(
+    conn: Any, wanted: set[int]
+) -> tuple[
+    dict[int, float], dict[int, float], dict[int, float],
+    dict[int, float], dict[int, int],
+]:
+    """Walk each round's fills in time order and return REALISED PnL.
+
+    Uses the same average-cost accounting as the engine: BUY fills grow the
+    position and its cost basis, SELL fills realise
+    `(sell_price - avg_cost) * sold_qty` and reduce the basis pro-rata.
+
+    Why this exists (operator 2026-10-31): the old round PnL was
+    `sell_proceeds - buy_cost`, so a same-window re-entry after a TP made
+    the round look like a loss — the fresh BUY's cost was subtracted even
+    though that position had not been sold yet (first TP +0.5 then a 2u
+    re-entry displayed -1.5). Realised PnL counts each SELL when it fills;
+    an open re-entry does not touch it.
+
+    Returns dicts keyed by round_start_ts:
+      realized, cost_of_sold, open_qty, pnl_today, sells_today
+    """
+    realized: dict[int, float] = {}
+    cost_sold: dict[int, float] = {}
+    open_qty: dict[int, float] = {}
+    pnl_today: dict[int, float] = {}
+    sells_today: dict[int, int] = {}
+    today_start_ms = int(
+        datetime.now(timezone.utc)
+        .replace(hour=0, minute=0, second=0, microsecond=0)
+        .timestamp() * 1000
+    )
+    state: dict[int, list[float]] = {}  # round -> [qty, cost basis]
+    for round_ts, side, price, size, ts_ms in conn.execute(
+        "SELECT round_start_ts, side, price, size, ts_ms FROM fills "
+        "ORDER BY round_start_ts ASC, ts_ms ASC, fill_id ASC"
+    ):
+        if round_ts not in wanted:
+            continue
+        try:
+            px = float(price or 0.0)
+            sz = float(size or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if px <= 0 or sz <= 0:
+            continue
+        st = state.setdefault(round_ts, [0.0, 0.0])
+        if str(side or "").upper() == "BUY":
+            st[0] += sz
+            st[1] += px * sz
+            continue
+        # SELL: realise only against shares actually held.
+        sold = min(sz, st[0])
+        if sold <= 1e-12:
+            continue
+        avg = st[1] / st[0]
+        pnl = (px - avg) * sold
+        realized[round_ts] = realized.get(round_ts, 0.0) + pnl
+        cost_sold[round_ts] = cost_sold.get(round_ts, 0.0) + avg * sold
+        try:
+            ts_ms_i = int(ts_ms or 0)
+        except (TypeError, ValueError):
+            ts_ms_i = 0
+        if ts_ms_i >= today_start_ms:
+            pnl_today[round_ts] = pnl_today.get(round_ts, 0.0) + pnl
+            sells_today[round_ts] = sells_today.get(round_ts, 0) + 1
+        st[0] -= sold
+        st[1] -= avg * sold
+        if st[0] <= 1e-9:
+            st[0] = 0.0
+            st[1] = 0.0
+    open_qty = {ts: st[0] for ts, st in state.items()}
+    return realized, cost_sold, open_qty, pnl_today, sells_today
+
+
 def rounds_with_pnl(conn: Any, limit: int = 100) -> list[dict[str, Any]]:
     """Rounds with realised PnL derived from fills.
 
-    A round is `closed` once it has at least one SELL fill. Rounds with only
-    BUY fills are `open` and report `pnl_usd=None` so they are excluded from
-    win-rate / realised-PnL stats. Rounds that have orders but no fills are
-    `unfilled` (the bot posted, nothing traded) — they are NOT open
-    positions.
+    Realised PnL is computed per SELL fill against the round's running
+    average cost, so each take-profit is booked the moment it fills — a
+    same-window re-entry does not subtract its (still open) buy cost.
+
+    Status:
+      * `closed`  — at least one SELL and the position is flat
+      * `holding` — realised some sells but still holds inventory
+      * `open`    — holds inventory, no sells yet (pnl_usd is None)
+      * `unfilled`— orders but no fills at all
 
     Rounds with neither orders nor fills are excluded entirely. Older
     builds wrote a `rounds` row at every window boundary, so windows where
@@ -251,6 +330,15 @@ def rounds_with_pnl(conn: Any, limit: int = 100) -> list[dict[str, Any]]:
     balance) lingered in the history as phantom open positions.
     """
     rows = conn.execute(_ROUNDS_SQL, (int(limit),)).fetchall()
+    wanted = {int(row[0]) for row in rows}
+    if wanted:
+        (realized, cost_sold, open_qty, pnl_today, sells_today) = (
+            _round_realized_pnl(conn, wanted)
+        )
+    else:
+        realized, cost_sold, open_qty, pnl_today, sells_today = (
+            {}, {}, {}, {}, {}
+        )
     out: list[dict[str, Any]] = []
     for row in rows:
         (round_ts, slug, started_at, finished_at,
@@ -259,14 +347,18 @@ def rounds_with_pnl(conn: Any, limit: int = 100) -> list[dict[str, Any]]:
         buy_cost = float(buy_cost or 0.0)
         sell_proceeds = float(sell_proceeds or 0.0)
         fill_count = int(fill_count or 0)
-        closed = sell_proceeds > 0
-        if closed:
+        has_sells = sell_proceeds > 0
+        qty_open = float(open_qty.get(round_ts, 0.0))
+        if qty_open > 1e-9:
+            round_status = "holding" if has_sells else "open"
+        elif has_sells:
             round_status = "closed"
         elif fill_count > 0:
             round_status = "open"
         else:
             round_status = "unfilled"
-        pnl = (sell_proceeds - buy_cost) if closed else None
+        pnl = float(realized.get(round_ts, 0.0)) if has_sells else None
+        cost_sold_round = float(cost_sold.get(round_ts, 0.0))
         out.append({
             "round_start_ts": round_ts,
             "slug": slug,
@@ -278,43 +370,52 @@ def rounds_with_pnl(conn: Any, limit: int = 100) -> list[dict[str, Any]]:
             "order_count": int(order_count or 0),
             "cancel_count": int(cancel_count or 0),
             "status": round_status,
-            "closed": closed,
+            "closed": round_status == "closed",
             "pnl_usd": pnl,
-            "pnl_pct": (pnl / buy_cost) if (closed and buy_cost > 0) else None,
+            "pnl_pct": (
+                (pnl / cost_sold_round)
+                if (pnl is not None and cost_sold_round > 0)
+                else None
+            ),
+            # Realised PnL booked TODAY (by sell fill timestamp), so the
+            # dashboard reflects a TP immediately, not at the round's end.
+            "pnl_today_usd": (
+                float(pnl_today.get(round_ts, 0.0)) if has_sells else 0.0
+            ),
+            "sells_today": int(sells_today.get(round_ts, 0)),
+            "open_qty": qty_open,
         })
     return out
 
 
 def compute_stats(rounds: list[dict[str, Any]]) -> dict[str, Any]:
-    closed = [r for r in rounds if r["closed"]]
-    # Only rounds with an actual BUY fill are "未平" (open position). A
-    # round where orders were posted but never filled has no position.
-    open_rounds = [r for r in rounds if r.get("status") == "open"]
-    unfilled = [r for r in rounds if r.get("status") == "unfilled"]
-    wins = [r for r in closed if (r["pnl_usd"] or 0.0) > 0]
-    losses = [r for r in closed if (r["pnl_usd"] or 0.0) <= 0]
-    total_pnl = sum(r["pnl_usd"] or 0.0 for r in closed)
+    closed = [r for r in rounds if r["status"] == "closed"]
+    # "未平" includes rounds still holding inventory, whether or not they
+    # already realised some sells (same-window re-entry).
+    open_rounds = [r for r in rounds if r["status"] in ("open", "holding")]
+    unfilled = [r for r in rounds if r["status"] == "unfilled"]
+    # Win/loss is judged on REALISED PnL per round (a holding round with a
+    # profitable TP already counts).
+    traded = [r for r in rounds if r["sell_proceeds"] > 0]
+    wins = [r for r in traded if (r["pnl_usd"] or 0.0) > 0]
+    losses = [r for r in traded if (r["pnl_usd"] or 0.0) <= 0]
+    total_pnl = sum(r["pnl_usd"] or 0.0 for r in rounds)
     gross_win = sum(r["pnl_usd"] for r in wins)
     gross_loss = abs(sum(r["pnl_usd"] for r in losses))
-    today_start = int(
-        datetime.now(timezone.utc)
-        .replace(hour=0, minute=0, second=0, microsecond=0)
-        .timestamp()
+    today_pnl = sum(float(r.get("pnl_today_usd") or 0.0) for r in rounds)
+    today_rounds = sum(
+        1 for r in rounds if int(r.get("sells_today") or 0) > 0
     )
-    today = [
-        r for r in closed
-        if int(r["round_start_ts"] or 0) >= today_start
-    ]
     return {
         "closed_rounds": len(closed),
         "open_rounds": len(open_rounds),
         "unfilled_rounds": len(unfilled),
         "wins": len(wins),
         "losses": len(losses),
-        "win_rate": (len(wins) / len(closed)) if closed else None,
+        "win_rate": (len(wins) / len(traded)) if traded else None,
         "total_pnl_usd": total_pnl,
-        "today_pnl_usd": sum(r["pnl_usd"] or 0.0 for r in today),
-        "today_rounds": len(today),
+        "today_pnl_usd": today_pnl,
+        "today_rounds": today_rounds,
         "avg_win_usd": (gross_win / len(wins)) if wins else 0.0,
         "avg_loss_usd": (-gross_loss / len(losses)) if losses else 0.0,
         "profit_factor": (gross_win / gross_loss) if gross_loss > 0 else None,
