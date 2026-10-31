@@ -345,40 +345,6 @@ class StrategyEngine:
             note="T4 drift gate bypassed: enough window time left to recover",
         )
 
-    # ── Same-window T1 re-entry after an early TP (2026-10-31) ───────────
-
-    def _t1_reentry_allowed(self) -> bool:
-        """True when a TP exit leaves enough time for a fresh T1 sequence."""
-        min_remaining = self._cfg_float("T1_REENTRY_MIN_REMAINING_S", 720.0)
-        if min_remaining <= 0:
-            return False
-        remaining = self._window_remaining_s()
-        return remaining is not None and remaining >= min_remaining
-
-    def _maybe_rearm_for_reentry(self, pos) -> None:  # noqa: ANN001
-        """Reset the round state after an EARLY take-profit exit.
-
-        Called from the post-TP near-zero branch. A TP normally blocks T1
-        until the next window (`entry_token` is kept on purpose); when the
-        exit happens while the window still has plenty of time, the
-        operator wants the bot to start a fresh entry sequence instead.
-        """
-        if not self._t1_reentry_allowed():
-            return
-        remaining = self._window_remaining_s()
-        pos.reset_for_new_entry()
-        # Start the new cycle with a clean TP backoff and log throttles.
-        self._tp_last_post_error_ts = 0.0
-        self._tp_post_failure_count = 0
-        self._tp_backoff_s = 5.0
-        self._t4_bypass_logged_round = None
-        log.info(
-            "engine.t1_reentry_armed",
-            remaining_s=round(remaining, 1) if remaining is not None else None,
-            round_start_ts=getattr(self._round, "round_start_ts", 0),
-            note="early TP exit; round state reset for a fresh T1 sequence",
-        )
-
     async def _cancel_placed_buys(self, reason: str) -> None:
         """Cancel every resting BUY GTD (T1..T4) during a volatility blackout.
 
@@ -1818,8 +1784,12 @@ class StrategyEngine:
         # residual. Run the cleanup exactly once: the old
         # `snap.total_qty <= 0` guard returned without cleaning the tier
         # state, so the dashboard kept showing filled tiers after the
-        # position was gone (production 2026-10-31 09:02). Then apply the
-        # same-window re-entry rule.
+        # position was gone (production 2026-10-31 09:02).
+        #
+        # A TP exit is FINAL for the window: `realize_position_closed`
+        # deliberately keeps `entry_token`, so `_check_t1_entry` cannot
+        # start another ladder until the next 15-minute round. Re-entering
+        # after a profit was judged too risky (operator decision 2026-10-31).
         #
         # IMPORTANT: `_total_qty == 0` is ALSO the state while a freshly
         # decided T1 order is still resting on the book (entry_token is set
@@ -1837,9 +1807,6 @@ class StrategyEngine:
                     source="engine._check_take_profit",
                     note="total_qty near zero after TP fill; clearing residual state",
                 )
-                # Early-TP re-entry: if the exit happened with enough
-                # window time left, reset for a fresh T1 in the SAME window.
-                self._maybe_rearm_for_reentry(pos)
             return
 
         # R6 (audit 2026-07-12): avg_cost sanity gate.

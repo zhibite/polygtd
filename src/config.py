@@ -185,14 +185,11 @@ class StrategySettings(BaseSettings):
     # 0 disables (T4 always requires drift within limit).
     T4_DRIFT_BYPASS_MIN_REMAINING_S: float = 540.0
 
-    # Same-window T1 re-entry after an EARLY take-profit (operator decision
-    # 2026-10-31). Normally a TP exit blocks T1 until the next window. When
-    # the position is fully closed while the window still has at least this
-    # many seconds left (default 720 = TP finished in the first 3 minutes of
-    # a 15-minute window), the round state is reset and a fresh T1 sequence
-    # may start in the same window. 0 disables (one entry sequence per
-    # window, the old behaviour).
-    T1_REENTRY_MIN_REMAINING_S: float = 720.0
+    # NOTE: Same-window T1 re-entry after a take-profit is deliberately NOT
+    # supported (operator decision 2026-10-31). Once a round has taken
+    # profit, `entry_token` is kept until the next window so a fresh
+    # martingale ladder cannot start — re-entering late in the same window
+    # was judged too risky.
 
     # ── Order settings ────────────────────────────────────────────────────
     # GTD lifetime in seconds. CLOB enforces a 180-second hard floor

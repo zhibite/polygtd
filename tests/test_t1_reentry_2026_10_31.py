@@ -1,10 +1,10 @@
-"""Tests for same-window T1 re-entry after an early take-profit.
+"""Tests for the post-take-profit entry block.
 
-Operator rule (2026-10-31): a TP exit normally blocks T1 until the next
-15-minute window. If the position is fully closed while the window still
-has at least `T1_REENTRY_MIN_REMAINING_S` (default 720 s = 12 min, i.e.
-the TP finished in the first 3 minutes), the round state is reset and a
-fresh T1 sequence may start in the same window.
+Operator rule (2026-10-31): once a round has taken profit, T1 must NOT
+enter again in the same 15-minute window — even when the TP filled with
+plenty of time left. Re-entering after a profit was judged too risky.
+`entry_token` is deliberately kept by `realize_position_closed`, which is
+the guard `_check_t1_entry` uses to block a fresh ladder.
 """
 from __future__ import annotations
 
@@ -73,18 +73,21 @@ def _round_with_end(pos: Position, seconds_left: float):
 
 
 @pytest.mark.asyncio
-async def test_early_tp_rearms_t1_in_same_window() -> None:
+async def test_early_tp_blocks_t1_for_the_rest_of_the_window() -> None:
+    """An early TP (13 min left) must still end this window's entries."""
     eng = _engine()
     pos = _residual_position()
-    eng._round = _round_with_end(pos, 800)  # ~13 min left: early TP
+    eng._round = _round_with_end(pos, 800)
 
     await eng._check_take_profit(bc_now=100_000.0)
 
-    assert pos.entry_token is None, "T1 must be re-enabled after an early TP"
-    assert pos.entry_side is None
+    assert pos.entry_token == "UP", (
+        "a TP exit must block T1 until the next window, even with time left"
+    )
+    assert pos.entry_side == "UP"
     assert pos._total_qty == 0.0
     assert pos._tp_sold_qty == 0.0
-    assert pos.baseline_realized_price is None
+    assert pos._position_closed is True
     assert all(t.size_filled == 0.0 for t in pos.tiers)
     assert all(not t.placed and not t.filled for t in pos.tiers)
 
@@ -106,17 +109,6 @@ async def test_late_tp_keeps_single_entry_per_window() -> None:
     assert pos.tier1.size_filled == 0.0
     assert pos.tier1.filled is False
     assert pos.tier1.server_order_id is None
-
-
-@pytest.mark.asyncio
-async def test_reentry_can_be_disabled() -> None:
-    eng = _engine(T1_REENTRY_MIN_REMAINING_S=0.0)
-    pos = _residual_position()
-    eng._round = _round_with_end(pos, 800)
-
-    await eng._check_take_profit(bc_now=100_000.0)
-
-    assert pos.entry_token == "UP", "0 disables the re-entry feature"
 
 
 @pytest.mark.asyncio

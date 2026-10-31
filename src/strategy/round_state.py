@@ -633,60 +633,6 @@ class Position:
             ),
         )
 
-    def reset_for_new_entry(self) -> None:
-        """Full reset so a NEW T1 sequence can start in the same window.
-
-        Used only for the early-TP re-entry feature
-        (`T1_REENTRY_MIN_REMAINING_S`). Unlike `realize_position_closed`,
-        this also clears `entry_token` (re-enabling `_check_t1_entry`) and
-        every tier's fill state, so the next T1 anchors a fresh martingale
-        ladder from scratch.
-        """
-        self.entry_side = None
-        self.entry_token = None
-        self._total_qty = 0.0
-        self._total_cost = 0.0
-        self._avg_cost = 0.0
-        self._tp_sold_qty = 0.0
-        self._tp_inflight = False
-        self._last_qty_signature = 0.0
-        self._position_closed = False
-        self._tp_snapshots.clear()
-        self._applied_watcher_dedup.clear()
-        self.baseline_target_price = None
-        self.baseline_realized_price = None
-        self.baseline_set_realized = False
-        self.t1_retry_after_ts = 0.0
-        self.tp_cancel_retry_after_ts = 0.0
-        # Dynamic engine helpers keyed on the previous entry.
-        self._t1_rebased_logged = False  # type: ignore[attr-defined]
-        self._last_used_t1_entry = None  # type: ignore[attr-defined]
-
-        for tier in self.tiers:
-            tier.placed = False
-            tier.watching = False
-            tier.filled = False
-            tier.server_order_id = None
-            tier.avg_fill_price = None
-            tier.size_filled = 0.0
-            tier.size_expected = 0.0
-            tier.placed_qty = 0.0
-            tier.cost_filled = 0.0
-            tier.placed_at = 0.0
-            tier.expires_at = 0.0
-            tier.last_fill_ts = 0.0
-            tier.cancel_reason = ""
-            tier.token_id = None
-            tier.cancel_pending = False
-            tier.retry_after_ts = 0.0
-            tier.cancel_retry_after_ts = 0.0
-            tier.watcher_task = None
-
-        log.warning(
-            "position.reset_for_new_entry",
-            note="early TP exit; fresh T1 sequence may start in this window",
-        )
-
     def record_tp_fill(
         self,
         server_order_id: str,
