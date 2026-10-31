@@ -169,6 +169,11 @@ async def test_final_reconcile_promotes_fully_filled_order() -> None:
         ) -> None:
             self.applied.append((sid, size_matched, fill_price))
 
+        def reconcile_fill_terms(
+            self, sid, cumulative, fill_price=None, trader_side=None,
+        ) -> bool:
+            return True
+
         def mark_filled(self, sid) -> bool:  # noqa: ANN001
             self.marked.append(sid)
             return True
@@ -234,6 +239,11 @@ async def test_final_reconcile_rechecks_cumulative_after_await() -> None:
                 self.tracked.size_matched, size_matched
             )
 
+        def reconcile_fill_terms(
+            self, sid, cumulative, fill_price=None, trader_side=None,
+        ) -> bool:
+            return True
+
         def mark_filled(self, sid) -> bool:  # noqa: ANN001
             return True
 
@@ -294,6 +304,11 @@ def test_tp_terminal_fill_mirrors_into_order_manager() -> None:
             self, sid, size_matched, fill_price=None, trader_side=None,
         ) -> None:
             self.applied.append((sid, size_matched, fill_price))
+
+        def reconcile_fill_terms(
+            self, sid, cumulative, fill_price=None, trader_side=None,
+        ) -> bool:
+            return True
 
         def mark_filled(self, sid) -> bool:  # noqa: ANN001
             self.marked.append(sid)

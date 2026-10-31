@@ -230,6 +230,55 @@ class DB:
         self._c.execute("UPDATE fills SET confirmed=1 WHERE fill_id=?", (fill_id,))
         self._c.commit()
 
+    def get_fill_terms(
+        self, fill_id: str
+    ) -> tuple[float, float, float, str | None] | None:
+        """(price, size, fee, trader_side) for an existing fill row, or None."""
+        row = self._c.execute(
+            "SELECT price, size, COALESCE(fee, 0), trader_side "
+            "FROM fills WHERE fill_id=?",
+            (fill_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return (
+            float(row[0] or 0.0),
+            float(row[1] or 0.0),
+            float(row[2] or 0.0),
+            row[3],
+        )
+
+    def update_fill_terms(
+        self,
+        fill_id: str,
+        price: float | None,
+        fee: float,
+        trader_side: str | None = None,
+    ) -> None:
+        """Correct a fill row's price/fee/role after a later feed reports them.
+
+        The ORDER-UPDATE feed can book a fill first using the order's LIMIT
+        price and no trader role; when the authoritative TRADE event (or a
+        watcher terminal state) arrives for the same cumulative size, this
+        fills in the real execution price and the taker fee.
+
+        `price=None` keeps the stored price (the caller only learned the
+        role); `trader_side=None` keeps the stored role.
+        """
+        sets: list[str] = ["fee=?"]
+        args: list[object] = [float(fee)]
+        if price is not None and price > 0:
+            sets.append("price=?")
+            args.append(float(price))
+        if trader_side:
+            sets.append("trader_side=?")
+            args.append(str(trader_side).upper())
+        args.append(fill_id)
+        self._c.execute(
+            f"UPDATE fills SET {', '.join(sets)} WHERE fill_id=?", args
+        )
+        self._c.commit()
+
     def rounds_in_progress(self) -> list[tuple]:
         cur = self._c.execute(
             "SELECT round_start_ts, slug, condition_id, up_token, down_token, tick_size "

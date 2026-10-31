@@ -66,6 +66,7 @@ class _FakeOrderManager:
     tracked: dict = field(default_factory=dict)
     apply_log: List[Any] = field(default_factory=list)
     mark_filled_log: List[str] = field(default_factory=list)
+    reconcile_log: List[Any] = field(default_factory=list)
 
     def by_server_id(self, server_id: str) -> Optional[TrackedOrder]:
         return self.tracked.get(server_id)
@@ -78,6 +79,13 @@ class _FakeOrderManager:
         t = self.tracked.get(server_id)
         if t is not None:
             t.size_matched = size_matched
+
+    def reconcile_fill_terms(
+        self, server_id: str, cumulative: float, fill_price=None,
+        trader_side=None,
+    ) -> bool:
+        self.reconcile_log.append((server_id, cumulative, fill_price, trader_side))
+        return True
 
     def mark_filled(self, server_id: str) -> None:
         self.mark_filled_log.append(server_id)

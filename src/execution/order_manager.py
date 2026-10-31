@@ -248,6 +248,23 @@ class OrderManager:
         except (TypeError, ValueError):
             return 0.0
 
+    @staticmethod
+    def _normalize_trader_side(trader_side: str | None) -> str | None:
+        """TAKER / MAKER, or None when the feed does not know our role.
+
+        The WS TRADE hint is sometimes missing (or "UNKNOWN"); that is
+        materially different from MAKER — an unknown role must stay
+        eligible for a later TAKER backfill instead of being frozen as a
+        zero-fee maker fill.
+        """
+        role = str(trader_side or "").strip().upper()
+        return role if role in ("TAKER", "MAKER") else None
+
+    @staticmethod
+    def _fill_id_for(order: TrackedOrder, cumulative: float) -> str:
+        """Stable fill-row key for the fill that ended at `cumulative`."""
+        return f"{order.client_order_id}:{float(cumulative):.6f}"
+
     def _fill_fee(
         self, delta_size: float, fill_price: float, trader_side: str | None
     ) -> float:
@@ -283,8 +300,10 @@ class OrderManager:
             db.insert_fill(
                 # Cumulative matched size makes the id stable across the
                 # WS UPDATE / TierWatcher-resync feeds that both mirror
-                # the same fill into `apply_fill_event`.
-                fill_id=f"{order.client_order_id}:{order.size_matched:.6f}",
+                # the same fill into `apply_fill_event`. Single source of
+                # the key format — `reconcile_fill_terms` looks rows up
+                # with the same helper.
+                fill_id=self._fill_id_for(order, order.size_matched),
                 order_id=order.client_order_id,
                 round_start_ts=order.round_start_ts,
                 token_id=order.token_id,
@@ -297,6 +316,117 @@ class OrderManager:
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("order_manager.db_persist_fill_failed", error=str(exc))
+
+    def reconcile_fill_terms(
+        self,
+        server_order_id: str,
+        cumulative: float,
+        fill_price: float | None = None,
+        trader_side: str | None = None,
+    ) -> bool:
+        """Backfill execution price / trader role / taker fee on a booked fill.
+
+        Fill rows are keyed by the order's cumulative matched size, and the
+        FIRST feed to observe a fill inserts the row. That is frequently the
+        WS ORDER-UPDATE, which carries no execution price (only the LIMIT)
+        and no maker/taker role — so the row lands with fee=0. When the
+        authoritative TRADE event, a TierWatcher poll (which derives the
+        role from the order's `associate_trades`) or the cancel-time
+        reconciliation later reports the same cumulative, this rewrites the
+        row with the real terms and (re)computes the Polymarket taker fee.
+
+        `fill_price=None` means "I only learned the role / no price info";
+        the stored price is kept. Only pass a price observed from a trade or
+        fill feed — never the order's limit-price mirror.
+
+        A role is only ever filled in when the row has none: a per-trade
+        role already on the row (written by `apply_fill_event` from the WS
+        TRADE payload) is more precise than the order-wide `is_taker` flag
+        this method is usually called with.
+
+        Returns True when a row was found and its terms were refreshed.
+        """
+        db = getattr(self, "_db", None)
+        if db is None or cumulative <= 0:
+            return False
+        role_in = self._normalize_trader_side(trader_side)
+        if fill_price is None and role_in is None:
+            # Nothing authoritative to contribute (e.g. the WS UPDATE
+            # mirror) — skip the DB round-trip entirely.
+            return False
+        order = self.by_server_id(server_order_id)
+        if order is None:
+            return False
+        fill_id = self._fill_id_for(order, cumulative)
+        try:
+            terms = db.get_fill_terms(fill_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("order_manager.db_fill_terms_failed", error=str(exc))
+            return False
+        if terms is None:
+            return False
+        old_price, size, old_fee, stored_role = terms
+        if size <= 0:
+            return False
+        old_role = self._normalize_trader_side(stored_role)
+        # A stored role is authoritative for this row; an incoming role can
+        # only fill a blank (see `role_changed` below).
+        role = old_role if old_role is not None else role_in
+        new_price = (
+            float(fill_price)
+            if fill_price is not None and fill_price > 0
+            else None
+        )
+        price_changed = (
+            new_price is not None and abs(new_price - old_price) > 1e-9
+        )
+        # ONLY backfill an unknown role — never overwrite one that is
+        # already recorded. Per-trade sources (the WS TRADE event's
+        # `trader_side`) are written on insert and are more precise than
+        # the order-wide `is_taker` flag the watcher derives (which is
+        # sticky: True if ANY associated trade was a taker). Overwriting
+        # would charge a taker fee on the maker rows of a mixed order.
+        role_changed = role_in is not None and old_role is None
+        if not price_changed and not role_changed:
+            return False
+        # Fee uses whichever price the row will carry after this update.
+        fee_px = new_price if new_price is not None else old_price
+        new_fee = (
+            self._fill_fee(size, fee_px, "TAKER")
+            if role == "TAKER"
+            else 0.0
+        )
+        # `price=None` keeps the stored price (role-only backfill).
+        # Best-effort like every other DB mirror: this runs inside the
+        # cancel handler and a dashboard-DB hiccup must never abort the
+        # trading path before the watcher/snapshot cleanup runs.
+        try:
+            db.update_fill_terms(
+                fill_id,
+                price=new_price,
+                fee=new_fee,
+                trader_side=role if role_changed else None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "order_manager.db_update_fill_terms_failed", error=str(exc)
+            )
+            return False
+        log.info(
+            "order_manager.fill_terms_reconciled",
+            client_id=order.client_order_id,
+            side=order.side,
+            tier=order.tier_name,
+            token=order.token_id[:16],
+            cumulative=cumulative,
+            old_price=old_price,
+            new_price=fee_px,
+            old_role=old_role,
+            new_role=role,
+            old_fee=old_fee,
+            new_fee=new_fee,
+        )
+        return True
 
     def _blocked(self, action: str) -> bool:
         """True when the emergency stop is engaged.
@@ -494,8 +624,18 @@ class OrderManager:
         if pending:
             order = self._orders.get(real_cid)
             if order:
-                for fill_price, size_matched in pending:
-                    self.apply_fill_event(server_id, size_matched=size_matched, fill_price=fill_price)
+                for item in pending:
+                    # `(price, cumulative)` is the legacy 2-tuple shape;
+                    # newer entries append the trader role so a FAK SELL
+                    # replayed here still books its taker fee.
+                    fill_price, size_matched = item[0], item[1]
+                    role = item[2] if len(item) > 2 else None
+                    self.apply_fill_event(
+                        server_id,
+                        size_matched=size_matched,
+                        fill_price=fill_price,
+                        trader_side=role,
+                    )
                 # If the cumulative matched reached the order's expected size,
                 # promote the status to "filled" (mirrors what mark_filled
                 # would have done had the lookup succeeded in time).
@@ -508,7 +648,13 @@ class OrderManager:
                     real_cid=real_cid,
                 )
 
-    def queue_pending_fill(self, server_id: str, fill_price: float, size_matched: float) -> None:
+    def queue_pending_fill(
+        self,
+        server_id: str,
+        fill_price: float,
+        size_matched: float,
+        trader_side: str | None = None,
+    ) -> None:
         """Store a fill observation that arrived before the real TrackedOrder.
 
         Called from `apply_fill_event` when the sentinel is detected. The
@@ -523,7 +669,9 @@ class OrderManager:
         if bucket is None:
             self._pending_fills = {}
             bucket = self._pending_fills
-        bucket.setdefault(server_id, []).append((fill_price, size_matched))
+        bucket.setdefault(server_id, []).append(
+            (fill_price, size_matched, self._normalize_trader_side(trader_side))
+        )
 
     def drain_pending_fills(self, server_id: str) -> None:
         """Explicitly drop pending fills for a server_id (e.g. on cancel)."""
@@ -1818,7 +1966,10 @@ class OrderManager:
             client_id = self._by_server.get(server_order_id)
             if client_id and client_id.startswith("_pending_"):
                 self.queue_pending_fill(
-                    server_order_id, fill_price or 0.0, size_matched
+                    server_order_id,
+                    fill_price or 0.0,
+                    size_matched,
+                    trader_side=trader_side,
                 )
                 log.debug(
                     "order_manager.apply_fill.queued_for_replay",
@@ -1833,6 +1984,7 @@ class OrderManager:
                     fill_price=fill_price,
                 )
             return
+        role = self._normalize_trader_side(trader_side)
         # size_matched is monotonic — keep the max
         if size_matched > order.size_matched:
             prev_matched = order.size_matched
@@ -1846,12 +1998,13 @@ class OrderManager:
                 fill_price if fill_price is not None and fill_price > 0
                 else order.price
             )
+            fee = self._fill_fee(delta_size, fill_px, role)
             self._persist_fill(
                 order,
                 delta_size=delta_size,
                 fill_price=fill_px,
-                trader_side=trader_side,
-                fee=self._fill_fee(delta_size, fill_px, trader_side),
+                trader_side=role,
+                fee=fee,
             )
             self._persist_status(order)
             # H-V6-2 fix: log every incremental fill so operators can see
@@ -1871,6 +2024,21 @@ class OrderManager:
                 new_matched=size_matched,
                 delta=size_matched - prev_matched,
                 fill_price=fill_price,
+                trader_side=role,
+                fee=fee,
                 expected=order.size,
                 fills_remaining=max(0.0, order.size - size_matched),
             )
+            return
+        # The cumulative is already booked — typically by the WS ORDER
+        # UPDATE, which books at the LIMIT price with no trader role. If
+        # this event carries the authoritative trade/fill terms for the
+        # same cumulative, backfill the row; otherwise it is a duplicate
+        # mirror and a no-op (`reconcile_fill_terms` writes nothing when
+        # neither the price nor the role changed).
+        self.reconcile_fill_terms(
+            server_order_id,
+            cumulative=size_matched,
+            fill_price=fill_price,
+            trader_side=role,
+        )

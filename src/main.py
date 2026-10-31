@@ -539,8 +539,56 @@ class ActionRouter:
                     # if the WS feed saw a later partial than the watcher's
                     # final observation). Mirror `_make_fill_callback`'s
                     # dedup contract: skip the engine call entirely to
-                    # avoid double-counting.
-                    pass
+                    # avoid double-counting. The fill ROW may still be
+                    # missing its taker role / real execution price if
+                    # the WS UPDATE booked it first — backfill those.
+                    reconcile_px = (
+                        float(result.avg_fill_price)
+                        if result.avg_fill_price and result.avg_fill_price > 0
+                        else None
+                    )
+                    reconcile_role = (
+                        "TAKER" if getattr(result, "is_taker", False) else None
+                    )
+                    if reconcile_px is None or reconcile_role is None:
+                        # Same race as the branch below: the watcher's
+                        # spawn-time fill-state read can precede the
+                        # trade ledger, so ask once more before the
+                        # row is left fee-free forever.
+                        clob = getattr(self._state, "clob", None)
+                        if clob is not None:
+                            try:
+                                fill_state = await clob.get_order_fill_state(
+                                    result.server_order_id
+                                )
+                                if fill_state:
+                                    px = float(
+                                        fill_state.get("avg_price", 0) or 0
+                                    )
+                                    if px > 0:
+                                        reconcile_px = px
+                                    if fill_state.get("is_taker"):
+                                        reconcile_role = "TAKER"
+                            except Exception as exc:  # noqa: BLE001
+                                log.debug(
+                                    "router.on_done.terms_refetch_failed",
+                                    server_id=result.server_order_id[:16],
+                                    error=str(exc),
+                                )
+                    om.reconcile_fill_terms(
+                        result.server_order_id,
+                        cumulative=float(result.filled_qty),
+                        fill_price=reconcile_px,
+                        trader_side=reconcile_role,
+                    )
+                    # The watcher reached FILLED/OVER_FILLED, but the
+                    # cumulative was already mirrored by the WS UPDATE,
+                    # so the usual post-apply promotion never ran. Without
+                    # this the tracked order stays "live" forever and the
+                    # 5-second GTD invariant reports a phantom order.
+                    # mark_filled is a no-op unless the cumulative really
+                    # reaches the order's expected size.
+                    om.mark_filled(result.server_order_id)
                 else:
                     forward_price = result.avg_fill_price
                     if not forward_price or forward_price <= 0:
@@ -554,7 +602,7 @@ class ActionRouter:
                         # call is the difference between avg_cost=0.38
                         # (strategy-price fallback) and avg_cost=0.33
                         # (real maker-fill avg).
-                        clob = self._state.clob
+                        clob = getattr(self._state, "clob", None)
                         if clob is not None:
                             try:
                                 fill_state = await clob.get_order_fill_state(
@@ -566,6 +614,12 @@ class ActionRouter:
                                     )
                                     if fetched > 0:
                                         forward_price = fetched
+                                    # The spawn-time read may have run
+                                    # before the trade ledger existed —
+                                    # learn the role from this one so
+                                    # the taker fee is booked on insert.
+                                    if fill_state.get("is_taker"):
+                                        result.is_taker = True
                             except Exception as exc:  # noqa: BLE001
                                 log.debug(
                                     "router.on_done.avg_price_refetch_failed",
@@ -688,12 +742,31 @@ class ActionRouter:
             # WS UPDATE arrives first, the polling delta collapses to 0
             # and the engine call is skipped.
             effective_delta = cumulative_size_matched - prev_size_matched
+            # The watcher passes 0.0 when this poll had no average price
+            # (the trade ledger has not caught up). That is NOT an
+            # execution price — never let it overwrite the fill row.
+            price_known = fill_price is not None and fill_price > 0
             if effective_delta <= 1e-9:
+                # Already booked (usually by the WS UPDATE, which has no
+                # role and only the limit price). This poll carries the
+                # CLOB average execution price and the maker/taker role
+                # derived from the order's trades — use them to complete
+                # the fill row's fee accounting.
+                om.reconcile_fill_terms(
+                    server_order_id,
+                    cumulative=cumulative_size_matched,
+                    fill_price=fill_price if price_known else None,
+                    trader_side=(
+                        "TAKER"
+                        if getattr(hint_result, "is_taker", False)
+                        else None
+                    ),
+                )
                 return
             om.apply_fill_event(
                 server_order_id,
                 size_matched=cumulative_size_matched,
-                fill_price=fill_price,
+                fill_price=fill_price if price_known else None,
                 trader_side=(
                     "TAKER"
                     if getattr(hint_result, "is_taker", False)
@@ -701,8 +774,17 @@ class ActionRouter:
                 ),
             )
             om.mark_filled(server_order_id)
+            engine_px = (
+                float(fill_price)
+                if price_known
+                else (
+                    tracked.price
+                    if tracked
+                    else getattr(hint_result, "strategy_price", 0.0)
+                )
+            )
             eng.on_order_filled(
-                token_id, server_order_id, fill_price, effective_delta
+                token_id, server_order_id, engine_px, effective_delta
             )
             log.info(
                 "router.polling_resync",
@@ -710,7 +792,8 @@ class ActionRouter:
                 order_id=server_order_id[:16],
                 cumulative=cumulative_size_matched,
                 delta_size=effective_delta,
-                fill_price=fill_price,
+                fill_price=engine_px,
+                price_observed=price_known,
                 note="polling catch-up (WS TRADE channel missed/late)",
             )
 
@@ -760,12 +843,13 @@ class ActionRouter:
         if om is None or not sid or filled <= 0:
             return
         fill_px = getattr(result, "avg_fill_price", 0.0) or 0.0
-        if fill_px <= 0:
-            fill_px = getattr(result, "strategy_price", 0.0) or 0.0
         om.apply_fill_event(
             sid,
             size_matched=filled,
-            fill_price=float(fill_px),
+            # Only a real observed average may overwrite a fill row's
+            # price; the strategy limit is just the insert-time fallback
+            # (apply_fill_event uses the tracked order's limit itself).
+            fill_price=float(fill_px) if fill_px > 0 else None,
             trader_side=(
                 "TAKER" if getattr(result, "is_taker", False) else None
             ),
@@ -790,6 +874,28 @@ class ActionRouter:
                 return
             pos = eng._round.position
             sid = result.server_order_id
+            # Fee/price accuracy: the spawn-time fast-fill read can race
+            # the trade ledger, leaving avg_fill_price=0 and no taker
+            # flag. One extra REST read here is the last chance to learn
+            # them before the fill row is persisted; without it the SELL
+            # exits stay fee-free in the dashboard.
+            if not result.is_taker or (result.avg_fill_price or 0.0) <= 0:
+                clob = getattr(self._state, "clob", None)
+                if clob is not None:
+                    try:
+                        fill_state = await clob.get_order_fill_state(sid)
+                        if fill_state:
+                            px = float(fill_state.get("avg_price", 0) or 0)
+                            if px > 0:
+                                result.avg_fill_price = px
+                            if fill_state.get("is_taker"):
+                                result.is_taker = True
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug(
+                            "router.tp_done.terms_refetch_failed",
+                            server_id=sid[:16],
+                            error=str(exc),
+                        )
             # Mirror the terminal cumulative into OrderManager FIRST: this
             # promotes the order to `filled` and persists the SELL fill row
             # (the engine-only update below left the dashboard showing a
@@ -843,12 +949,26 @@ class ActionRouter:
             tracked = om.by_server_id(server_order_id)
             prev_matched = tracked.size_matched if tracked else 0.0
             effective_delta = cumulative_size_matched - prev_matched
+            # 0.0 = the watcher did not observe an average this poll.
+            price_known = fill_price is not None and fill_price > 0
             if effective_delta <= 1e-9:
+                # Same as the BUY side: complete the terms of a fill row
+                # first booked by the WS UPDATE / WS TRADE without a role.
+                om.reconcile_fill_terms(
+                    server_order_id,
+                    cumulative=cumulative_size_matched,
+                    fill_price=fill_price if price_known else None,
+                    trader_side=(
+                        "TAKER"
+                        if getattr(hint_result, "is_taker", False)
+                        else None
+                    ),
+                )
                 return
             om.apply_fill_event(
                 server_order_id,
                 size_matched=cumulative_size_matched,
-                fill_price=fill_price,
+                fill_price=fill_price if price_known else None,
                 trader_side=(
                     "TAKER"
                     if getattr(hint_result, "is_taker", False)
@@ -856,10 +976,19 @@ class ActionRouter:
                 ),
             )
             om.mark_filled(server_order_id)
+            engine_px = (
+                float(fill_price)
+                if price_known
+                else (
+                    tracked.price
+                    if tracked
+                    else getattr(hint_result, "strategy_price", 0.0)
+                )
+            )
             # No BUY tier matches a SELL id, so on_order_filled falls
             # through to Position.record_tp_fill.
             eng.on_order_filled(
-                token_id, server_order_id, fill_price, effective_delta
+                token_id, server_order_id, engine_px, effective_delta
             )
             log.info(
                 "router.tp_polling_resync",
@@ -867,7 +996,8 @@ class ActionRouter:
                 order_id=server_order_id[:16],
                 cumulative=cumulative_size_matched,
                 delta_size=effective_delta,
-                fill_price=fill_price,
+                fill_price=engine_px,
+                price_observed=price_known,
             )
 
         def is_active() -> bool:
@@ -913,6 +1043,10 @@ class ActionRouter:
         if tracked is None:
             return
         fill_px = tracked.price
+        # True only when `fill_px` came from the trade-derived fill state.
+        # The tracked LIMIT is fine as an insert-time fallback but must not
+        # overwrite an already-booked row's real execution price.
+        fill_px_authoritative = False
         rest_cumulative = 0.0
         try:
             fill_state = await clob.get_order_fill_state(server_order_id)
@@ -927,6 +1061,7 @@ class ActionRouter:
                 avg_px = float(fill_state.get("avg_price", 0) or 0)
                 if avg_px > 0:
                     fill_px = avg_px
+                    fill_px_authoritative = True
             except (TypeError, ValueError):
                 pass
         # Re-read `prev` AFTER the await. The watcher's terminal on_done (or
@@ -941,17 +1076,23 @@ class ActionRouter:
         prev = tracked.size_matched or 0.0
         cumulative = max(prev, rest_cumulative)
         delta = cumulative - prev
+        role = "TAKER" if (fill_state or {}).get("is_taker") else None
         if delta <= 1e-9:
+            # Nothing new to book, but this is the last authoritative look
+            # at the order before the slot is released — fill in any
+            # role/price terms a racing WS UPDATE left incomplete.
+            om.reconcile_fill_terms(
+                server_order_id,
+                cumulative=cumulative,
+                fill_price=fill_px if fill_px_authoritative else None,
+                trader_side=role,
+            )
             return
         om.apply_fill_event(
             server_order_id,
             size_matched=cumulative,
-            fill_price=fill_px,
-            trader_side=(
-                "TAKER"
-                if (fill_state or {}).get("is_taker")
-                else None
-            ),
+            fill_price=fill_px if fill_px_authoritative else None,
+            trader_side=role,
         )
         # Promote the tracked order to `filled` once the cumulative reaches
         # its expected size. Without this, an order whose last fill is
@@ -1499,6 +1640,7 @@ class ActionRouter:
             fill_price: float,
             fill_delta_size: float,
             fill_total_size: float,
+            trader_side: str | None = None,
         ):
             if not eng or not om:
                 return
@@ -1542,9 +1684,22 @@ class ActionRouter:
                              "already pushed — likely out-of-order delivery; "
                              "clamping to skip",
                     )
-                    om.apply_fill_event(
-                        order_id, size_matched=prev_size_matched,
+                    om.reconcile_fill_terms(
+                        order_id,
+                        cumulative=fill_total_size,
                         fill_price=fill_price,
+                        trader_side=trader_side,
+                    )
+                else:
+                    # Same cumulative as OrderManager already booked. The
+                    # earlier booking may have been the WS UPDATE (limit
+                    # price, no role) — this observation carries the real
+                    # execution price and, for FAK sells, TAKER.
+                    om.reconcile_fill_terms(
+                        order_id,
+                        cumulative=fill_total_size,
+                        fill_price=fill_price,
+                        trader_side=trader_side,
                     )
                 return
             fill_delta_size = effective_delta
@@ -1556,6 +1711,7 @@ class ActionRouter:
                 order_id,
                 size_matched=fill_total_size,
                 fill_price=fill_price,
+                trader_side=trader_side,
             )
             om.mark_filled(order_id)
 
@@ -1573,6 +1729,7 @@ class ActionRouter:
                 fill_price=fill_price,
                 fill_delta_size=fill_delta_size,
                 fill_total_size=fill_total_size,
+                trader_side=trader_side,
             )
         return on_fill
 
@@ -2395,6 +2552,11 @@ def _make_maker_fill_callback(state: AppState):
     om = state.order_manager
     _seen_trades: set[str] = set()
     _SEEN_TRADES_LIMIT = 1024
+    # server_order_id -> sum of the per-trade volumes WE have seen. Used as
+    # the trade-side cumulative so a WS ORDER-UPDATE that already mirrored
+    # the same fill cannot be added a second time by the TRADE event.
+    _trade_totals: dict[str, float] = {}
+    _TRADE_TOTALS_LIMIT = 4096
 
     def on_maker_fill(fill, candidates=None) -> None:
         if not eng or not om:
@@ -2525,8 +2687,21 @@ def _make_maker_fill_callback(state: AppState):
         # The previous code subtracted `prev_cumulative` in both cases,
         # which silently dropped every partial fill after the first one
         # on a multi-trade GTD.
+        #
+        # ORDERING (2026-10-31 review): the WS ORDER-UPDATE and the WS
+        # TRADE report the SAME fill through different channels. Adding
+        # this trade's `inc` to OrderManager's UPDATE-mirrored cumulative
+        # double-books whenever the UPDATE arrived first — e.g. UPDATE
+        # mirrors 4 → prev=4, the TRADE then adds its 4 again → phantom
+        # 8 shares, mark_filled promotes a half-filled order, and the
+        # genuine second fill is capped away forever. Instead, keep our
+        # OWN running total of the trade volumes we have seen and advance
+        # the order to `max(OrderManager's cumulative, trade total)`.
+        # That is order-independent; a trade the WS missed simply leaves
+        # the max at OrderManager's (polling-derived) value.
         prev_cumulative = tracked.size_matched or 0.0
         rest_delta = chosen[4]
+        prev_trade_total = _trade_totals.get(order_id, 0.0)
         if rest_delta > 0:
             # REST fallback candidate shape: (oid, asset, CUMULATIVE, price,
             # delta). `chosen[2]` is the order's cumulative size_matched and
@@ -2540,9 +2715,12 @@ def _make_maker_fill_callback(state: AppState):
             # was rejected by the CLOB ("balance: 14360000, order amount:
             # 20380000"). Treat the REST value as the authoritative absolute
             # cumulative and never move backwards.
-            new_cumulative = max(prev_cumulative, float(chosen[2]))
+            trade_total = max(prev_trade_total, float(chosen[2]))
+            new_cumulative = max(prev_cumulative, trade_total)
         else:
             inc = max(0.0, float(chosen[2]))
+            trade_total = prev_trade_total + inc
+            new_cumulative = max(prev_cumulative, trade_total)
             # Cap the cumulative at the order's expected size. This absorbs
             # duplicate MATCHED→MINED→CONFIRMED re-fires when the WS payload
             # lacks a trade_id.
@@ -2550,11 +2728,31 @@ def _make_maker_fill_callback(state: AppState):
                 tracked.placed_size if tracked.placed_size > 0 else tracked.size
             )
             if expected_total > 0:
-                new_cumulative = min(prev_cumulative + inc, expected_total)
-            else:
-                new_cumulative = prev_cumulative + inc
+                new_cumulative = min(new_cumulative, expected_total)
+        _trade_totals[order_id] = trade_total
+        if len(_trade_totals) > _TRADE_TOTALS_LIMIT:
+            _trade_totals.clear()
         fill_size_inc = new_cumulative - prev_cumulative
         if fill_size_inc <= 1e-9:
+            # The cumulative was already booked (typically by the WS
+            # ORDER UPDATE, which knows neither our role nor the actual
+            # execution price). THIS event is the authoritative source
+            # for both — backfill the fill row's terms (and taker fee)
+            # before dropping the duplicate.
+            om.reconcile_fill_terms(
+                order_id,
+                cumulative=prev_cumulative,
+                # Only the row's OWN price counts. `fill_price` may have
+                # fallen back to tracked.price (the LIMIT) or to the
+                # top-level taker-side price; either would clobber a
+                # real execution price that is already on the row.
+                fill_price=fill_price if chosen[3] > 0 else None,
+                trader_side=getattr(fill, "trader_side", None),
+            )
+            # The UPDATE mirror advanced OrderManager, so the usual
+            # post-apply promotion is skipped. Promote here when the
+            # cumulative really is complete (mark_filled re-checks it).
+            om.mark_filled(order_id)
             log.debug(
                 "router.maker_fill.no_new",
                 order_id=order_id, prev=prev_cumulative,
@@ -2588,6 +2786,7 @@ def _make_maker_fill_callback(state: AppState):
             fill_price=fill_price,
             fill_size=fill_size_inc,
             fill_total_size=new_cumulative,
+            trader_side=getattr(fill, "trader_side", None),
             status=fill.status,
         )
 
@@ -2686,11 +2885,15 @@ def _make_user_ws_order_callback(state: AppState):
             if new_size_matched <= prev_size_matched + 1e-9:
                 # WS re-fire or out-of-order; nothing new.
                 return
-            fill_price = tracked.price  # for logging only — see comment above
+            # No execution price / trader role here: the UPDATE predates
+            # the trade data, so the row is booked at the LIMIT with
+            # fee=0 and completed later by the TRADE / watcher reconcile
+            # (`reconcile_fill_terms`). Passing the limit as a price
+            # would make that backfill treat it as authoritative.
             om.apply_fill_event(
                 order_id,
                 size_matched=new_size_matched,
-                fill_price=fill_price,
+                fill_price=None,
             )
             # H-NEW-2026-07-11-3: push cumulative into the watcher.
             # TierWatcher.receive_update() is monotonic — out-of-order

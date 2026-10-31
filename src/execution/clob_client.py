@@ -2,8 +2,13 @@
 
 Key differences from the stub:
   - Uses py_clob_client_v2.ClobClient (v2, not v1)
-  - BUY always goes via GTD limit (maker, no taker fee)
-  - SELL always goes via FAK market order (fastest exit)
+  - BUY goes via GTD limit; a GTD is only *maker* while it rests. If the
+    limit crosses the book it fills immediately as TAKER and pays the
+    Polymarket fee (C × rate × p × (1-p))
+  - SELL uses a GTD limit (production TP path) or a FAK market order
+    (`place_fak_sell`); either can be the taker when it crosses, so the
+    role is derived from the order's trades — never assumed from the
+    order type
   - fill_size is returned from the API response after a poll
   - Tracks expires_at so GtdExpiryWatcher can detect stale GTDs
   - on_fill callback fires after any confirmed fill
@@ -33,6 +38,14 @@ from py_clob_client_v2.clob_types import (
 )
 
 log = get_logger(__name__)
+
+# How long a FAILED / empty trade-ledger lookup is remembered before the
+# next `get_order_fill_state` retries it. Successful lookups are cached
+# permanently per (order, trade-count). The TTL only exists so a burst of
+# WS updates cannot re-walk the same trade ids on every wake; it is short
+# enough that the terminal re-read still gets a fresh chance once the
+# ledger catches up.
+_AVG_PRICE_UNKNOWN_TTL_S = 0.1
 
 
 def _round_down(value: float, prec: Decimal) -> float:
@@ -634,9 +647,15 @@ class CLOBClient:
         if cache is None:
             self._avg_price_cache = cache = {}
         key = (order_id, len(ids))
-        if key in cache:
-            cached_avg, cached_taker = cache[key]
-            return float(cached_avg), bool(cached_taker)
+        hit = cache.get(key)
+        if hit is not None:
+            cached_ts, cached_avg, cached_taker = hit
+            if (
+                cached_avg > 0
+                or cached_taker
+                or (time.monotonic() - cached_ts) < _AVG_PRICE_UNKNOWN_TTL_S
+            ):
+                return float(cached_avg), bool(cached_taker)
         total_qty = 0.0
         total_notional = 0.0
         taker_seen = False
@@ -681,7 +700,11 @@ class CLOBClient:
         avg = (total_notional / total_qty) if total_qty > 0 else 0.0
         if len(cache) > 512:
             cache.clear()
-        cache[key] = (avg, taker_seen)
+        # Always store, tagged with the time so an UNRESOLVED lookup
+        # (transient trade-endpoint failure / ledger lag) is retried after
+        # a short TTL instead of being frozen as "no price, maker" — the
+        # fee backfill depends on a later read seeing the trades.
+        cache[key] = (time.monotonic(), avg, taker_seen)
         if avg > 0 or taker_seen:
             log.info(
                 "clob.avg_price_from_trades",
@@ -1000,7 +1023,11 @@ class CLOBClient:
             fill_price=_round_down(avg_px, tick_d),
             success=True,
         )
-        await self._fire_fill_callback(token_id, result.order_id, avg_px, total_sz)
+        # A FAK (market) sell only fills by crossing the book — by
+        # definition WE are the taker, so the Polymarket fee applies.
+        await self._fire_fill_callback(
+            token_id, result.order_id, avg_px, total_sz, trader_side="TAKER"
+        )
         return result
 
     # ------------------------------------------------------------------
@@ -1189,6 +1216,7 @@ class CLOBClient:
         fill_price: float,
         fill_size: float,
         fill_id: str = "",
+        trader_side: str | None = None,
     ) -> None:
         """Forward a confirmed fill to the user callback, exactly once per delta.
 
@@ -1197,6 +1225,9 @@ class CLOBClient:
         cumulative -> delta so that the engine is never told about a fill it
         already accounted for, irrespective of how many parallel paths
         happened to observe it (WS / polling / FAK response).
+
+        `trader_side` ("TAKER" for marketable fills) is forwarded so the
+        router can book the Polymarket taker fee on the fill row.
         """
         if not self.fill_callback or not order_id:
             return
@@ -1211,7 +1242,7 @@ class CLOBClient:
             if delta <= 0:
                 return  # already notified by another source
             self.fill_callback(
-                token_id, order_id, fill_price, delta, total_after
+                token_id, order_id, fill_price, delta, total_after, trader_side
             )
         except Exception as exc:
             # Single malformed fill must not tear down the polling loop.

@@ -424,7 +424,12 @@ class TierWatcher:
                 expected_size=self._expected_size,
                 filled_qty=fast_size,
                 cancel_sent=cancel_sent,
-                avg_fill_price=fast_avg if fast_avg > 0 else self._strategy_price,
+                # 0 = "no average observed". Do NOT substitute the
+                # strategy/limit price: the router uses this field to
+                # distinguish a real execution price from the limit when
+                # backfilling fill fees and PnL, and it has its own
+                # notional/size fallback.
+                avg_fill_price=fast_avg if fast_avg > 0 else 0.0,
                 dedup_key=self._dedup_key(TierOutcome.FILLED),
             )
             log.info(
@@ -478,10 +483,11 @@ class TierWatcher:
                     expected_size=self._expected_size,
                     filled_qty=self._last_size_matched,
                     cancel_sent=cancel_sent,
+                    # 0 = not observed (see the fast-fill path above).
                     avg_fill_price=(
                         self._avg_price_running
                         if self._avg_price_running and self._avg_price_running > 0
-                        else self._strategy_price
+                        else 0.0
                     ),
                     dedup_key=self._dedup_key(TierOutcome.FILLED),
                 )
@@ -534,10 +540,14 @@ class TierWatcher:
             )
 
             observed = self._observed_size_matched()
+            # 0 = "no average observed" — consumers must use their own
+            # notional/size fallback. Substituting the strategy (LIMIT)
+            # price here previously made the router treat the limit as an
+            # authoritative execution price when backfilling fees.
             avg_price = (
                 self._avg_price_running
                 if self._avg_price_running and self._avg_price_running > 0
-                else self._strategy_price
+                else 0.0
             )
 
             # 2) Over-fill safety net (defensive — should not happen for a
@@ -815,9 +825,12 @@ class TierWatcher:
             # baseline so subsequent iterations can detect increments.
             primed = max(size_matched, self._last_size_matched)
             self._last_pushed_size_matched = primed
-            self._avg_price_running = (
-                avg_price if avg_price > 0 else self._strategy_price
-            )
+            # Keep 0.0 when this read had no average. Pretending the
+            # strategy (LIMIT) price is the fill average made
+            # `_ensure_avg_price_for_ws_fast_fill` a permanent no-op
+            # (`> 0` looked like a real observation) and fed the limit
+            # into the fee/PnL reconciliation as an execution price.
+            self._avg_price_running = avg_price if avg_price > 0 else 0.0
             self._partial_filling_initialised = True
             log.debug(
                 "tier_watcher.partial_fill_initialised",
@@ -852,16 +865,19 @@ class TierWatcher:
                 expected_size=self._expected_size,
                 filled_qty=high_water,
                 cancel_sent=False,
+                # 0 = not observed; the router applies its own fallback
+                # for the position cost basis and passes None (keep the
+                # stored value) to the fill-terms backfill.
                 avg_fill_price=(
                     self._avg_price_running
                     if self._avg_price_running > 0
-                    else self._strategy_price
+                    else 0.0
                 ),
                 is_taker=self._is_taker,
             )
             await self._on_partial_fill(
                 high_water,
-                self._avg_price_running if self._avg_price_running > 0 else self._strategy_price,
+                self._avg_price_running if self._avg_price_running > 0 else 0.0,
                 hint,
             )
         except Exception as exc:
