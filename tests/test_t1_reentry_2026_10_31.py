@@ -101,8 +101,11 @@ async def test_late_tp_keeps_single_entry_per_window() -> None:
         "late TP must keep the round's entry_token so T1 cannot re-enter"
     )
     assert pos._total_qty == 0.0
-    # realize_position_closed preserves tier fills by design.
-    assert pos.tier1.size_filled == 5.0
+    # The full-close cleanup resets the tier panel too (the dashboard must
+    # show all-idle once the position is gone).
+    assert pos.tier1.size_filled == 0.0
+    assert pos.tier1.filled is False
+    assert pos.tier1.server_order_id is None
 
 
 @pytest.mark.asyncio
@@ -114,3 +117,70 @@ async def test_reentry_can_be_disabled() -> None:
     await eng._check_take_profit(bc_now=100_000.0)
 
     assert pos.entry_token == "UP", "0 disables the re-entry feature"
+
+
+@pytest.mark.asyncio
+async def test_exact_zero_tp_close_cleans_tier_state_once() -> None:
+    """A TP that sells the exact quantity leaves total_qty == 0 (not an FP
+    residual). The cleanup must still run — once — or the dashboard keeps
+    showing filled tiers after the position is gone (production
+    2026-10-31 09:02)."""
+    from unittest.mock import patch
+
+    eng = _engine()
+    pos = Position()
+    pos.entry_token = "UP"
+    pos.entry_side = "UP"
+    pos._total_qty = 0.0  # exact zero, not 0.004
+    pos.tier1.size_filled = 5.0
+    pos.tier1.size_expected = 5.0
+    pos.tier1.filled = True
+    pos.tier1.placed = True
+    pos.tier1.server_order_id = "0xabc"
+    eng._round = _round_with_end(pos, 600)  # too late for re-entry
+
+    with patch.object(
+        pos, "realize_position_closed", wraps=pos.realize_position_closed
+    ) as mock_rpc:
+        await eng._check_take_profit(bc_now=100_000.0)
+        assert mock_rpc.call_count == 1
+
+        assert pos.tier1.size_filled == 0.0
+        assert pos.tier1.size_expected == 0.0
+        assert pos.tier1.filled is False
+        assert pos.tier1.placed is False
+        assert pos.tier1.server_order_id is None
+        assert pos._position_closed is True
+        assert pos.entry_token == "UP"  # no re-entry: too little time left
+
+        # A second tick must NOT repeat the cleanup.
+        await eng._check_take_profit(bc_now=100_000.0)
+        assert mock_rpc.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_pending_t1_is_not_treated_as_closed_position() -> None:
+    """entry_token is set at T1 decision time; before the fill lands the
+    position is still empty. The full-close cleanup must NOT run then, or
+    the pending T1 order would be wiped and the round could re-arm."""
+    from unittest.mock import patch
+
+    eng = _engine()
+    pos = Position()
+    pos.entry_token = "UP"
+    pos.entry_side = "UP"
+    pos._total_qty = 0.0
+    pos.tier1.placed = True
+    pos.tier1.server_order_id = "0xpending"
+    eng._round = _round_with_end(pos, 800)  # early window: re-arm eligible
+
+    with patch.object(
+        pos, "realize_position_closed", wraps=pos.realize_position_closed
+    ) as mock_rpc:
+        await eng._check_take_profit(bc_now=100_000.0)
+        assert mock_rpc.call_count == 0, (
+            "a pending T1 (no fills yet) must not be cleaned up as a closed position"
+        )
+
+    assert pos.entry_token == "UP"
+    assert pos.tier1.server_order_id == "0xpending"

@@ -323,6 +323,12 @@ class Position:
     # landed, whether that fill is the TP itself or residual positioning).
     _tp_inflight: bool = False
     _last_qty_signature: float = 0.0
+    # True once `realize_position_closed()` cleaned up the current flat
+    # position. A TP that sells the exact quantity leaves `_total_qty == 0`
+    # (not just an FP residual); the engine still needs to run the cleanup
+    # exactly once so the dashboard's tier panel shows all-idle, and this
+    # flag prevents the cleanup from repeating on every tick.
+    _position_closed: bool = False
     # Same post-failure backoff as TierSnapshot, for the T1 entry.
     t1_retry_after_ts: float = 0.0
     # Cancel-failure backoff for the TP GTD (avoids a cancel storm when the
@@ -586,18 +592,34 @@ class Position:
             )
         self._applied_watcher_dedup.clear()
 
-        # Reset tier mutex state but PRESERVE buy fills so the engine
-        # does not re-fire trigger_t1 next tick.
+        self._position_closed = True
+
+        # Reset the FULL tier state, including the per-tier fill records.
+        # The old code preserved `filled/size_filled/...` to stop a ghost
+        # trigger_t1, but `entry_token` (kept until the next window) already
+        # guards T1 and `_check_average_down` bails on a flat position, so
+        # the preserved state only made the dashboard's "分层状态" show
+        # filled tiers while the position was actually closed (production
+        # 2026-10-31 09:02: T1 displayed as filled 5/5 after the TP exit).
         for tier in self.tiers:
             tier.placed = False
             tier.watching = False
-            tier.placed_qty = 0.0
+            tier.filled = False
             tier.server_order_id = None
+            tier.avg_fill_price = None
+            tier.size_filled = 0.0
+            tier.size_expected = 0.0
+            tier.placed_qty = 0.0
+            tier.cost_filled = 0.0
+            tier.placed_at = 0.0
             tier.expires_at = 0.0
-            tier.watcher_task = None
+            tier.last_fill_ts = 0.0
+            tier.cancel_reason = ""
             tier.token_id = None
-            # NOTE: tier.filled, tier.size_filled, tier.cost_filled,
-            # tier.avg_fill_price preserved intentionally.
+            tier.cancel_pending = False
+            tier.retry_after_ts = 0.0
+            tier.cancel_retry_after_ts = 0.0
+            tier.watcher_task = None
 
         log.warning(
             "position.realize_closed",
@@ -605,10 +627,9 @@ class Position:
             note=note,
             prev_qty=prev_qty,
             prev_cost=prev_cost,
-            tiers_preserved=[t.tier for t in self.tiers if t.filled],
             note_2=(
-                "all in-memory position state cleared; tier BUY fills "
-                "preserved so engine does not ghost-fire trigger_t1"
+                "all in-memory position and tier state cleared; entry_token "
+                "is kept so T1 cannot re-enter this window"
             ),
         )
 
@@ -629,6 +650,7 @@ class Position:
         self._tp_sold_qty = 0.0
         self._tp_inflight = False
         self._last_qty_signature = 0.0
+        self._position_closed = False
         self._tp_snapshots.clear()
         self._applied_watcher_dedup.clear()
         self.baseline_target_price = None
@@ -773,6 +795,10 @@ class Position:
         """
         if size <= 0 or price <= 0:
             return
+
+        # A fill means we hold inventory again — the flat-position cleanup
+        # latch must release so a later full exit triggers it once more.
+        self._position_closed = False
 
         # If this is the first time we see a fill for this tier, mark placed=True.
         if not tier.placed:

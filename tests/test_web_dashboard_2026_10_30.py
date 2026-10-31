@@ -379,3 +379,57 @@ def test_http_routes_serve_pages_and_health() -> None:
 
     r = client.get("/static/style.css")
     assert r.status_code == 200
+
+
+def test_build_status_flat_position_shows_idle_tiers() -> None:
+    """A closed position must not render leftover filled tier rows.
+
+    Production 2026-10-31 09:02: the TP sold the whole position but the
+    dashboard's 分层状态 kept showing T1 filled 5/5 with a server order id,
+    while the actual position was empty.
+    """
+    mkt = SimpleNamespace(
+        up_token="UPTOKEN", down_token="DOWNTOKEN",
+        slug="btc-updown-15m-1", condition_id="0xdead",
+        window_start=None, window_end=None,
+    )
+
+    class _FlatPos:
+        entry_side = "DOWN"
+        entry_token = "DOWNTOKEN"
+        total_qty = 0.0
+        total_cost = 0.0
+        avg_cost = 0.0
+        tiers = [
+            SimpleNamespace(
+                tier=1, notional=2.0, placed=False, watching=False,
+                is_complete=True, size_filled=5.0, size_expected=5.0,
+                avg_fill_price=0.40, server_order_id="0xabc",
+            )
+        ]
+
+        def tp_target(self):
+            return None
+
+    state = SimpleNamespace(
+        wm=_FakeWM(mkt),
+        engine=SimpleNamespace(
+            _round=SimpleNamespace(
+                round_start_ts=1_000, slug=mkt.slug,
+                position=_FlatPos(), skip_reason=None,
+            ),
+            _gate=None,
+        ),
+        price_cache=PriceCache(),
+        binance_cache=SimpleNamespace(last_price=50_000.0),
+        order_manager=None,
+    )
+
+    out = status_mod.build_status(state)
+    tier = out["position"]["tiers"][0]
+    assert tier["status"] == "idle"
+    assert tier["filled"] is False
+    assert tier["size_filled"] == 0.0
+    assert tier["size_expected"] == 0.0
+    assert tier["server_order_id"] is None
+    assert tier["avg_fill_price"] is None

@@ -118,6 +118,24 @@ def build_status(state: Any) -> dict[str, Any]:
         elif pos.entry_side == "DOWN":
             held_mid = down_mid
         upnl = (held_mid - avg) * qty if qty > 0 and held_mid > 0 else 0.0
+        tiers = [_tier_payload(t) for t in getattr(pos, "tiers", [])]
+        if qty <= 1e-9:
+            # Flat position: never show leftover filled/placed tier rows.
+            # The engine clears them on its next tick, but the dashboard may
+            # poll inside that window — and this also covers legacy state
+            # (production 2026-10-31 09:02: T1 displayed filled 5/5 after a
+            # TP had closed the whole position).
+            for payload in tiers:
+                payload.update(
+                    status="idle",
+                    placed=False,
+                    watching=False,
+                    filled=False,
+                    size_filled=0.0,
+                    size_expected=0.0,
+                    avg_fill_price=None,
+                    server_order_id=None,
+                )
         position = {
             "side": pos.entry_side,
             "token": pos.entry_token,
@@ -128,7 +146,7 @@ def build_status(state: Any) -> dict[str, Any]:
             "upnl_usd": upnl,
             "upnl_pct": (upnl / cost) if cost > 0 else 0.0,
             "tp_target": pos.tp_target(),
-            "tiers": [_tier_payload(t) for t in getattr(pos, "tiers", [])],
+            "tiers": tiers,
         }
 
     # ── Open orders (live GTDs this round) ──────────────────────────────

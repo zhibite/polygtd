@@ -1810,7 +1810,36 @@ class StrategyEngine:
         pos = self._round.position
         if snap is None:
             snap = pos.snapshot()
-        if not snap.entry_token or snap.total_qty <= 0:
+        if not snap.entry_token:
+            return
+
+        # Position fully closed — a TP that sells the EXACT quantity leaves
+        # `_total_qty == 0`, and pro-rata arithmetic can leave a small FP
+        # residual. Run the cleanup exactly once: the old
+        # `snap.total_qty <= 0` guard returned without cleaning the tier
+        # state, so the dashboard kept showing filled tiers after the
+        # position was gone (production 2026-10-31 09:02). Then apply the
+        # same-window re-entry rule.
+        #
+        # IMPORTANT: `_total_qty == 0` is ALSO the state while a freshly
+        # decided T1 order is still resting on the book (entry_token is set
+        # at decision time, before any fill). Only treat it as "closed" when
+        # there is evidence of prior inventory — a tier fill or shares sold
+        # by TP. Otherwise a pending T1 would be wiped before it fills.
+        qty_now = pos._total_qty
+        if isinstance(qty_now, float) and qty_now < 1e-2:
+            had_inventory = (
+                float(getattr(snap, "tp_sold_qty", 0.0) or 0.0) > 1e-9
+                or sum(snap.tier_size_filled) > 1e-9
+            )
+            if had_inventory and not getattr(pos, "_position_closed", False):
+                pos.realize_position_closed(
+                    source="engine._check_take_profit",
+                    note="total_qty near zero after TP fill; clearing residual state",
+                )
+                # Early-TP re-entry: if the exit happened with enough
+                # window time left, reset for a fresh T1 in the SAME window.
+                self._maybe_rearm_for_reentry(pos)
             return
 
         # R6 (audit 2026-07-12): avg_cost sanity gate.
@@ -1834,28 +1863,6 @@ class StrategyEngine:
         # without dropping a real 6+ share gap (which would mean a TP
         # fired against a partial position view).
         sum_tier_qty = sum(snap.tier_size_filled)
-        # H-NEW-2026-07-15 (fix): check near-zero position BEFORE the
-        # tier-reconciliation gap check. After a TP sell drains the inventory
-        # the position may retain an FP residual (e.g. 0.004596 from pro-rata
-        # cost removal). This is NOT a reconciled-tier mismatch — the position
-        # IS empty. Without this guard the engine logs
-        # tp_blocked_avg_cost_unreconciled every tick for the rest of the round.
-        # Threshold 1e-2 = 0.01. This is:
-        #   - well below the smallest real position (T1 qty >= 2.0 tokens)
-        #   - above the FP residual (~0.0046) from TP sell pro-rata arithmetic
-        #   - above the ~0.00003 FP rounding slack from per-tier cost accumulation
-        #   So: real positions pass through, FP residuals trigger the guard.
-        # Type guard: skip in tests where pos._total_qty may be a MagicMock.
-        qty: float = pos._total_qty
-        if isinstance(qty, float) and qty < 1e-2:
-            pos.realize_position_closed(
-                source="engine._check_take_profit",
-                note="total_qty near zero after TP fill; clearing residual state",
-            )
-            # Early-TP re-entry: if the exit happened with enough window
-            # time left, reset for a fresh T1 sequence in the SAME window.
-            self._maybe_rearm_for_reentry(pos)
-            return
         qty_slack = max(1e-6 * max(snap.total_qty, 1.0), 1e-9)
         # `record_tp_fill` reduces total_qty but deliberately keeps
         # tier.size_filled intact, so shares already sold by an earlier
