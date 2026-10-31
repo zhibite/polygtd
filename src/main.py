@@ -36,7 +36,7 @@ import sys
 import time
 from typing import Optional
 
-from src.config import binance, log_config, strategy
+from src.config import binance, general, log_config, strategy
 from src.clob_l1_auth import create_or_derive_clob_api_creds, ClobL1Error
 from src.execution.clob_client import CLOBClient
 from src.execution.gtd_expiry_watcher import GtdExpiryWatcher
@@ -1984,6 +1984,116 @@ async def _on_new_round(round_start_ts: int) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Round settlement
+# ---------------------------------------------------------------------------
+#
+# A losing position is never sold — it simply expires worthless. Without
+# recording the market outcome the dashboard cannot tell a settled loss
+# apart from a still-open position, so those losses were missing from the
+# PnL / win-rate totals (operator report 2026-10-31). Gamma exposes the
+# resolved outcome; poll it for every ended round until it answers.
+#
+# Resolution is usually available seconds after the window closes, but
+# Gamma can lag or briefly 5xx. Attempts are capped per round so a market
+# that never resolves (e.g. voided) does not get polled forever.
+
+_RESOLUTION_POLL_S = 30.0
+_RESOLUTION_GRACE_S = 15.0
+_RESOLUTION_LOOKBACK_S = 30 * 86400
+_RESOLUTION_MAX_ATTEMPTS = 40
+_RESOLUTION_BATCH = 50
+
+
+async def _resolve_rounds_once(
+    state: AppState, attempts: dict[int, int]
+) -> int:
+    """Resolve ended rounds whose outcome is not yet in the DB.
+
+    Returns the number of rounds resolved this pass. `attempts` is owned
+    by the caller so the cap survives across polls.
+    """
+    pm = getattr(state, "pm_client", None)
+    db = getattr(state, "db", None)
+    if pm is None or db is None:
+        return 0
+
+    period = int(general().ROUND_PERIOD_S)
+    before_ts = int(time.time() - period - _RESOLUTION_GRACE_S)
+    try:
+        rows = db.unresolved_rounds(
+            before_ts=before_ts,
+            lookback_s=_RESOLUTION_LOOKBACK_S,
+            limit=_RESOLUTION_BATCH,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("round.resolve.query_failed", error=str(exc))
+        return 0
+
+    resolved_count = 0
+    for round_ts, cid, slug, up_token, down_token in rows:
+        # Both token ids are required to attribute the held side. Rows
+        # written by very old builds may lack them; they cannot be
+        # settled from Gamma's UP/DOWN outcome alone.
+        if not up_token or not down_token:
+            continue
+        tries = attempts.get(round_ts, 0)
+        if tries >= _RESOLUTION_MAX_ATTEMPTS:
+            continue
+        attempts[round_ts] = tries + 1
+        try:
+            res = await asyncio.wait_for(
+                pm.get_market_resolution(cid), timeout=10.0
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "round.resolve.failed",
+                round_start_ts=round_ts, cid=(cid or "")[:12], error=str(exc),
+            )
+            continue
+        if not res or not res.get("resolved"):
+            continue
+        up_won = bool(res.get("up_wins"))
+        try:
+            db.set_round_resolution(round_ts, up_won)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "round.resolve.persist_failed",
+                round_start_ts=round_ts, error=str(exc),
+            )
+            continue
+        attempts.pop(round_ts, None)
+        resolved_count += 1
+        log.info(
+            "round.resolved",
+            round_start_ts=round_ts,
+            slug=slug or "",
+            up_won=up_won,
+            note="settlement outcome recorded for PnL accounting",
+        )
+
+    # Bound the attempts map on a long-lived process.
+    if len(attempts) > 500:
+        cutoff = int(time.time()) - _RESOLUTION_LOOKBACK_S
+        for ts in [t for t in attempts if t < cutoff]:
+            attempts.pop(ts, None)
+    return resolved_count
+
+
+async def _resolution_loop() -> None:
+    """Poll Gamma for the outcome of ended rounds (settlement accounting)."""
+    attempts: dict[int, int] = {}
+    while True:
+        try:
+            await _resolve_rounds_once(STATE, attempts)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.warning("round.resolve.loop_error", error=str(exc))
+        await asyncio.sleep(_RESOLUTION_POLL_S)
+
 
 # ---------------------------------------------------------------------------
 # REST midpoint poller (stable prices for strategy decisions)
@@ -2446,9 +2556,10 @@ async def main() -> None:
     # ── Web dashboard (FastAPI on the bot's event loop) ─────────────────
     web_task = _start_dashboard()
 
-    # Status printer + REST midpoint poller
+    # Status printer + REST midpoint poller + settlement resolver
     status_task = asyncio.create_task(_status_loop())
     midpoint_task = asyncio.create_task(_midpoint_poll_loop())
+    resolution_task = asyncio.create_task(_resolution_loop())
 
     # ── Graceful shutdown ───────────────────────────────────────────────
     def _signal_handler() -> None:
@@ -2468,6 +2579,7 @@ async def main() -> None:
     log.info("bot.shutdown_initiated")
     status_task.cancel()
     midpoint_task.cancel()
+    resolution_task.cancel()
     # Stop the dashboard first: its routes read `db_conn`, which is closed
     # at the very end of shutdown.
     if web_task is not None:

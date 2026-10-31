@@ -28,6 +28,10 @@ from src.config import strategy as _strategy
 # otherwise a fully-exited round keeps showing 未平仓 forever.
 _DUST_QTY = 1e-2
 
+# Window length assumed when attributing a settlement that carries no
+# `resolved_at` (legacy rows). The bot only trades the 15-minute BTC series.
+_ROUND_PERIOD_S = 900
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -230,6 +234,11 @@ SELECT r.round_start_ts,
        r.slug,
        r.started_at,
        r.finished_at,
+       COALESCE(r.resolved, 0) AS resolved,
+       r.up_won,
+       r.resolved_at,
+       r.up_token,
+       r.down_token,
        COALESCE(SUM(CASE WHEN f.side = 'BUY'  THEN f.price * f.size END), 0.0) AS buy_cost,
        COALESCE(SUM(CASE WHEN f.side = 'SELL' THEN f.price * f.size END), 0.0) AS sell_proceeds,
        COUNT(f.fill_id) AS fill_count,
@@ -251,8 +260,8 @@ LIMIT ?
 def _round_realized_pnl(
     conn: Any, wanted: set[int]
 ) -> tuple[
-    dict[int, float], dict[int, float], dict[int, float],
-    dict[int, float], dict[int, int], dict[int, float],
+    dict[int, float], dict[int, float], dict[int, dict[str, list[float]]],
+    dict[int, float], dict[int, int], dict[int, float], dict[int, float],
 ]:
     """Walk each round's fills in time order and return REALISED PnL.
 
@@ -271,23 +280,30 @@ def _round_realized_pnl(
     is added to the cost basis, a SELL fee is deducted from the proceeds.
 
     Returns dicts keyed by round_start_ts:
-      realized, cost_of_sold, open_qty, pnl_today, sells_today, fees_total
+      realized, cost_of_sold, open_positions, pnl_today, sells_today,
+      fees_total, buy_fees
+
+    `open_positions[round][token_id] = [qty, cost_basis]` is what allows
+    settlement accounting: shares left at expiry are paid 1 (win) or 0
+    (loss) and never produce a SELL fill, so the caller needs the token
+    and remaining basis to book that outcome.
     """
     realized: dict[int, float] = {}
     cost_sold: dict[int, float] = {}
-    open_qty: dict[int, float] = {}
     pnl_today: dict[int, float] = {}
     sells_today: dict[int, int] = {}
     fees_total: dict[int, float] = {}
+    buy_fees: dict[int, float] = {}
     today_start_ms = int(
         datetime.now(timezone.utc)
         .replace(hour=0, minute=0, second=0, microsecond=0)
         .timestamp() * 1000
     )
-    state: dict[int, list[float]] = {}  # round -> [qty, cost basis]
-    for round_ts, side, price, size, ts_ms, fee in conn.execute(
-        "SELECT round_start_ts, side, price, size, ts_ms, COALESCE(fee, 0) "
-        "FROM fills "
+    # round -> token_id -> [qty, cost basis]
+    state: dict[int, dict[str, list[float]]] = {}
+    for round_ts, token_id, side, price, size, ts_ms, fee in conn.execute(
+        "SELECT round_start_ts, token_id, side, price, size, ts_ms, "
+        "COALESCE(fee, 0) FROM fills "
         "ORDER BY round_start_ts ASC, ts_ms ASC, fill_id ASC"
     ):
         if round_ts not in wanted:
@@ -300,13 +316,23 @@ def _round_realized_pnl(
             continue
         if px <= 0 or sz <= 0:
             continue
-        st = state.setdefault(round_ts, [0.0, 0.0])
+        tok = str(token_id or "")
+        positions = state.setdefault(round_ts, {})
+        st = positions.setdefault(tok, [0.0, 0.0])
         fees_total[round_ts] = fees_total.get(round_ts, 0.0) + fee_f
         if str(side or "").upper() == "BUY":
             st[0] += sz
             st[1] += px * sz + fee_f
+            buy_fees[round_ts] = buy_fees.get(round_ts, 0.0) + fee_f
             continue
-        # SELL: realise only against shares actually held.
+        # SELL: realise only against shares actually held. Older rows can
+        # carry a blank token_id on either side; fall back to the sole
+        # token that still holds inventory.
+        if st[0] <= 1e-12:
+            held = [s for s in positions.values() if s[0] > 1e-12]
+            if len(held) != 1:
+                continue
+            st = held[0]
         sold = min(sz, st[0])
         if sold <= 1e-12:
             continue
@@ -328,8 +354,10 @@ def _round_realized_pnl(
         if st[0] <= 1e-9:
             st[0] = 0.0
             st[1] = 0.0
-    open_qty = {ts: st[0] for ts, st in state.items()}
-    return realized, cost_sold, open_qty, pnl_today, sells_today, fees_total
+    return (
+        realized, cost_sold, state, pnl_today, sells_today, fees_total,
+        buy_fees,
+    )
 
 
 def rounds_with_pnl(conn: Any, limit: int = 100) -> list[dict[str, Any]]:
@@ -353,27 +381,64 @@ def rounds_with_pnl(conn: Any, limit: int = 100) -> list[dict[str, Any]]:
     rows = conn.execute(_ROUNDS_SQL, (int(limit),)).fetchall()
     wanted = {int(row[0]) for row in rows}
     if wanted:
-        (realized, cost_sold, open_qty, pnl_today, sells_today,
-         fees_total) = _round_realized_pnl(conn, wanted)
+        (realized, cost_sold, open_positions, pnl_today, sells_today,
+         fees_total, buy_fees) = _round_realized_pnl(conn, wanted)
     else:
-        realized, cost_sold, open_qty, pnl_today, sells_today, fees_total = (
-            {}, {}, {}, {}, {}, {}
-        )
+        (realized, cost_sold, open_positions, pnl_today, sells_today,
+         fees_total, buy_fees) = ({}, {}, {}, {}, {}, {}, {})
+    today_start_ms = int(
+        datetime.now(timezone.utc)
+        .replace(hour=0, minute=0, second=0, microsecond=0)
+        .timestamp() * 1000
+    )
     out: list[dict[str, Any]] = []
     for row in rows:
-        (round_ts, slug, started_at, finished_at,
-         buy_cost, sell_proceeds, fill_count, order_count,
-         cancel_count) = row
+        (round_ts, slug, started_at, finished_at, resolved, up_won,
+         resolved_at, up_token, down_token, buy_cost, sell_proceeds,
+         fill_count, order_count, cancel_count) = row
+        resolved = bool(resolved)
+        up_won_b = None if up_won is None else bool(up_won)
         buy_cost = float(buy_cost or 0.0)
         sell_proceeds = float(sell_proceeds or 0.0)
         fill_count = int(fill_count or 0)
         has_sells = sell_proceeds > 0
-        qty_open = float(open_qty.get(round_ts, 0.0))
-        if qty_open < _DUST_QTY:
-            # Ignore CLOB size-rounding dust (see `_DUST_QTY`): a round
-            # whose residual cannot even be sold is flat.
-            qty_open = 0.0
-        if qty_open > 0:
+
+        # Remaining inventory, per token. Ignore CLOB size-rounding dust
+        # (see `_DUST_QTY`): a round whose residual cannot even be sold is
+        # flat.
+        positions = open_positions.get(round_ts, {})
+        qty_open = sum(
+            float(q) for q, _cost in positions.values() if q >= _DUST_QTY
+        )
+
+        # Settlement: shares left at expiry pay 1 (win) or 0 (loss) and
+        # never produce a SELL fill. Book the outcome explicitly — without
+        # this, a fully losing T1..T4 round stays "未平仓" forever and is
+        # missing from the dashboard's PnL / win-rate stats.
+        settle_pnl: float | None = None
+        if resolved and up_won_b is not None and qty_open > 0:
+            total = 0.0
+            attributed = True
+            for token, (q, cost) in positions.items():
+                if q < _DUST_QTY:
+                    continue
+                if up_token and str(token) == str(up_token):
+                    payoff = 1.0 if up_won_b else 0.0
+                elif down_token and str(token) == str(down_token):
+                    payoff = 0.0 if up_won_b else 1.0
+                else:
+                    # The held side cannot be mapped to UP/DOWN (legacy
+                    # row without token ids). Leave the round open rather
+                    # than book a wrong number.
+                    attributed = False
+                    break
+                total += float(q) * payoff - float(cost)
+            if attributed:
+                settle_pnl = total
+
+        if resolved and (qty_open <= 0 or settle_pnl is not None):
+            round_status = "closed"
+        elif qty_open > 0:
             round_status = "holding" if has_sells else "open"
         elif has_sells:
             round_status = "closed"
@@ -381,13 +446,37 @@ def rounds_with_pnl(conn: Any, limit: int = 100) -> list[dict[str, Any]]:
             round_status = "open"
         else:
             round_status = "unfilled"
-        pnl = float(realized.get(round_ts, 0.0)) if has_sells else None
+
+        pnl = None
+        if has_sells or settle_pnl is not None:
+            pnl = float(realized.get(round_ts, 0.0)) + (settle_pnl or 0.0)
         cost_sold_round = float(cost_sold.get(round_ts, 0.0))
+        # A settled round's return is measured against everything it
+        # invested (notional + buy-side taker fees); a still-open round
+        # keeps the realised-on-sold-shares denominator.
+        pnl_denom = (
+            buy_cost + float(buy_fees.get(round_ts, 0.0))
+            if settle_pnl is not None
+            else cost_sold_round
+        )
+
+        # Attribute the settlement to the window it belongs to, not to the
+        # moment Gamma answered: a round ending at 23:58 UTC must stay in
+        # that day's PnL even if resolution lands after midnight (or the
+        # bot was offline and backfilled the outcome the next day).
+        settled_today = bool(
+            settle_pnl is not None
+            and (float(round_ts) + _ROUND_PERIOD_S) * 1000.0 >= today_start_ms
+        )
+
         out.append({
             "round_start_ts": round_ts,
             "slug": slug,
             "started_at": started_at,
             "finished_at": finished_at,
+            "resolved": resolved,
+            "up_won": up_won_b,
+            "resolved_at": resolved_at,
             "buy_cost": buy_cost,
             "sell_proceeds": sell_proceeds,
             "fill_count": fill_count,
@@ -399,17 +488,23 @@ def rounds_with_pnl(conn: Any, limit: int = 100) -> list[dict[str, Any]]:
             "closed": round_status == "closed",
             "pnl_usd": pnl,
             "pnl_pct": (
-                (pnl / cost_sold_round)
-                if (pnl is not None and cost_sold_round > 0)
+                (pnl / pnl_denom)
+                if (pnl is not None and pnl_denom > 0)
                 else None
+            ),
+            # PnL from the position left to settlement (1/0 payout).
+            "settlement_usd": (
+                float(settle_pnl) if settle_pnl is not None else 0.0
             ),
             # Realised PnL booked TODAY (by sell fill timestamp), so the
             # dashboard reflects a TP immediately, not at the round's end.
+            # Settlement PnL is included when the market resolved today.
             "pnl_today_usd": (
                 float(pnl_today.get(round_ts, 0.0)) if has_sells else 0.0
-            ),
+            ) + (float(settle_pnl) if settled_today else 0.0),
             "sells_today": int(sells_today.get(round_ts, 0)),
-            "open_qty": qty_open,
+            "settled_today": settled_today,
+            "open_qty": 0.0 if settle_pnl is not None else qty_open,
         })
     return out
 
@@ -421,8 +516,9 @@ def compute_stats(rounds: list[dict[str, Any]]) -> dict[str, Any]:
     open_rounds = [r for r in rounds if r["status"] in ("open", "holding")]
     unfilled = [r for r in rounds if r["status"] == "unfilled"]
     # Win/loss is judged on REALISED PnL per round (a holding round with a
-    # profitable TP already counts).
-    traded = [r for r in rounds if r["sell_proceeds"] > 0]
+    # profitable TP already counts; a round settled at expiry counts too,
+    # even when it never produced a SELL — e.g. the losing T4 case).
+    traded = [r for r in rounds if r.get("pnl_usd") is not None]
     wins = [r for r in traded if (r["pnl_usd"] or 0.0) > 0]
     losses = [r for r in traded if (r["pnl_usd"] or 0.0) <= 0]
     total_pnl = sum(r["pnl_usd"] or 0.0 for r in rounds)
@@ -430,7 +526,8 @@ def compute_stats(rounds: list[dict[str, Any]]) -> dict[str, Any]:
     gross_loss = abs(sum(r["pnl_usd"] for r in losses))
     today_pnl = sum(float(r.get("pnl_today_usd") or 0.0) for r in rounds)
     today_rounds = sum(
-        1 for r in rounds if int(r.get("sells_today") or 0) > 0
+        1 for r in rounds
+        if int(r.get("sells_today") or 0) > 0 or r.get("settled_today")
     )
     return {
         "closed_rounds": len(closed),

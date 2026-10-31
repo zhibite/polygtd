@@ -31,6 +31,17 @@ def _parse_end_dt(raw: str) -> Optional[datetime]:
         return None
 
 
+def _as_bool(value: object) -> bool:
+    """Parse a Gamma boolean that may arrive as bool, number or string."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if value is None:
+        return False
+    return str(value).strip().lower() in ("1", "true", "yes", "resolved")
+
+
 @dataclass(frozen=True)
 class ClientSettings:
     gamma_api: str
@@ -411,17 +422,46 @@ class PolymarketClient:
                 )
                 return None
 
-            resolved = bool(data.get("resolved", False))
+            raw = data.get("outcomePrices") or ""
+            try:
+                prices = json.loads(raw) if raw else []
+            except Exception:
+                prices = []
+            try:
+                nums = [float(p) for p in prices]
+            except (TypeError, ValueError):
+                nums = []
+
+            # Gamma has exposed resolution through slightly different
+            # fields over time. Accept any of: explicit `resolved`, UMA
+            # status resolved, or a closed market whose two outcome prices
+            # are terminal (exactly 0 and 1). A voided market's ["0","0"]
+            # is NOT a resolution.
+            terminal = len(nums) >= 2 and sorted(nums[:2]) == [0.0, 1.0]
+            uma = str(data.get("umaResolutionStatus") or "").strip().lower()
+            resolved = _as_bool(data.get("resolved")) or (
+                terminal and (_as_bool(data.get("closed")) or uma == "resolved")
+            )
             if not resolved:
                 return {"resolved": False, "up_wins": None, "outcome": ""}
 
-            raw = data.get("outcomePrices") or '["0","0"]'
+            # `outcomePrices` is ordered like `outcomes`. The 15-minute
+            # series lists Up first, but do not rely on it: find the UP
+            # label when present so a reordered market cannot book the
+            # winner as a loser.
+            up_idx = 0
+            raw_outcomes = data.get("outcomes")
             try:
-                prices = json.loads(raw)
+                labels = json.loads(raw_outcomes) if raw_outcomes else []
             except Exception:
-                prices = ["0", "0"]
+                labels = []
+            if isinstance(labels, list) and len(labels) == len(nums):
+                for i, label in enumerate(labels):
+                    if str(label).strip().lower() in ("up", "yes"):
+                        up_idx = i
+                        break
 
-            up_price = float(prices[0]) if prices else 0.0
+            up_price = nums[up_idx] if nums else 0.0
             up_wins = up_price >= 0.5
             outcome_text = (data.get("outcome") or "").strip()
             if outcome_text.lower() in ("up", "yes"):

@@ -41,7 +41,10 @@ CREATE TABLE IF NOT EXISTS rounds (
   binance_baseline REAL,
   finished        INTEGER DEFAULT 0,
   started_at      TEXT,
-  finished_at     TEXT
+  finished_at     TEXT,
+  resolved        INTEGER DEFAULT 0,
+  up_won          INTEGER,
+  resolved_at     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS orders (
@@ -107,6 +110,18 @@ def init_db(db_path: Path = _DB_PATH) -> sqlite3.Connection:
         if "fee" not in fill_cols:
             conn.execute("ALTER TABLE fills ADD COLUMN fee REAL DEFAULT 0")
             log.info("db.migrate.fills_fee")
+        round_cols = {row[1] for row in conn.execute("PRAGMA table_info(rounds)")}
+        if "resolved" not in round_cols:
+            conn.execute(
+                "ALTER TABLE rounds ADD COLUMN resolved INTEGER DEFAULT 0"
+            )
+            log.info("db.migrate.rounds_resolved")
+        if "up_won" not in round_cols:
+            conn.execute("ALTER TABLE rounds ADD COLUMN up_won INTEGER")
+            log.info("db.migrate.rounds_up_won")
+        if "resolved_at" not in round_cols:
+            conn.execute("ALTER TABLE rounds ADD COLUMN resolved_at TEXT")
+            log.info("db.migrate.rounds_resolved_at")
     except Exception as exc:  # noqa: BLE001
         log.warning("db.migrate.failed", error=str(exc))
     conn.commit()
@@ -161,6 +176,58 @@ class DB:
             (datetime.now(timezone.utc).isoformat(), round_start_ts)
         )
         self._c.commit()
+
+    def set_round_resolution(
+        self,
+        round_start_ts: int,
+        up_won: bool,
+        resolved_at: str | None = None,
+    ) -> None:
+        """Record the market's final outcome for a round.
+
+        Needed for settlement accounting: a losing position that expires
+        worthless is never sold, so without the outcome the dashboard
+        cannot book the loss (see `src/web/status.py`).
+        """
+        self._c.execute(
+            "UPDATE rounds SET resolved=1, up_won=?, resolved_at=? "
+            "WHERE round_start_ts=?",
+            (
+                1 if up_won else 0,
+                resolved_at or datetime.now(timezone.utc).isoformat(),
+                int(round_start_ts),
+            ),
+        )
+        self._c.commit()
+
+    def unresolved_rounds(
+        self,
+        before_ts: int,
+        lookback_s: int = 30 * 86400,
+        limit: int = 100,
+    ) -> list[tuple]:
+        """Rounds whose window has ended but whose outcome is unknown.
+
+        Returns `(round_start_ts, condition_id, slug, up_token, down_token)`
+        newest-first, so the round that just ended is settled before the
+        backlog of older rows. Rows without a condition_id cannot be looked
+        up and are skipped; the caller also needs both token ids to
+        attribute the held side.
+        """
+        cutoff = int(before_ts) - int(lookback_s)
+        rows = self._c.execute(
+            """
+            SELECT round_start_ts, condition_id, slug, up_token, down_token
+            FROM rounds
+            WHERE COALESCE(resolved, 0) = 0
+              AND condition_id IS NOT NULL AND condition_id <> ''
+              AND round_start_ts >= ? AND round_start_ts <= ?
+            ORDER BY round_start_ts DESC
+            LIMIT ?
+            """,
+            (cutoff, int(before_ts), int(limit)),
+        ).fetchall()
+        return [tuple(r) for r in rows]
 
     def insert_order(
         self,

@@ -10,6 +10,7 @@ Covers:
 """
 from __future__ import annotations
 
+import asyncio
 import time
 from types import SimpleNamespace
 
@@ -232,6 +233,9 @@ def test_trades_page_exposes_the_fill_pager() -> None:
     assert 'id="fill-next"' in r.text
     assert "/api/fills?limit=" in r.text
     assert "FILL_PAGE_SIZE = 20" in r.text
+    # Settlement at expiry is shown separately from SELL proceeds.
+    assert "到期结算" in r.text
+    assert "settlement_usd" in r.text
 
 
 def test_open_round_is_not_counted_as_loss(conn) -> None:
@@ -389,6 +393,219 @@ def test_realized_pnl_books_each_sell_and_ignores_open_reentry(conn) -> None:
     assert stats["open_rounds"] == 1
     assert stats["closed_rounds"] == 0
     assert stats["today_rounds"] == 1
+
+
+def test_settled_losing_round_is_booked_as_loss(conn) -> None:
+    """A T4 position that expires worthless must count as a loss.
+
+    No SELL fill exists for a losing binary outcome, so before settlement
+    accounting the round stayed "未平仓" forever and the loss was missing
+    from the dashboard totals (operator report 2026-10-31).
+    """
+    db = DB(conn)
+    round_ts = int(time.time()) - 900
+    db.upsert_round(
+        round_start_ts=round_ts, slug="r-loss", condition_id="0xdead",
+        up_token="UP", down_token="DOWN",
+    )
+    db.insert_order(
+        client_order_id="c-loss", server_order_id="s-loss",
+        round_start_ts=round_ts, side="BUY", token_id="UP", tier_name="T4",
+        price=0.40, size=10.0, lifetime_s=300,
+        expires_at=round_ts + 300, placed_at=round_ts,
+    )
+    db.insert_fill("f-loss", "c-loss", round_ts, "UP", "BUY", 0.40, 10.0,
+                   ts_ms=round_ts * 1000)
+    db.set_round_resolution(round_ts, up_won=False)
+
+    r = status_mod.rounds_with_pnl(conn)[0]
+    assert r["resolved"] is True
+    assert r["up_won"] is False
+    assert r["status"] == "closed"
+    assert r["closed"] is True
+    assert r["open_qty"] == 0.0
+    assert r["pnl_usd"] == pytest.approx(-4.0)
+    assert r["settlement_usd"] == pytest.approx(-4.0)
+    assert r["pnl_pct"] == pytest.approx(-1.0)
+
+    stats = status_mod.compute_stats([r])
+    assert stats["closed_rounds"] == 1
+    assert stats["open_rounds"] == 0
+    assert stats["wins"] == 0
+    assert stats["losses"] == 1
+    assert stats["win_rate"] == pytest.approx(0.0)
+    assert stats["total_pnl_usd"] == pytest.approx(-4.0)
+    assert stats["today_pnl_usd"] == pytest.approx(-4.0)
+    assert stats["today_rounds"] == 1
+
+
+def test_settled_loss_includes_buy_fees(conn) -> None:
+    """Buy-side taker fees are part of the basis and the return denominator."""
+    db = DB(conn)
+    round_ts = int(time.time()) - 900
+    db.upsert_round(
+        round_start_ts=round_ts, slug="r-fee", condition_id="0xfee",
+        up_token="UP", down_token="DOWN",
+    )
+    db.insert_fill("f-fee", "c-fee", round_ts, "UP", "BUY", 0.40, 10.0,
+                   ts_ms=round_ts * 1000, fee=0.10)
+    db.set_round_resolution(round_ts, up_won=False)
+
+    r = status_mod.rounds_with_pnl(conn)[0]
+    assert r["pnl_usd"] == pytest.approx(-4.10)
+    assert r["pnl_pct"] == pytest.approx(-1.0)
+
+
+def test_settled_winning_round_books_payout(conn) -> None:
+    """Winning shares pay $1 at expiry; book that as realised profit."""
+    db = DB(conn)
+    round_ts = int(time.time()) - 900
+    db.upsert_round(
+        round_start_ts=round_ts, slug="r-win", condition_id="0xbeef",
+        up_token="UP", down_token="DOWN",
+    )
+    db.insert_fill("f-win", "c-win", round_ts, "DOWN", "BUY", 0.40, 10.0,
+                   ts_ms=round_ts * 1000)
+    db.set_round_resolution(round_ts, up_won=False)  # DOWN wins
+
+    r = status_mod.rounds_with_pnl(conn)[0]
+    assert r["status"] == "closed"
+    assert r["pnl_usd"] == pytest.approx(6.0)  # 10 × $1 − $4 cost
+    assert r["settlement_usd"] == pytest.approx(6.0)
+    assert r["pnl_pct"] == pytest.approx(1.5)
+
+    stats = status_mod.compute_stats([r])
+    assert stats["wins"] == 1
+    assert stats["losses"] == 0
+    assert stats["total_pnl_usd"] == pytest.approx(6.0)
+
+
+def test_partial_tp_then_settlement_books_remaining_loss(conn) -> None:
+    """A half-sold position that loses the rest combines both PnL legs."""
+    db = DB(conn)
+    round_ts = int(time.time()) - 900
+    db.upsert_round(
+        round_start_ts=round_ts, slug="r-mixed", condition_id="0xcafe",
+        up_token="UP", down_token="DOWN",
+    )
+    db.insert_fill("f-buy", "c-mixed", round_ts, "UP", "BUY", 0.40, 10.0,
+                   ts_ms=round_ts * 1000 + 1_000)
+    db.insert_fill("f-sell", "c-mixed", round_ts, "UP", "SELL", 0.50, 5.0,
+                   ts_ms=round_ts * 1000 + 2_000)
+    db.set_round_resolution(round_ts, up_won=False)
+
+    r = status_mod.rounds_with_pnl(conn)[0]
+    assert r["status"] == "closed"
+    assert r["sell_proceeds"] == pytest.approx(2.5)
+    # +$0.50 on the first 5 shares, −$2.00 on the 5 left at expiry.
+    assert r["pnl_usd"] == pytest.approx(-1.5)
+    assert r["settlement_usd"] == pytest.approx(-2.0)
+    assert r["open_qty"] == 0.0
+
+
+def test_unresolved_round_stays_open_even_if_old(conn) -> None:
+    """Without a Gamma outcome the position must not be guessed closed."""
+    db = DB(conn)
+    round_ts = int(time.time()) - 3_600
+    db.upsert_round(
+        round_start_ts=round_ts, slug="r-unknown", condition_id="0xfeed",
+        up_token="UP", down_token="DOWN",
+    )
+    db.insert_fill("f-unknown", "c-unknown", round_ts, "UP", "BUY", 0.40, 10.0,
+                   ts_ms=round_ts * 1000)
+
+    r = status_mod.rounds_with_pnl(conn)[0]
+    assert r["resolved"] is False
+    assert r["status"] == "open"
+    assert r["closed"] is False
+    assert r["pnl_usd"] is None
+    assert r["open_qty"] == pytest.approx(10.0)
+
+    assert len(db.unresolved_rounds(before_ts=round_ts + 900)) == 1
+
+
+def test_unresolved_rounds_excludes_recorded_outcomes(conn) -> None:
+    db = DB(conn)
+    db.upsert_round(
+        round_start_ts=1_000, condition_id="0xa",
+        up_token="UP", down_token="DOWN",
+    )
+    db.upsert_round(
+        round_start_ts=2_000, condition_id="0xb",
+        up_token="UP", down_token="DOWN",
+    )
+    db.set_round_resolution(1_000, up_won=True)
+
+    rows = db.unresolved_rounds(before_ts=5_000, lookback_s=10_000)
+    assert [r[0] for r in rows] == [2_000]
+    assert rows[0][1] == "0xb"
+
+
+class _FakeResolutionPM:
+    def __init__(self, result) -> None:
+        self.result = result
+        self.calls: list[str] = []
+
+    async def get_market_resolution(self, condition_id: str):
+        self.calls.append(condition_id)
+        return self.result
+
+
+class _FakeResolutionDB:
+    def __init__(self, rows) -> None:
+        self.rows = rows
+        self.recorded: list[tuple[int, bool]] = []
+
+    def unresolved_rounds(self, **_kw):
+        return self.rows
+
+    def set_round_resolution(self, round_ts: int, up_won: bool) -> None:
+        self.recorded.append((round_ts, up_won))
+
+
+def test_resolve_rounds_once_records_the_outcome() -> None:
+    from src.main import _resolve_rounds_once
+
+    pm = _FakeResolutionPM({"resolved": True, "up_wins": False})
+    db = _FakeResolutionDB(
+        [(1_000, "0xabc", "slug", "UP", "DOWN")]
+    )
+    state = SimpleNamespace(pm_client=pm, db=db)
+    attempts: dict[int, int] = {}
+
+    resolved = asyncio.run(_resolve_rounds_once(state, attempts))
+
+    assert resolved == 1
+    assert pm.calls == ["0xabc"]
+    assert db.recorded == [(1_000, False)]
+    assert attempts == {}
+
+
+def test_resolve_rounds_once_retries_until_resolved() -> None:
+    from src.main import _resolve_rounds_once
+
+    pm = _FakeResolutionPM({"resolved": False, "up_wins": None})
+    db = _FakeResolutionDB(
+        [(1_000, "0xabc", "slug", "UP", "DOWN")]
+    )
+    state = SimpleNamespace(pm_client=pm, db=db)
+    attempts: dict[int, int] = {}
+
+    assert asyncio.run(_resolve_rounds_once(state, attempts)) == 0
+    assert db.recorded == []
+    assert attempts == {1_000: 1}
+
+
+def test_resolve_rounds_once_skips_rows_without_token_ids() -> None:
+    """Without both tokens the held side cannot be attributed."""
+    from src.main import _resolve_rounds_once
+
+    pm = _FakeResolutionPM({"resolved": True, "up_wins": True})
+    db = _FakeResolutionDB([(1_000, "0xabc", "slug", None, "DOWN")])
+    state = SimpleNamespace(pm_client=pm, db=db)
+
+    assert asyncio.run(_resolve_rounds_once(state, {})) == 0
+    assert pm.calls == []
 
 
 # ---------------------------------------------------------------------------

@@ -74,10 +74,10 @@
         <thead>
           <tr>
             <th>开始 (UTC)</th><th>轮次</th><th>买入成本</th><th>卖出收入</th>
-            <th>手续费</th><th>盈亏</th><th>盈亏 %</th><th>成交笔数</th><th>撤单</th><th>状态</th>
+            <th>到期结算</th><th>手续费</th><th>盈亏</th><th>盈亏 %</th><th>成交笔数</th><th>撤单</th><th>状态</th>
           </tr>
         </thead>
-        <tbody id="rounds-tbody"><tr><td colspan="10" class="no-data">加载中...</td></tr></tbody>
+        <tbody id="rounds-tbody"><tr><td colspan="11" class="no-data">加载中...</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -170,7 +170,7 @@ function renderRounds(rounds) {
   $('round-count').textContent = rounds.length;
   const body = $('rounds-tbody');
   if (!rounds.length) {
-    body.innerHTML = '<tr><td colspan="10" class="no-data">暂无记录（下单成交后会出现在这里）</td></tr>';
+    body.innerHTML = '<tr><td colspan="11" class="no-data">暂无记录（下单成交后会出现在这里）</td></tr>';
     return;
   }
   body.innerHTML = rounds.map(r => {
@@ -182,11 +182,16 @@ function renderRounds(rounds) {
       : (r.fill_count > 0
           ? '<span class="pill watching">未平仓</span>'
           : '<span class="pill idle">未成交</span>');
+    // 到期时仍持有的份额按 1/0 兑付，没有 SELL 成交；单独展示这部分。
+    const settle = (r.settlement_usd && Math.abs(r.settlement_usd) > 1e-9)
+      ? `<span class="${cls(r.settlement_usd)}">${money(r.settlement_usd)}</span>`
+      : '<span class="muted">--</span>';
     return `<tr>
       <td class="mono">${iso(r.started_at) === '--' ? utc(r.round_start_ts) : iso(r.started_at)}</td>
       <td class="mono muted">${r.slug || r.round_start_ts}</td>
       <td class="mono">$${fmt(r.buy_cost, 2)}</td>
       <td class="mono">$${fmt(r.sell_proceeds, 2)}</td>
+      <td class="mono">${settle}</td>
       <td class="mono muted">$${fmt(r.fee_total, 2)}</td>
       <td class="mono ${pnl === null ? '' : cls(pnl)}">${pnl === null ? '--' : money(pnl)}</td>
       <td class="mono ${pnl === null ? '' : cls(pnl)}">${r.pnl_pct === null ? '--' : fmt(r.pnl_pct * 100, 2) + '%'}</td>
