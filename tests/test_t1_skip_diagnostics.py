@@ -119,6 +119,26 @@ async def test_t1_skip_logs_when_above_price_cap(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_t1_skip_labels_a_price_cap_rejection_as_cap() -> None:
+    """mid between the cap (0.40) and the pre-arm line (0.44) is a cap
+    rejection, not a drift failure (within_limit is True)."""
+    eng, pc = _make_engine()
+    pc.midpoint["UP_TOKEN"] = 0.42  # > ENTRY_PRICE_CAP, <= trigger 0.44
+    pc.best_bid["UP_TOKEN"] = 0.42
+
+    seen: dict[str, dict[str, Any]] = {}
+
+    def capture(reason: str, *, side: str, **fields: Any) -> None:
+        seen[reason] = {"side": side, **fields}
+
+    eng._t1_skip_log = capture  # type: ignore[method-assign]
+    await _drive_one_evaluate(eng)
+
+    assert "engine.t1_skip_price_cap" in seen
+    assert "engine.t1_skip_drift" not in seen
+
+
+@pytest.mark.asyncio
 async def test_t1_does_not_skip_when_best_bid_empty() -> None:
     """After the pre-arm refactor, T1 entry is driven by midpoint, not
     best_bid. With a valid midpoint and empty best_bid, the engine should

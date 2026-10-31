@@ -1245,23 +1245,40 @@ class ActionRouter:
                     getattr(om, "last_buy_reject_reason", "")
                     or "om.place_market_buy returned None"
                 )
-                log.error(
-                    "router.t1_failed",
-                    side=action.side,
-                    token=action.token[:16],
-                    strategy_price=action.price,
-                    notional=action.notional,
-                    reason=reject_reason,
-                )
                 eng._round.position.entry_side = None
                 eng._round.position.entry_token = None
-                # Backoff before the next T1 attempt (2 s) so a rejected
-                # POST is not retried on every 250 ms tick. An empty wallet
-                # is not fixed by retrying — back off much longer and let
-                # the balance cache expire in the meantime.
-                eng._round.position.t1_retry_after_ts = time.time() + (
-                    15.0 if reject_reason == "insufficient_balance" else 2.0
-                )
+                if reject_reason == "FAK_no_fills":
+                    # A marketable order with no resting match is a normal
+                    # no-fill, not a POST failure. One attempt per window:
+                    # mark the round skipped instead of retrying into the
+                    # same book (operator decision 2026-10-31).
+                    eng._round.skip_reason = "t1_fak_no_fill"
+                    log.warning(
+                        "router.t1_no_fill_skip_window",
+                        side=action.side,
+                        token=action.token[:16],
+                        strategy_price=action.price,
+                        notional=action.notional,
+                        note="FAK buy had no resting match; skipping the "
+                             "rest of this window",
+                    )
+                else:
+                    log.error(
+                        "router.t1_failed",
+                        side=action.side,
+                        token=action.token[:16],
+                        strategy_price=action.price,
+                        notional=action.notional,
+                        reason=reject_reason,
+                    )
+                    # Backoff before the next T1 attempt (2 s) so a
+                    # rejected POST is not retried on every 250 ms tick.
+                    # An empty wallet is not fixed by retrying — back off
+                    # much longer and let the balance cache expire.
+                    eng._round.position.t1_retry_after_ts = time.time() + (
+                        15.0 if reject_reason == "insufficient_balance"
+                        else 2.0
+                    )
 
         elif isinstance(action, ActionOpenTN):
             order = await om.place_buy_by_strategy_price(

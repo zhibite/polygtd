@@ -1396,6 +1396,18 @@ class StrategyEngine:
                     )
                 continue
 
+            # Price cap. `can_enter` also enforces it, but splitting the
+            # check here keeps the skip diagnostic honest: mid between the
+            # cap (0.40) and the pre-arm line (0.44) used to be logged as
+            # `t1_skip_drift` with within_limit=True.
+            cap = float(getattr(s, "ENTRY_PRICE_CAP", 0.0) or 0.0)
+            if cap > 0 and mid_price > cap:
+                self._t1_skip_log(
+                    "engine.t1_skip_price_cap",
+                    side=side, mid_price=mid_price, cap=cap,
+                )
+                continue
+
             # BTC drift gate
             if not self._gate.can_enter(bc_now, mid_price):
                 gs = self._gate.state(bc_now)

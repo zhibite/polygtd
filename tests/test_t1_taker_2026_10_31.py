@@ -72,6 +72,23 @@ async def test_fak_buy_sends_a_usdc_market_order() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fak_buy_prefers_aggregate_amounts_over_fills() -> None:
+    """The aggregate amounts match the CLOB trade ledger; fills[] can be a
+    tick off (production 0.36 vs ledger 0.37 on a 1-USDC buy)."""
+    clob, _ = _clob_with({
+        "orderID": "0xabc",
+        "fills": [{"size": 2.5, "price": 0.36}],
+        "takingAmount": "2.7027",   # shares
+        "makingAmount": "1.0",      # USDC
+    })
+    out = await clob.place_fak_buy(
+        token_id="tok", amount=1.0, price=0.40, tick_size=0.01
+    )
+    assert out.tokens == pytest.approx(2.7027)
+    assert out.fill_price == pytest.approx(0.37)
+
+
+@pytest.mark.asyncio
 async def test_fak_buy_falls_back_to_aggregate_amounts() -> None:
     """Some CLOB responses only carry taking/makingAmount."""
     clob, _ = _clob_with({
@@ -97,6 +114,50 @@ async def test_fak_buy_without_fills_fails() -> None:
     )
     assert out.success is False
     assert out.error == "FAK_no_fills"
+
+
+@pytest.mark.asyncio
+async def test_fak_buy_no_match_is_a_normal_no_fill() -> None:
+    """The CLOB's 400 "no orders found to match" is a no-fill, not a
+    POST/network error — the T1 router uses it to skip the window."""
+    class _NoMatchSdk:
+        def create_and_post_market_order(self, *args, **kwargs):
+            raise RuntimeError(
+                "PolyApiException[status_code=400, error_message={'error': "
+                "'no orders found to match with FAK order. FAK orders are "
+                "partially filled or killed if no match is found.'}]"
+            )
+
+    clob = CLOBClient(private_key="")
+    clob._client = _NoMatchSdk()  # type: ignore[assignment]
+
+    out = await clob.place_fak_buy(
+        token_id="tok", amount=1.0, price=0.40, tick_size=0.01
+    )
+
+    assert out.success is False
+    assert out.error == "FAK_no_fills"
+
+
+@pytest.mark.asyncio
+async def test_fak_sell_marketable_parses_aggregate_amounts() -> None:
+    """A matched FAK sell may omit fills[]; makingAmount/takingAmount are
+    authoritative (production 2026-10-31 14:31 UTC: 2.7 @0.41 sold but
+    misread as FAK_no_fills)."""
+    clob, sdk = _clob_with({
+        "orderID": "0xsell",
+        "makingAmount": "2.7",     # shares sold
+        "takingAmount": "1.107",   # USDC received
+    })
+    out = await clob.place_fak_sell_marketable(
+        token_id="tok", size=2.7, reference_price=0.41,
+        tick_size=0.01, slippage_pct=0.0,
+    )
+    assert out.success is True
+    assert out.tokens == pytest.approx(2.7)
+    assert out.fill_price == pytest.approx(0.41)
+    args, _ = sdk.calls[0]
+    assert args.amount == pytest.approx(2.7)
 
 
 @pytest.mark.asyncio
@@ -311,6 +372,39 @@ async def test_router_t1_taker_binds_and_feeds_the_fill() -> None:
     assert eng.bound[0]["placed_size"] == pytest.approx(2.5)
     assert eng.fills == [("tok", "s1", 0.40, 2.5)]
     assert router._watchers == {}, "taker T1 must not spawn a TierWatcher"
+
+
+class _NoFillOM:
+    last_buy_reject_reason = "FAK_no_fills"
+
+    async def place_market_buy(self, **kwargs):  # noqa: ANN003
+        return None
+
+
+@pytest.mark.asyncio
+async def test_router_skips_the_window_after_a_fak_buy_no_fill() -> None:
+    eng = _RouterEngine()
+    pos = eng._round.position
+    pos.entry_token = "tok"
+    pos.entry_side = "UP"
+    eng._round.skip_reason = None
+    state = SimpleNamespace(
+        engine=eng,
+        order_manager=_NoFillOM(),
+        clob=SimpleNamespace(fill_callback=None),
+        round_start_ts=1_000,
+        killswitch=None,
+        _bg_tasks=set(),
+    )
+    router = ActionRouter(state)  # type: ignore[arg-type]
+
+    await router(ActionOpenT1(
+        side="UP", token="tok", price=0.40, notional=1.0
+    ))
+
+    assert eng._round.skip_reason == "t1_fak_no_fill"
+    assert pos.entry_token is None
+    assert pos.entry_side is None
 
 
 # ---------------------------------------------------------------------------

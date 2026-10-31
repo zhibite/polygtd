@@ -917,14 +917,24 @@ class OrderManager:
             if not result.success:
                 self._cleanup_failed_post(result.order_id)
                 self._last_buy_reject_reason = result.error or "fak_buy_failed"
-                log.warning(
-                    "order_manager.market_buy.failed",
-                    token=token_id[:16],
-                    notional=notional,
-                    price=price,
-                    tier=tier_name,
-                    error=result.error,
-                )
+                if result.error == "FAK_no_fills":
+                    log.info(
+                        "order_manager.market_buy.no_fills",
+                        token=token_id[:16],
+                        notional=notional,
+                        price=price,
+                        tier=tier_name,
+                        note="FAK had no resting match",
+                    )
+                else:
+                    log.warning(
+                        "order_manager.market_buy.failed",
+                        token=token_id[:16],
+                        notional=notional,
+                        price=price,
+                        tier=tier_name,
+                        error=result.error,
+                    )
                 return None
 
             server_id = result.order_id
@@ -1008,14 +1018,24 @@ class OrderManager:
             )
             if not result.success:
                 self._cleanup_failed_post(result.order_id)
-                log.warning(
-                    "order_manager.market_sell.failed",
-                    token=token_id[:16],
-                    size=size,
-                    reference_price=reference_price,
-                    tier=tier_name,
-                    error=result.error,
-                )
+                if result.error == "FAK_no_fills":
+                    log.info(
+                        "order_manager.market_sell.no_fills",
+                        token=token_id[:16],
+                        size=size,
+                        reference_price=reference_price,
+                        tier=tier_name,
+                        note="FAK had no resting match; will retry after backoff",
+                    )
+                else:
+                    log.warning(
+                        "order_manager.market_sell.failed",
+                        token=token_id[:16],
+                        size=size,
+                        reference_price=reference_price,
+                        tier=tier_name,
+                        error=result.error,
+                    )
                 return None
 
             server_id = result.order_id

@@ -986,7 +986,21 @@ class CLOBClient:
                 order_type=OrderType.FAK,
             )
         except Exception as exc:
-            log.warning("clob.fak_buy.post_error", error=str(exc))
+            msg = str(exc)
+            if "no orders found to match with fak order" in msg.lower():
+                # A marketable order that finds no resting liquidity is a
+                # normal no-fill, not a POST failure. Callers use this to
+                # skip the T1 window instead of logging an ERROR every
+                # retry.
+                log.warning(
+                    "clob.fak_buy.no_fills",
+                    token=token_id[:16],
+                    amount=float(amount_q),
+                    price=price_q,
+                    note="FAK had no resting match; normal no-fill",
+                )
+                return FillResult("", 0, 0, price_q, False, "FAK_no_fills")
+            log.warning("clob.fak_buy.post_error", error=msg)
             return FillResult(
                 "", 0, 0, price_q, False, f"FAK_post_error:{exc}"
             )
@@ -994,28 +1008,29 @@ class CLOBClient:
         if not resp:
             return FillResult("", 0, 0, price_q, False, "FAK_no_response")
 
+        # Prefer the aggregate amounts: for a BUY, takingAmount = shares
+        # received, makingAmount = USDC spent. The CLOB's trade ledger
+        # agrees with these (the per-fill `fills[]` price can be a tick
+        # off). Fall back to fills[] when the aggregates are absent.
         total_sz = 0.0
         total_usdc = 0.0
-        for f in resp.get("fills") or []:
-            try:
-                sz = float(f.get("size", 0))
-                px = float(f.get("price", price_q))
-            except (TypeError, ValueError):
-                continue
-            if sz > 0 and px > 0:
-                total_sz += sz
-                total_usdc += sz * px
-
-        # Market-order responses may only expose aggregate amounts. For a
-        # BUY: takingAmount = shares received, makingAmount = USDC spent.
-        if total_sz <= 0:
-            try:
-                taking = float(resp.get("takingAmount") or 0)
-                making = float(resp.get("makingAmount") or 0)
-            except (TypeError, ValueError):
-                taking = making = 0.0
-            if taking > 0 and making > 0:
-                total_sz, total_usdc = taking, making
+        try:
+            taking = float(resp.get("takingAmount") or 0)
+            making = float(resp.get("makingAmount") or 0)
+        except (TypeError, ValueError):
+            taking = making = 0.0
+        if taking > 0 and making > 0:
+            total_sz, total_usdc = taking, making
+        else:
+            for f in resp.get("fills") or []:
+                try:
+                    sz = float(f.get("size", 0))
+                    px = float(f.get("price", price_q))
+                except (TypeError, ValueError):
+                    continue
+                if sz > 0 and px > 0:
+                    total_sz += sz
+                    total_usdc += sz * px
 
         # Some endpoints return 6-decimal base units. This bot's tiers are
         # at most 8 USDC, so a value in the millions is certainly base
@@ -1104,7 +1119,19 @@ class CLOBClient:
             #                          succeeded with zero size — release
             #                          the mutex, no work to do;
             #   * None / unexpected → keep mutex, log warning.
-            log.warning("clob.fak_sell.post_error", error=str(exc))
+            msg = str(exc)
+            if "no orders found to match with fak order" in msg.lower():
+                log.warning(
+                    "clob.fak_sell.no_fills",
+                    token=token_id[:16],
+                    size=float(size_q),
+                    price=sell_price,
+                    note="FAK had no resting match; normal no-fill",
+                )
+                return FillResult(
+                    "", 0, 0, sell_price, False, "FAK_no_fills"
+                )
+            log.warning("clob.fak_sell.post_error", error=msg)
             return FillResult(
                 "", 0, 0, sell_price, False, f"FAK_post_error:{exc}"
             )
@@ -1112,25 +1139,41 @@ class CLOBClient:
         if not resp:
             return FillResult("", 0, 0, sell_price, False, "FAK_no_response")
 
-        fills = resp.get("fills") or []
-        if not fills:
+        # Prefer the aggregate amounts: for a SELL, makingAmount = shares
+        # sold, takingAmount = USDC received. A FAK sell response often
+        # omits fills[] even when the order matched — production
+        # 2026-10-31 14:31 UTC: a 2.7-share sell at 0.41 returned no
+        # fills[] and was misread as FAK_no_fills, leaving a phantom
+        # position in the DB while the wallet was already flat.
+        total_sz = 0.0
+        total_usdc = 0.0
+        try:
+            making = float(resp.get("makingAmount") or 0)  # shares sold
+            taking = float(resp.get("takingAmount") or 0)  # USDC received
+        except (TypeError, ValueError):
+            making = taking = 0.0
+        if making > 0 and taking > 0:
+            total_sz, total_usdc = making, taking
+        else:
+            for f in resp.get("fills") or []:
+                try:
+                    sz = float(f.get("size", 0))
+                    px = float(f.get("price", sell_price))
+                except (TypeError, ValueError):
+                    continue
+                if sz > 0 and px > 0:
+                    total_sz += sz
+                    total_usdc += sz * px
+
+        if total_sz > 1_000_000:
+            total_sz /= self._CLOB_BASE_UNITS
+        if total_usdc > 1_000_000:
+            total_usdc /= self._CLOB_BASE_UNITS
+
+        if total_sz <= 0 or total_usdc <= 0:
             # FAK was rejected by the book (no resting liquidity at our
             # price). This is the common "FAK gets nothing" case — the
             # router must distinguish it from a network error (above).
-            return FillResult("", 0, 0, sell_price, False, "FAK_no_fills")
-
-        total_sz = 0.0
-        total_usdc = 0.0
-        for f in fills:
-            try:
-                sz = float(f.get("size", 0))
-                px = float(f.get("price", sell_price))
-                total_sz += sz
-                total_usdc += sz * px
-            except (TypeError, ValueError):
-                continue
-
-        if total_sz <= 0:
             return FillResult("", 0, 0, sell_price, False, "FAK_no_fills")
 
         # H-NEW-1 fix: FAK sells also race — _fire_fill_callback below runs
