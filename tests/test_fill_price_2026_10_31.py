@@ -59,11 +59,14 @@ async def test_taker_fill_price_comes_from_the_trade_not_the_limit() -> None:
 
     assert state["size_matched"] == pytest.approx(5.0)
     assert state["avg_price"] == pytest.approx(0.39)
+    assert state["trader_side"] == "TAKER"
+    assert state["is_taker"] is True
 
     # The trade lookup is cached: a second read re-fetches only the order.
     sdk.get_order_calls = 0
     state2 = await client.get_order_fill_state(order_id)
     assert state2["avg_price"] == pytest.approx(0.39)
+    assert state2["trader_side"] == "TAKER"
     assert sdk.get_order_calls == 1
 
 
@@ -90,6 +93,9 @@ async def test_maker_fill_uses_the_maker_row_price() -> None:
     state = await client.get_order_fill_state(order_id)
 
     assert state["avg_price"] == pytest.approx(0.32)
+    # A maker row is positively identified now, not just "not taker".
+    assert state["trader_side"] == "MAKER"
+    assert state["is_taker"] is False
 
 
 @pytest.mark.asyncio
@@ -124,3 +130,5 @@ async def test_no_trade_data_falls_back_to_unset() -> None:
     state = await client.get_order_fill_state(order_id)
 
     assert state["avg_price"] == 0.0
+    assert state["trader_side"] is None
+    assert state["is_taker"] is False

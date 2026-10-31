@@ -65,6 +65,19 @@ from src.strategy.loop import DecisionLoop
 log = get_logger(__name__)
 
 
+def _watcher_role(result: object) -> str | None:
+    """Maker/taker role carried by a WatcherResult.
+
+    Prefers the tri-state `trader_side` (TAKER / MAKER / None) the
+    TierWatcher derives from the order's trades; falls back to the older
+    `is_taker` bool so partially-updated callers keep working.
+    """
+    role = getattr(result, "trader_side", None)
+    if role in ("TAKER", "MAKER"):
+        return role
+    return "TAKER" if getattr(result, "is_taker", False) else None
+
+
 # ---------------------------------------------------------------------------
 # Web dashboard server
 # ---------------------------------------------------------------------------
@@ -547,9 +560,7 @@ class ActionRouter:
                         if result.avg_fill_price and result.avg_fill_price > 0
                         else None
                     )
-                    reconcile_role = (
-                        "TAKER" if getattr(result, "is_taker", False) else None
-                    )
+                    reconcile_role = _watcher_role(result)
                     if reconcile_px is None or reconcile_role is None:
                         # Same race as the branch below: the watcher's
                         # spawn-time fill-state read can precede the
@@ -567,7 +578,12 @@ class ActionRouter:
                                     )
                                     if px > 0:
                                         reconcile_px = px
-                                    if fill_state.get("is_taker"):
+                                    fetched_role = fill_state.get(
+                                        "trader_side"
+                                    )
+                                    if fetched_role in ("TAKER", "MAKER"):
+                                        reconcile_role = fetched_role
+                                    elif fill_state.get("is_taker"):
                                         reconcile_role = "TAKER"
                             except Exception as exc:  # noqa: BLE001
                                 log.debug(
@@ -618,6 +634,11 @@ class ActionRouter:
                                     # before the trade ledger existed —
                                     # learn the role from this one so
                                     # the taker fee is booked on insert.
+                                    fetched_role = fill_state.get(
+                                        "trader_side"
+                                    )
+                                    if fetched_role in ("TAKER", "MAKER"):
+                                        result.trader_side = fetched_role
                                     if fill_state.get("is_taker"):
                                         result.is_taker = True
                             except Exception as exc:  # noqa: BLE001
@@ -641,11 +662,7 @@ class ActionRouter:
                         size_matched=float(result.filled_qty),
                         fill_price=float(forward_price),
                         # Taker fills pay the Polymarket fee; makers do not.
-                        trader_side=(
-                            "TAKER"
-                            if getattr(result, "is_taker", False)
-                            else None
-                        ),
+                        trader_side=_watcher_role(result),
                     )
                     # Promote status too: the fast-fill path can be the ONLY
                     # observation of a fully matched order (the WS TRADE and
@@ -756,22 +773,14 @@ class ActionRouter:
                     server_order_id,
                     cumulative=cumulative_size_matched,
                     fill_price=fill_price if price_known else None,
-                    trader_side=(
-                        "TAKER"
-                        if getattr(hint_result, "is_taker", False)
-                        else None
-                    ),
+                    trader_side=_watcher_role(hint_result),
                 )
                 return
             om.apply_fill_event(
                 server_order_id,
                 size_matched=cumulative_size_matched,
                 fill_price=fill_price if price_known else None,
-                trader_side=(
-                    "TAKER"
-                    if getattr(hint_result, "is_taker", False)
-                    else None
-                ),
+                trader_side=_watcher_role(hint_result),
             )
             om.mark_filled(server_order_id)
             engine_px = (
@@ -850,9 +859,7 @@ class ActionRouter:
             # price; the strategy limit is just the insert-time fallback
             # (apply_fill_event uses the tracked order's limit itself).
             fill_price=float(fill_px) if fill_px > 0 else None,
-            trader_side=(
-                "TAKER" if getattr(result, "is_taker", False) else None
-            ),
+            trader_side=_watcher_role(result),
         )
         om.mark_filled(sid)
 
@@ -888,6 +895,9 @@ class ActionRouter:
                             px = float(fill_state.get("avg_price", 0) or 0)
                             if px > 0:
                                 result.avg_fill_price = px
+                            fetched_role = fill_state.get("trader_side")
+                            if fetched_role in ("TAKER", "MAKER"):
+                                result.trader_side = fetched_role
                             if fill_state.get("is_taker"):
                                 result.is_taker = True
                     except Exception as exc:  # noqa: BLE001
@@ -958,22 +968,14 @@ class ActionRouter:
                     server_order_id,
                     cumulative=cumulative_size_matched,
                     fill_price=fill_price if price_known else None,
-                    trader_side=(
-                        "TAKER"
-                        if getattr(hint_result, "is_taker", False)
-                        else None
-                    ),
+                    trader_side=_watcher_role(hint_result),
                 )
                 return
             om.apply_fill_event(
                 server_order_id,
                 size_matched=cumulative_size_matched,
                 fill_price=fill_price if price_known else None,
-                trader_side=(
-                    "TAKER"
-                    if getattr(hint_result, "is_taker", False)
-                    else None
-                ),
+                trader_side=_watcher_role(hint_result),
             )
             om.mark_filled(server_order_id)
             engine_px = (
@@ -1076,7 +1078,9 @@ class ActionRouter:
         prev = tracked.size_matched or 0.0
         cumulative = max(prev, rest_cumulative)
         delta = cumulative - prev
-        role = "TAKER" if (fill_state or {}).get("is_taker") else None
+        role = (fill_state or {}).get("trader_side")
+        if role not in ("TAKER", "MAKER"):
+            role = "TAKER" if (fill_state or {}).get("is_taker") else None
         if delta <= 1e-9:
             # Nothing new to book, but this is the last authoritative look
             # at the order before the slot is released — fill in any

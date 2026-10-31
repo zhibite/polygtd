@@ -90,7 +90,10 @@ class WatcherResult:
     dedup_key: str = ""
     # Whether OUR order was the taker in the associated trades. Polymarket
     # only charges takers (fee = C × rate × p × (1-p)); makers pay 0.
+    # `trader_side` is the tri-state source of truth ("TAKER"/"MAKER"/None);
+    # `is_taker` is kept for older callers and derived from it.
     is_taker: bool = False
+    trader_side: str | None = None
 
 
 # Callback signatures the ActionRouter / engine wire up.
@@ -209,7 +212,10 @@ class TierWatcher:
         # downstream `apply_tier_watcher_result` would double-count (B-NEW-3).
         self._fire_complete_called = False
         # Whether our order was the taker in its trades (drives the fee).
+        # `_trader_side` is the tri-state REST answer ("TAKER"/"MAKER"/
+        # None) so a maker fill seen only via REST is still labelled.
         self._is_taker: bool = False
+        self._trader_side: str | None = None
         # H-NEW-2026-07-12: continuous ground-truth reconciliation state.
         # `_last_pushed_size_matched` is the cumulative size_matched the
         # watcher most recently pushed through `on_partial_fill` (or
@@ -315,6 +321,29 @@ class TierWatcher:
             return True  # already done
         return self._last_size_matched + 1e-9 >= self._expected_size
 
+    def _learn_trade_role(self, fill_state: dict | None) -> None:
+        """Record the maker/taker role the CLOB derived from our trades.
+
+        `get_order_fill_state` now returns a tri-state `trader_side`
+        (TAKER / MAKER / None) parsed from the order's `associate_trades`.
+        Learning MAKER matters too: a fill first booked by the watcher
+        used to stay role-less forever when the WS TRADE was missed, which
+        left the dashboard's maker ratio incomplete and — for a taker —
+        the fee at 0.
+        """
+        if not fill_state:
+            return
+        role = fill_state.get("trader_side")
+        if role in ("TAKER", "MAKER"):
+            self._trader_side = role
+            if role == "TAKER":
+                self._is_taker = True
+            return
+        # Older fill-state shape (or a caller that only sets is_taker).
+        if fill_state.get("is_taker"):
+            self._is_taker = True
+            self._trader_side = "TAKER"
+
     async def _ensure_avg_price_for_ws_fast_fill(self) -> None:
         """Fill _avg_price_running from CLOB REST when WS fast-fill fired
         without a prior REST observation.
@@ -343,8 +372,7 @@ class TierWatcher:
         avg = fs.get("avg_price", 0.0)
         if avg > 0:
             self._avg_price_running = avg
-        if fs.get("is_taker"):
-            self._is_taker = True
+        self._learn_trade_role(fs)
 
     async def _run(self) -> None:
         """Main loop. One watcher = one GTD = one terminal state."""
@@ -411,8 +439,7 @@ class TierWatcher:
         fast_state = await self._read_fill_state()
         fast_size = fast_state.get("size_matched", 0.0) if fast_state else 0.0
         fast_avg = fast_state.get("avg_price", 0.0) if fast_state else 0.0
-        if fast_state and fast_state.get("is_taker"):
-            self._is_taker = True
+        self._learn_trade_role(fast_state)
         if fast_size + 1e-9 >= self._expected_size and fast_size > 0:
             cancel_sent = await self._safe_cancel()
             self._result = WatcherResult(
@@ -753,8 +780,10 @@ class TierWatcher:
         if self._fire_complete_called:
             return
         self._fire_complete_called = True
-        # Carry the taker flag to the router (fee accounting): the result is
+        # Carry the role to the router (fee accounting): the result is
         # built in several places and not all of them have the fill state.
+        if self._on_complete is not None and self._trader_side:
+            result.trader_side = self._trader_side
         if self._on_complete is not None and self._is_taker:
             result.is_taker = True
         if self._on_complete is None:
@@ -806,8 +835,7 @@ class TierWatcher:
         avg_price = float(fill_state.get("avg_price", 0.0) or 0.0)
         if avg_price > 0:
             self._avg_price_running = avg_price
-        if fill_state.get("is_taker"):
-            self._is_taker = True
+        self._learn_trade_role(fill_state)
 
         # Record the observation for terminal decisions. This happens even
         # if the callback below raises: the CLOB fact is still true, and
@@ -874,6 +902,7 @@ class TierWatcher:
                     else 0.0
                 ),
                 is_taker=self._is_taker,
+                trader_side=self._trader_side,
             )
             await self._on_partial_fill(
                 high_water,

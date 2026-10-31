@@ -594,10 +594,10 @@ class CLOBClient:
             # production 2026-10-31 09:30 recorded 0.40 BUs and 0.40 sells
             # while Polymarket's history showed 0.37-0.39 buys and 0.49
             # sells (PnL understated by ~3x).
-            is_taker = False
+            trader_side: str | None = None
             if size > 0:
                 try:
-                    trade_avg, is_taker = await self._avg_price_from_trades(
+                    trade_avg, trader_side = await self._avg_price_from_trades(
                         order_id, resp.get("associate_trades")
                     )
                     if avg_px <= 0 and trade_avg > 0:
@@ -610,9 +610,13 @@ class CLOBClient:
             return {
                 "size_matched": size,
                 "avg_price": avg_px,
-                # Whether OUR order was the taker in these trades. Takers pay
+                # Which role OUR order played in these trades. Takers pay
                 # the Polymarket fee (C × rate × p × (1-p)); makers pay 0.
-                "is_taker": bool(is_taker),
+                # `is_taker` is kept for older callers; `trader_side` is
+                # tri-state (TAKER / MAKER / None) so a maker fill observed
+                # only through REST can still be labelled correctly.
+                "is_taker": trader_side == "TAKER",
+                "trader_side": trader_side,
                 "status": (resp.get("status") or "").lower(),
             }
         except Exception as exc:
@@ -624,8 +628,8 @@ class CLOBClient:
 
     async def _avg_price_from_trades(
         self, order_id: str, trade_ids: object
-    ) -> tuple[float, bool]:
-        """Weighted average execution price + taker flag from the order's trades.
+    ) -> tuple[float, str | None]:
+        """Weighted average execution price + OUR role from the order's trades.
 
         `GET /data/order/<id>` exposes `associate_trades` (trade ids) but no
         average price. For each associated trade:
@@ -634,31 +638,34 @@ class CLOBClient:
           * if our order was a maker, use our row's `price` (a maker fill
             always executes at its resting limit, so weights do not matter).
 
-        Returns `(avg_price, is_taker)`. `is_taker` drives the Polymarket
-        fee: taker pays `C × rate × p × (1-p)`, maker pays 0.
+        Returns `(avg_price, trader_side)` where `trader_side` is
+        "TAKER", "MAKER", or None when the ledger is unavailable. The role
+        drives the Polymarket fee (taker pays `C × rate × p × (1-p)`, maker
+        pays 0) and the dashboard's maker-ratio stats.
 
         Results are cached per (order_id, trade-count) so the watcher's
         repeated fill-state reads do not re-query every trade.
         """
         ids = [str(t) for t in (trade_ids or []) if t]
         if not ids:
-            return 0.0, False
+            return 0.0, None
         cache = getattr(self, "_avg_price_cache", None)
         if cache is None:
             self._avg_price_cache = cache = {}
         key = (order_id, len(ids))
         hit = cache.get(key)
         if hit is not None:
-            cached_ts, cached_avg, cached_taker = hit
+            cached_ts, cached_avg, cached_role = hit
             if (
                 cached_avg > 0
-                or cached_taker
+                or cached_role is not None
                 or (time.monotonic() - cached_ts) < _AVG_PRICE_UNKNOWN_TTL_S
             ):
-                return float(cached_avg), bool(cached_taker)
+                return float(cached_avg), cached_role
         total_qty = 0.0
         total_notional = 0.0
         taker_seen = False
+        maker_seen = False
         for tid in ids[:20]:
             try:
                 rows = await self._run(
@@ -686,6 +693,7 @@ class CLOBClient:
                     for mo in t.get("maker_orders") or []:
                         if str(mo.get("order_id") or "") != order_id:
                             continue
+                        maker_seen = True
                         try:
                             px = float(mo.get("price") or 0)
                             qty = float(mo.get("matched_amount") or 0)
@@ -698,22 +706,25 @@ class CLOBClient:
                     total_qty += qty
                     total_notional += px * qty
         avg = (total_notional / total_qty) if total_qty > 0 else 0.0
+        # TAKER wins when the order took on any trade (matches the
+        # order-wide semantics used by the fee); otherwise MAKER.
+        role = "TAKER" if taker_seen else ("MAKER" if maker_seen else None)
         if len(cache) > 512:
             cache.clear()
         # Always store, tagged with the time so an UNRESOLVED lookup
         # (transient trade-endpoint failure / ledger lag) is retried after
-        # a short TTL instead of being frozen as "no price, maker" — the
+        # a short TTL instead of being frozen as "no price, no role" — the
         # fee backfill depends on a later read seeing the trades.
-        cache[key] = (time.monotonic(), avg, taker_seen)
-        if avg > 0 or taker_seen:
+        cache[key] = (time.monotonic(), avg, role)
+        if avg > 0 or role is not None:
             log.info(
                 "clob.avg_price_from_trades",
                 order_id=order_id[:16],
                 trade_count=len(ids),
                 avg_price=round(avg, 6) if avg > 0 else None,
-                is_taker=taker_seen,
+                trader_side=role,
             )
-        return avg, taker_seen
+        return avg, role
 
     # ------------------------------------------------------------------
     # Order placement

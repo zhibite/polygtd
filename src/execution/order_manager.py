@@ -377,8 +377,10 @@ class OrderManager:
             if fill_price is not None and fill_price > 0
             else None
         )
+        # 1e-6: trade-derived averages carry float noise around the tick
+        # (0.2700000383 vs 0.27) that must not trigger a rewrite/log.
         price_changed = (
-            new_price is not None and abs(new_price - old_price) > 1e-9
+            new_price is not None and abs(new_price - old_price) > 1e-6
         )
         # ONLY backfill an unknown role — never overwrite one that is
         # already recorded. Per-trade sources (the WS TRADE event's

@@ -429,3 +429,31 @@ async def test_watcher_reports_zero_instead_of_the_limit_for_unknown_avg() -> No
     assert price == 0.0, "unknown avg must be 0, not the 0.40 limit"
     assert hint.avg_fill_price == 0.0
     assert hint.is_taker is True
+
+
+def test_watcher_learns_the_tri_state_role_from_fill_state() -> None:
+    """REST can positively identify MAKER too, not just "not taker".
+
+    A maker fill first booked by the watcher (WS TRADE missed) used to
+    stay role-less forever, so the dashboard counted it as unknown and a
+    taker fill in that position would have kept fee=0.
+    """
+    watcher = TierWatcher.__new__(TierWatcher)
+    watcher._is_taker = False
+    watcher._trader_side = None
+
+    watcher._learn_trade_role({"trader_side": "MAKER"})
+    assert watcher._trader_side == "MAKER"
+    assert watcher._is_taker is False
+
+    watcher._learn_trade_role({"trader_side": "TAKER"})
+    assert watcher._trader_side == "TAKER"
+    assert watcher._is_taker is True
+
+    # Older fill-state shape: is_taker=True still maps to TAKER.
+    fresh = TierWatcher.__new__(TierWatcher)
+    fresh._is_taker = False
+    fresh._trader_side = None
+    fresh._learn_trade_role({"is_taker": True})
+    assert fresh._trader_side == "TAKER"
+    assert fresh._is_taker is True
