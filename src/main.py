@@ -269,6 +269,15 @@ STATE = AppState()
 # ---------------------------------------------------------------------------
 
 
+# A freshly bought conditional-token position can legitimately read 0 from
+# the CLOB balance endpoint for a few seconds while settlement catches up.
+# Never treat that as "the wallet is empty" inside this window — production
+# 2026-10-31 14:00 UTC: a 1u taker T1 buy (2.857 shares) was followed ~0.3 s
+# later by a taker TP that read balance 0, and the reconcile wiped a real
+# position out of the engine.
+_POSITION_SETTLE_GRACE_S = 10.0
+
+
 async def _maybe_realize_closed(token_id: str, clob, pos) -> None:
     """If the CLOB reports zero token balance for `token_id`, instruct
     `Position.realize_position_closed()` to drop the phantom inventory.
@@ -291,7 +300,29 @@ async def _maybe_realize_closed(token_id: str, clob, pos) -> None:
 
     Best-effort: a transient REST failure does NOT clear state — we
     only act on a definitive balance==0.
+
+    A BUY fill settles into the wallet with a lag (1-3s+, longer when the
+    chain is busy), so a zero balance read right after a buy is not
+    evidence of a drained position. Skip the reconcile while the newest
+    tier fill is younger than `_POSITION_SETTLE_GRACE_S`; the next TP/stop
+    retry will re-check after the backoff.
     """
+    last_fill_ts = max(
+        (float(getattr(t, "last_fill_ts", 0.0) or 0.0) for t in pos.tiers),
+        default=0.0,
+    )
+    fill_age = time.time() - last_fill_ts if last_fill_ts > 0 else None
+    if fill_age is not None and fill_age < _POSITION_SETTLE_GRACE_S:
+        log.warning(
+            "router.realize_check.settle_grace",
+            token=token_id[:16],
+            in_memory_qty=pos.total_qty,
+            fill_age_s=round(fill_age, 2),
+            grace_s=_POSITION_SETTLE_GRACE_S,
+            note="newest BUY fill is still settling; keeping position state",
+        )
+        return
+
     try:
         bal = await clob.get_token_balance(token_id)
     except Exception as exc:

@@ -239,6 +239,55 @@ class _RouterOM:
         )
 
 
+class _SettlePosition:
+    def __init__(self, age_s: float) -> None:
+        self.total_qty = 2.8571
+        self.cleared = False
+        self.tiers = [SimpleNamespace(last_fill_ts=time.time() - age_s)]
+
+    def realize_position_closed(self, **kwargs):  # noqa: ANN003
+        self.cleared = True
+
+
+class _ZeroBalanceClob:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def get_token_balance(self, token_id):  # noqa: ANN001
+        self.calls += 1
+        return 0.0
+
+
+def test_settle_grace_keeps_a_just_bought_position() -> None:
+    """The CLOB balance lags a fresh buy; a zero read must not wipe it.
+
+    Production 2026-10-31 14:00 UTC: taker T1 bought 2.857 shares, the
+    immediate taker TP read balance 0, and the reconcile cleared a real
+    position from the engine.
+    """
+    from src.main import _maybe_realize_closed
+
+    pos = _SettlePosition(age_s=1.0)
+    clob = _ZeroBalanceClob()
+
+    asyncio.run(_maybe_realize_closed("tok", clob, pos))
+
+    assert pos.cleared is False
+    assert clob.calls == 0, "the grace period must skip the balance read"
+
+
+def test_drained_position_is_cleared_after_the_grace() -> None:
+    from src.main import _maybe_realize_closed
+
+    pos = _SettlePosition(age_s=60.0)
+    clob = _ZeroBalanceClob()
+
+    asyncio.run(_maybe_realize_closed("tok", clob, pos))
+
+    assert pos.cleared is True
+    assert clob.calls == 2, "two consecutive zero reads confirm a drain"
+
+
 @pytest.mark.asyncio
 async def test_router_t1_taker_binds_and_feeds_the_fill() -> None:
     eng = _RouterEngine()
