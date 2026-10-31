@@ -177,6 +177,12 @@ const fmt = (n, d = 2) => (n === null || n === undefined || isNaN(n)) ? '--' : N
 const money = (n) => (n === null || n === undefined || isNaN(n)) ? '--' : (n >= 0 ? '+$' : '-$') + Math.abs(n).toFixed(2);
 const cls = (n) => (n > 0 ? 'green' : n < 0 ? 'red' : '');
 const utc = (ts) => ts ? new Date(ts * 1000).toISOString().slice(11, 19) : '--';
+// 轮次列附带方向：UP/DOWN 由 fill.token_id 匹配 round 的 up/down token 得出。
+const outcomePill = (o) => {
+  const v = (o || '').toUpperCase();
+  if (v !== 'UP' && v !== 'DOWN') return '';
+  return ` <span class="pill ${v === 'UP' ? 'buy' : 'sell'}">${v}</span>`;
+};
 const iso = (s) => s ? new Date(s).toISOString().replace('T', ' ').slice(0, 19) : '--';
 // 秒 → "14m 19s"（不足一分钟只显示秒），用于窗口剩余时间。
 const dur = (s) => {
@@ -444,7 +450,7 @@ function renderFills(fills) {
   }
   body.innerHTML = fills.slice(0, 15).map(f => `<tr>
     <td class="mono">${f.ts_ms ? new Date(f.ts_ms).toISOString().slice(11, 19) : '--'}</td>
-    <td class="mono">${utc(f.round_start_ts)}</td>
+    <td class="mono">${utc(f.round_start_ts)}${outcomePill(f.outcome)}</td>
     <td>${f.tier || '--'}</td>
     <td><span class="pill ${f.side === 'BUY' ? 'buy' : 'sell'}">${f.side}</span></td>
     <td class="mono">${fmt(f.price, 4)}</td>

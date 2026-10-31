@@ -109,6 +109,12 @@ const money = (n) => (n === null || n === undefined || isNaN(n)) ? '--' : (n >= 
 const cls = (n) => (n > 0 ? 'green' : n < 0 ? 'red' : '');
 const utc = (ts) => ts ? new Date(ts * 1000).toISOString().slice(11, 19) : '--';
 const iso = (s) => s ? new Date(s).toISOString().replace('T', ' ').slice(0, 19) : '--';
+// 轮次列附带方向：UP/DOWN 由 fill.token_id 匹配 round 的 up/down token 得出。
+const outcomePill = (o) => {
+  const v = (o || '').toUpperCase();
+  if (v !== 'UP' && v !== 'DOWN') return '';
+  return ` <span class="pill ${v === 'UP' ? 'buy' : 'sell'}">${v}</span>`;
+};
 
 // 成交明细分页：每页 20 条，服务端按 (ts_ms, fill_id) 倒序切片。
 const FILL_PAGE_SIZE = 20;
@@ -218,7 +224,7 @@ function renderFills(fills) {
     const roleCls = role === 'MAKER' ? 'watching' : role === 'TAKER' ? 'placed' : 'idle';
     return `<tr>
       <td class="mono">${f.ts_ms ? new Date(f.ts_ms).toISOString().replace('T', ' ').slice(0, 19) : '--'}</td>
-      <td class="mono">${utc(f.round_start_ts)}</td>
+      <td class="mono">${utc(f.round_start_ts)}${outcomePill(f.outcome)}</td>
       <td>${f.tier || '--'}</td>
       <td><span class="pill ${f.side === 'BUY' ? 'buy' : 'sell'}">${f.side}</span></td>
       <td class="mono">${fmt(f.price, 4)}</td>

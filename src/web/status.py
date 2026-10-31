@@ -556,7 +556,12 @@ SELECT f.fill_id,
        COALESCE(r.slug, '') AS slug,
        COALESCE(o.price, 0.0) AS limit_price,
        COALESCE(f.trader_side, '') AS trader_side,
-       COALESCE(f.fee, 0.0) AS fee
+       COALESCE(f.fee, 0.0) AS fee,
+       CASE
+         WHEN r.up_token IS NOT NULL AND f.token_id = r.up_token THEN 'UP'
+         WHEN r.down_token IS NOT NULL AND f.token_id = r.down_token THEN 'DOWN'
+         ELSE ''
+       END AS outcome
 FROM fills f
 LEFT JOIN orders o ON o.client_order_id = f.order_id
 LEFT JOIN rounds r ON r.round_start_ts = f.round_start_ts
@@ -602,7 +607,7 @@ def recent_fills(
     ).fetchall()
     out = []
     for (fill_id, round_ts, side, price, size, ts_ms,
-         tier_name, slug, limit_price, trader_side, fee) in rows:
+         tier_name, slug, limit_price, trader_side, fee, outcome) in rows:
         price = float(price or 0.0)
         size = float(size or 0.0)
         limit_price = float(limit_price or 0.0)
@@ -612,6 +617,9 @@ def recent_fills(
             "fill_id": fill_id,
             "round_start_ts": round_ts,
             "side": side,
+            # UP/DOWN token the fill touched; '' for legacy rows whose
+            # round predates token-id storage (cannot be mapped).
+            "outcome": str(outcome or "").upper(),
             "price": price,
             "size": size,
             "notional": notional,

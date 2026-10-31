@@ -189,6 +189,28 @@ def test_rounds_with_pnl_and_stats(conn) -> None:
     assert fills[0]["tier"] == "T1"
 
 
+def test_recent_fills_tag_up_and_down_tokens(conn) -> None:
+    """The 轮次 column tags each fill with the side that was traded.
+
+    UP/DOWN comes from matching fills.token_id against the round's
+    up_token/down_token. A token mapping to neither (legacy round) stays
+    blank rather than guessing a direction.
+    """
+    db = DB(conn)
+    db.upsert_round(
+        round_start_ts=1_000, slug="r1",
+        up_token="UPTOK", down_token="DOWNTOK",
+    )
+    db.insert_fill("f1", "c1", 1_000, "UPTOK", "BUY", 0.40, 5.0, 1_000_000)
+    db.insert_fill("f2", "c1", 1_000, "DOWNTOK", "SELL", 0.60, 5.0, 2_000_000)
+    db.insert_fill("f3", "c1", 1_000, "OTHER", "BUY", 0.10, 5.0, 3_000_000)
+
+    by_id = {f["fill_id"]: f for f in status_mod.recent_fills(conn)}
+    assert by_id["f1"]["outcome"] == "UP"
+    assert by_id["f2"]["outcome"] == "DOWN"
+    assert by_id["f3"]["outcome"] == ""
+
+
 def test_fills_pagination_is_stable_and_counted(conn) -> None:
     """成交明细 pages must not overlap or skip when ts_ms ties.
 
