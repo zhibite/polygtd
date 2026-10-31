@@ -42,6 +42,61 @@ def _as_bool(value: object) -> bool:
     return str(value).strip().lower() in ("1", "true", "yes", "resolved")
 
 
+def _parse_market_resolution(data: dict | None) -> dict | None:
+    """Parse one Gamma market object into a resolution verdict.
+
+    Returns None when `data` is not a dict. Gamma has exposed resolution
+    through slightly different fields over time; accept any of: explicit
+    `resolved`, UMA status resolved, or a closed market whose two outcome
+    prices are terminal (exactly 0 and 1). A voided market's ["0","0"] is
+    NOT a resolution.
+    """
+    if not isinstance(data, dict):
+        return None
+
+    raw = data.get("outcomePrices") or ""
+    try:
+        prices = json.loads(raw) if raw else []
+    except Exception:
+        prices = []
+    try:
+        nums = [float(p) for p in prices]
+    except (TypeError, ValueError):
+        nums = []
+
+    terminal = len(nums) >= 2 and sorted(nums[:2]) == [0.0, 1.0]
+    uma = str(data.get("umaResolutionStatus") or "").strip().lower()
+    resolved = _as_bool(data.get("resolved")) or (
+        terminal and (_as_bool(data.get("closed")) or uma == "resolved")
+    )
+    if not resolved:
+        return {"resolved": False, "up_wins": None, "outcome": ""}
+
+    # `outcomePrices` is ordered like `outcomes`. The 15-minute series
+    # lists Up first, but do not rely on it: find the UP label when
+    # present so a reordered market cannot book the winner as a loser.
+    up_idx = 0
+    raw_outcomes = data.get("outcomes")
+    try:
+        labels = json.loads(raw_outcomes) if raw_outcomes else []
+    except Exception:
+        labels = []
+    if isinstance(labels, list) and len(labels) == len(nums):
+        for i, label in enumerate(labels):
+            if str(label).strip().lower() in ("up", "yes"):
+                up_idx = i
+                break
+
+    up_price = nums[up_idx] if nums else 0.0
+    up_wins = up_price >= 0.5
+    outcome_text = (data.get("outcome") or "").strip()
+    if outcome_text.lower() in ("up", "yes"):
+        up_wins = True
+    elif outcome_text.lower() in ("down", "no"):
+        up_wins = False
+    return {"resolved": True, "up_wins": up_wins, "outcome": outcome_text}
+
+
 @dataclass(frozen=True)
 class ClientSettings:
     gamma_api: str
@@ -398,77 +453,84 @@ class PolymarketClient:
 
     # ── Market resolution ───────────────────────────────────────────────────────
 
-    async def get_market_resolution(self, condition_id: str) -> Optional[dict]:
+    async def _market_by_condition(
+        self, c: httpx.AsyncClient, condition_id: str
+    ) -> dict | None:
+        """Gamma `/markets` lookup by condition_id (first/only match)."""
+        resp = await c.get(
+            f"{self.settings.gamma_api}/markets",
+            params={"condition_ids": [condition_id]},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list):
+            return data[0] if data else None
+        if isinstance(data, dict):
+            return data
+        log.warning(
+            "get_market_resolution unexpected response type",
+            condition_id=condition_id[:12], got=type(data).__name__,
+        )
+        return None
+
+    async def _market_by_event_slug(
+        self, c: httpx.AsyncClient, slug: str, condition_id: str
+    ) -> dict | None:
+        """Find the market inside a Gamma event payload.
+
+        Why this exists: for the recurring 15-minute crypto markets Gamma
+        returns `[]` from `/markets?condition_ids=` once the market is
+        resolved, even though `/events?slug=` still carries the final
+        `closed` / `outcomePrices` / `umaResolutionStatus` fields
+        (production 2026-10-31 13:15 UTC round). Without this fallback a
+        losing round can never be settled.
+        """
+        resp = await c.get(
+            f"{self.settings.gamma_api}/events",
+            params={"slug": slug},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        events = data if isinstance(data, list) else [data]
+        wanted_cid = str(condition_id or "").lower()
+        by_slug: dict | None = None
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            for m in ev.get("markets") or []:
+                if not isinstance(m, dict):
+                    continue
+                if wanted_cid and str(m.get("conditionId") or "").lower() == wanted_cid:
+                    return m
+                if m.get("slug") == slug:
+                    by_slug = m
+        return by_slug
+
+    async def get_market_resolution(
+        self, condition_id: str, slug: str | None = None
+    ) -> Optional[dict]:
         """
         Query Gamma for market resolution result.
-        condition_id is passed as query param `condition_ids` (array form).
+
+        `condition_id` is tried first via `/markets?condition_ids=`.
+        `slug` (the event slug) enables the `/events?slug=` fallback used
+        for resolved recurring markets, where the `/markets` filter can
+        return an empty list.
         """
         c = await self._client()
         try:
-            resp = await c.get(
-                f"{self.settings.gamma_api}/markets",
-                params={"condition_ids": [condition_id]},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            if isinstance(data, list):
-                if not data:
-                    return {"resolved": False, "up_wins": None, "outcome": ""}
-                data = data[0]
-            elif not isinstance(data, dict):
-                log.warning(
-                    "get_market_resolution unexpected response type",
-                    condition_id=condition_id[:12], got=type(data).__name__,
+            data = await self._market_by_condition(c, condition_id)
+            parsed = _parse_market_resolution(data) or {
+                "resolved": False, "up_wins": None, "outcome": "",
+            }
+            if not parsed.get("resolved") and slug:
+                event_data = await self._market_by_event_slug(
+                    c, slug, condition_id
                 )
-                return None
-
-            raw = data.get("outcomePrices") or ""
-            try:
-                prices = json.loads(raw) if raw else []
-            except Exception:
-                prices = []
-            try:
-                nums = [float(p) for p in prices]
-            except (TypeError, ValueError):
-                nums = []
-
-            # Gamma has exposed resolution through slightly different
-            # fields over time. Accept any of: explicit `resolved`, UMA
-            # status resolved, or a closed market whose two outcome prices
-            # are terminal (exactly 0 and 1). A voided market's ["0","0"]
-            # is NOT a resolution.
-            terminal = len(nums) >= 2 and sorted(nums[:2]) == [0.0, 1.0]
-            uma = str(data.get("umaResolutionStatus") or "").strip().lower()
-            resolved = _as_bool(data.get("resolved")) or (
-                terminal and (_as_bool(data.get("closed")) or uma == "resolved")
-            )
-            if not resolved:
-                return {"resolved": False, "up_wins": None, "outcome": ""}
-
-            # `outcomePrices` is ordered like `outcomes`. The 15-minute
-            # series lists Up first, but do not rely on it: find the UP
-            # label when present so a reordered market cannot book the
-            # winner as a loser.
-            up_idx = 0
-            raw_outcomes = data.get("outcomes")
-            try:
-                labels = json.loads(raw_outcomes) if raw_outcomes else []
-            except Exception:
-                labels = []
-            if isinstance(labels, list) and len(labels) == len(nums):
-                for i, label in enumerate(labels):
-                    if str(label).strip().lower() in ("up", "yes"):
-                        up_idx = i
-                        break
-
-            up_price = nums[up_idx] if nums else 0.0
-            up_wins = up_price >= 0.5
-            outcome_text = (data.get("outcome") or "").strip()
-            if outcome_text.lower() in ("up", "yes"):
-                up_wins = True
-            elif outcome_text.lower() in ("down", "no"):
-                up_wins = False
-            return {"resolved": True, "up_wins": up_wins, "outcome": outcome_text}
+                event_parsed = _parse_market_resolution(event_data)
+                if event_parsed and event_parsed.get("resolved"):
+                    parsed = event_parsed
+            return parsed
         except Exception as e:
             is_422 = getattr(e, "status_code", None) == 422
             level = "debug" if is_422 else "warning"

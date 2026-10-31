@@ -544,10 +544,12 @@ def test_unresolved_rounds_excludes_recorded_outcomes(conn) -> None:
 class _FakeResolutionPM:
     def __init__(self, result) -> None:
         self.result = result
-        self.calls: list[str] = []
+        self.calls: list[tuple[str, str | None]] = []
 
-    async def get_market_resolution(self, condition_id: str):
-        self.calls.append(condition_id)
+    async def get_market_resolution(
+        self, condition_id: str, slug: str | None = None
+    ):
+        self.calls.append((condition_id, slug))
         return self.result
 
 
@@ -576,7 +578,7 @@ def test_resolve_rounds_once_records_the_outcome() -> None:
     resolved = asyncio.run(_resolve_rounds_once(state, attempts))
 
     assert resolved == 1
-    assert pm.calls == ["0xabc"]
+    assert pm.calls == [("0xabc", "slug")]
     assert db.recorded == [(1_000, False)]
     assert attempts == {}
 

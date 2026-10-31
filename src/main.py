@@ -2043,7 +2043,8 @@ async def _resolve_rounds_once(
         attempts[round_ts] = tries + 1
         try:
             res = await asyncio.wait_for(
-                pm.get_market_resolution(cid), timeout=10.0
+                pm.get_market_resolution(cid, slug=slug or None),
+                timeout=10.0,
             )
         except asyncio.CancelledError:
             raise

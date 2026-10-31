@@ -42,6 +42,30 @@ def _client_with(data: dict) -> PolymarketClient:
     return pm
 
 
+class _RoutingHTTP:
+    def __init__(self, markets, events) -> None:
+        self.markets = markets
+        self.events = events
+        self.calls: list[tuple[str, dict | None]] = []
+
+    async def get(self, url, params=None):
+        self.calls.append((url, params))
+        if "/events" in url:
+            return _Response(self.events)
+        return _Response(self.markets)
+
+
+def _client_with_routes(markets, events):
+    pm = PolymarketClient()
+    http = _RoutingHTTP(markets, events)
+
+    async def _client():
+        return http
+
+    pm._client = _client  # type: ignore[method-assign]
+    return pm, http
+
+
 def _resolve(data: dict) -> dict:
     return asyncio.run(_client_with(data).get_market_resolution("0xdead"))
 
@@ -109,3 +133,79 @@ def test_open_market_with_mid_prices_is_unresolved() -> None:
         "outcomePrices": '["0.52", "0.48"]',
     })
     assert out["resolved"] is False
+
+
+def test_resolved_market_falls_back_to_the_event_endpoint() -> None:
+    """Gamma `/markets?condition_ids=` returns [] for resolved recurring
+    markets; the event payload still has the final outcome (production
+    2026-10-31 13:15 UTC round)."""
+    market = {
+        "conditionId": "0xdead",
+        "slug": "btc-updown-15m-1",
+        "closed": True,
+        "outcomePrices": '["0", "1"]',
+        "umaResolutionStatus": "resolved",
+        "outcomes": '["Up", "Down"]',
+    }
+    pm, http = _client_with_routes(
+        [], [{"slug": "btc-updown-15m-1", "markets": [market]}]
+    )
+    out = asyncio.run(
+        pm.get_market_resolution("0xdead", slug="btc-updown-15m-1")
+    )
+    assert out == {"resolved": True, "up_wins": False, "outcome": ""}
+    assert any("/events" in url for url, _ in http.calls)
+
+
+def test_event_fallback_also_covers_a_stale_unresolved_markets_reply() -> None:
+    stale = {
+        "conditionId": "0xdead",
+        "closed": False,
+        "outcomePrices": '["0.9995", "0.0005"]',
+        "umaResolutionStatus": None,
+    }
+    resolved = {
+        "conditionId": "0xdead",
+        "closed": True,
+        "outcomePrices": '["1", "0"]',
+        "umaResolutionStatus": "resolved",
+        "outcomes": '["Up", "Down"]',
+    }
+    pm, _ = _client_with_routes(
+        [stale], [{"slug": "btc-updown-15m-1", "markets": [resolved]}]
+    )
+    out = asyncio.run(
+        pm.get_market_resolution("0xdead", slug="btc-updown-15m-1")
+    )
+    assert out["resolved"] is True
+    assert out["up_wins"] is True
+
+
+def test_event_fallback_matches_the_condition_id() -> None:
+    other = {
+        "conditionId": "0xother",
+        "closed": True,
+        "outcomePrices": '["1", "0"]',
+        "umaResolutionStatus": "resolved",
+    }
+    wanted = {
+        "conditionId": "0xdead",
+        "closed": True,
+        "outcomePrices": '["0", "1"]',
+        "umaResolutionStatus": "resolved",
+    }
+    pm, _ = _client_with_routes(
+        [], [{"markets": [other, wanted]}]
+    )
+    out = asyncio.run(
+        pm.get_market_resolution("0xdead", slug="btc-updown-15m-1")
+    )
+    assert out["resolved"] is True
+    assert out["up_wins"] is False
+
+
+def test_without_slug_only_the_markets_endpoint_is_queried() -> None:
+    pm, http = _client_with_routes([], [])
+    out = asyncio.run(pm.get_market_resolution("0xdead"))
+    assert out == {"resolved": False, "up_wins": None, "outcome": ""}
+    assert not any("/events" in url for url, _ in http.calls)
