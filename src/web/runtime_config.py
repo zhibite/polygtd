@@ -115,6 +115,23 @@ PARAMS: tuple[Param, ...] = (
     Param("T4_DRIFT_BYPASS_MIN_REMAINING_S", "T4 漂移豁免剩余时间 (秒)", "风控", "float",
           0.0, 900.0, 30.0,
           help="窗口剩余时间 ≥ 该值时，T4 可在 BTC 漂移 FAIL 下补仓；0 = 关闭"),
+    Param("T4_MIN_REMAINING_S", "T4 最短剩余时间 (秒)", "风控", "float",
+          0.0, 900.0, 30.0,
+          help="剩余时间少于此值时不再补 T4（300s GTD 与止盈都来不及走完）；0 = 关闭"),
+    Param("T4_STRIKE_GATE_ENABLED", "T4 行权价距离闸门", "风控", "bool",
+          help="只允许在 BTC 仍接近窗口开盘价（z 分数不超限）时补 T4；"
+               "避免在明确趋势中越补越深"),
+    Param("T4_MAX_STRIKE_Z", "T4 行权价距离 z 上限", "风控", "float",
+          0.0, 5.0, 0.25,
+          help="z = 不利方向距离 / (1 分钟波动 × √剩余分钟)；越小越保守，"
+               "0 = 只在 BTC 位于有利一侧时补"),
+    Param("T4_STRIKE_SIGMA_PCT_PER_MIN", "T4 波动率下限 (%/分钟)", "风控", "float",
+          0.01, 1.0, 0.01,
+          help="60 秒振幅样本不足时的 BTC 1 分钟波动率；实盘用 60s 振幅/2"),
+    Param("T4_MAX_GAP_BELOW_TRIGGER_PCT", "T4 允许低于触发价幅度", "风控", "float",
+          0.0, 0.5, 0.01,
+          help="mid 已跌到触发价下方超过该比例时不挂 T4，等价格回到预挂区；"
+               "0 = 关闭（旧行为）"),
     Param("STOP_LOSS_ENABLED", "T4 后启用止损", "风控", "bool",
           help="T4 成交后，价格继续下跌时按两段式规则自动减仓/清仓"),
     Param("STOP_LOSS_T4_DROP_PCT", "止损触发跌幅 (相对 T4 成交价)", "风控", "float",

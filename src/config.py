@@ -213,6 +213,37 @@ class StrategySettings(BaseSettings):
     # 0 disables (T4 always requires drift within limit).
     T4_DRIFT_BYPASS_MIN_REMAINING_S: float = 540.0
 
+    # ── T4 entry gates (operator decision 2026-10-31) ─────────────────────
+    # T4 adds 8 of the 15 USD planned exposure at a price 60% below T1.
+    # A fixed price drop alone cannot tell a trend (do not add) from an
+    # overreaction (add), so the largest step is additionally conditioned
+    # on the underlying's distance from the window strike and on the time
+    # left. All gates fail-open when their inputs are unavailable: the
+    # BTC feed-health guard already covers a dead feed, and a new gate
+    # must never be able to wedge the ladder.
+    #
+    # Skip T4 when fewer than this many seconds remain in the window:
+    # the 300 s GTD and the recovery to TP cannot play out, and round-end
+    # cancels the order anyway. 0 disables.
+    T4_MIN_REMAINING_S: float = 240.0
+    # Distance-to-strike gate. The 15-minute token is a probability that
+    # BTC closes on one side of the window-open price. z = adverse-side
+    # distance / (sigma_1m * sqrt(remaining_minutes)); "adverse" flips
+    # sign by position side. Add only while the adverse z is at most this.
+    # Higher = more permissive; 0 = only add when BTC is on the winning
+    # side of the strike. 0 does not disable (see the ENABLED flag).
+    T4_STRIKE_GATE_ENABLED: bool = True
+    T4_MAX_STRIKE_Z: float = 2.0
+    # Fallback 1-minute BTC sigma (percent) when the 60 s range sample is
+    # too thin. The live estimate is range/2, so a fast spike (possible
+    # overreaction) raises sigma and a slow grind keeps it at the floor.
+    T4_STRIKE_SIGMA_PCT_PER_MIN: float = 0.05
+    # Do not arm T4 once the token mid has already gapped more than this
+    # fraction below the T4 trigger: wait for the price to come back into
+    # the pre-arm zone instead of catching a falling knife.
+    # 0 = arm at any mid at/below the fire line (old behaviour).
+    T4_MAX_GAP_BELOW_TRIGGER_PCT: float = 0.05
+
     # NOTE: Same-window T1 re-entry after a take-profit is deliberately NOT
     # supported (operator decision 2026-10-31). Once a round has taken
     # profit, `entry_token` is kept until the next window so a fresh

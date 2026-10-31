@@ -251,7 +251,9 @@ async def test_t4_time_bypass_places_t4_despite_drift_fail() -> None:
     """Window has 10 min left → T4 may fire even though drift FAILs."""
     eng = _engine()
     eng._gate.can_double_down = lambda *a, **k: False
-    eng._pc = SimpleNamespace(get_midpoint=lambda tok: 0.10)  # below T4 fire line
+    # Inside the T4 pre-arm zone (trigger 0.152, fire line 0.167) and
+    # above the 5% gap floor (0.144) so the 2026-10-31 entry gates pass.
+    eng._pc = SimpleNamespace(get_midpoint=lambda tok: 0.155)
     eng._round = _round_with_end(_t4_position(), 600)
 
     await eng._check_average_down(bc_now=100_000.0)
@@ -266,7 +268,7 @@ async def test_t4_time_bypass_does_not_apply_with_little_time_left() -> None:
     """Window has only 5 min left → T4 stays blocked by the drift gate."""
     eng = _engine()
     eng._gate.can_double_down = lambda *a, **k: False
-    eng._pc = SimpleNamespace(get_midpoint=lambda tok: 0.10)
+    eng._pc = SimpleNamespace(get_midpoint=lambda tok: 0.155)
     eng._round = _round_with_end(_t4_position(), 300)
 
     await eng._check_average_down(bc_now=100_000.0)
@@ -279,7 +281,7 @@ async def test_t4_time_bypass_can_be_disabled() -> None:
     eng = _engine()
     eng._s.T4_DRIFT_BYPASS_MIN_REMAINING_S = 0.0
     eng._gate.can_double_down = lambda *a, **k: False
-    eng._pc = SimpleNamespace(get_midpoint=lambda tok: 0.10)
+    eng._pc = SimpleNamespace(get_midpoint=lambda tok: 0.155)
     eng._round = _round_with_end(_t4_position(), 600)
 
     await eng._check_average_down(bc_now=100_000.0)

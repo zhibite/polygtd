@@ -381,6 +381,122 @@ class StrategyEngine:
             note="T4 drift gate bypassed: enough window time left to recover",
         )
 
+    # ── T4 entry gates (2026-10-31) ──────────────────────────────────────
+    #
+    # T4 is the largest ladder step (8 of 15 USD) and sits 60% below T1.
+    # A fixed price drop cannot distinguish "the market overreacted" from
+    # "BTC has decisively left the strike"; these gates add that context:
+    #   * enough window time left for a recovery,
+    #   * BTC still close enough to the window strike (distance z-score),
+    #   * the token has not already gapped far through the trigger.
+    # Every gate fails open when its inputs are unavailable — the feed
+    # health guard already pauses averaging on a dead BTC feed, and a
+    # risk gate must never be able to wedge the ladder permanently.
+
+    def _t4_remaining_ok(self) -> tuple[bool, float | None]:
+        """False when too little of the 15-minute window is left for T4."""
+        remaining = self._window_remaining_s()
+        min_s = self._cfg_float("T4_MIN_REMAINING_S", 240.0)
+        if min_s <= 0 or remaining is None:
+            return True, remaining
+        return remaining >= min_s, remaining
+
+    def _btc_sigma_1m(self) -> float:
+        """1-minute BTC sigma estimate (fraction) for the T4 strike gate.
+
+        Reuses the rolling 60 s high/low sample maintained by the flash
+        volatility guard. A Brownian range over one minute is roughly 2σ,
+        so σ_1m ≈ range/2. A slow trend keeps the 60 s range small (z
+        rises and T4 is blocked), while a fast spike inflates the range —
+        i.e. a spike is treated as a possible overreaction, not a trend.
+        Falls back to `T4_STRIKE_SIGMA_PCT_PER_MIN` when samples are thin.
+        """
+        floor_pct = max(
+            self._cfg_float("T4_STRIKE_SIGMA_PCT_PER_MIN", 0.05), 0.0
+        )
+        sigma = floor_pct / 100.0
+        samples = getattr(self, "_btc_samples", None) or []
+        if len(samples) >= 4:
+            low = min(p for _, p in samples)
+            high = max(p for _, p in samples)
+            if low > 0:
+                sigma = max(sigma, (high - low) / low / 2.0)
+        return sigma
+
+    def _t4_strike_gate(
+        self, bc_now: float, side: str | None
+    ) -> tuple[bool, dict]:
+        """Whether BTC is still close enough to the strike for T4.
+
+        The token resolves on BTC vs the window-open price. For a DOWN
+        position only BTC *above* the strike is adverse (UP symmetric).
+        z = adverse distance / (σ_1m * √remaining_minutes): add only while
+        z stays small, i.e. the outcome is still genuinely in play.
+
+        Returns (ok, metrics) so the caller can log every decision for
+        later threshold calibration.
+        """
+        if not self._cfg_bool("T4_STRIKE_GATE_ENABLED", True):
+            return True, {"t4_z": None, "t4_z_gate": "disabled"}
+
+        side_u = str(side or "").upper()
+        if side_u not in ("UP", "DOWN"):
+            # Unknown side: fail open rather than applying the wrong sign.
+            return True, {"t4_z": None, "t4_z_gate": "unknown_side"}
+
+        baseline = 0.0
+        gate = getattr(self, "_gate", None)
+        if gate is not None:
+            baseline = float(getattr(gate, "baseline", 0.0) or 0.0)
+        remaining = self._window_remaining_s()
+        sigma = self._btc_sigma_1m()
+        if (
+            baseline <= 0
+            or bc_now <= 0
+            or remaining is None
+            or remaining <= 0
+            or sigma <= 0
+        ):
+            return True, {
+                "t4_z": None,
+                "t4_z_gate": "unavailable",
+                "t4_baseline": baseline or None,
+                "t4_remaining_s": remaining,
+            }
+
+        minutes = max(remaining, 1.0) / 60.0
+        z = (bc_now - baseline) / baseline / (sigma * math.sqrt(minutes))
+        adverse_z = z if side_u == "DOWN" else -z
+        max_z = self._cfg_float("T4_MAX_STRIKE_Z", 2.0)
+        metrics = {
+            "t4_z": round(adverse_z, 3),
+            "t4_raw_z": round(z, 3),
+            "t4_max_z": max_z,
+            "t4_sigma_1m_pct": round(sigma * 100.0, 4),
+            "t4_remaining_s": round(remaining, 1),
+            "t4_baseline": baseline,
+            "t4_btc_now": bc_now,
+        }
+        return adverse_z <= max_z, metrics
+
+    def _t4_gap_ok(
+        self, mid: float, strategy_price: float
+    ) -> tuple[bool, float | None]:
+        """False when the mid has gapped far below the T4 trigger.
+
+        Arming T4 while the token is still collapsing is the "catch a
+        falling knife" path: the pre-armed BUY fills on the way down and
+        the position is immediately underwater. Wait for the price to
+        come back into the pre-arm zone instead.
+        """
+        gap = max(
+            self._cfg_float("T4_MAX_GAP_BELOW_TRIGGER_PCT", 0.05), 0.0
+        )
+        if gap <= 0 or strategy_price <= 0:
+            return True, None
+        floor_price = strategy_price * (1.0 - gap)
+        return mid >= floor_price, floor_price
+
     async def _cancel_placed_buys(self, reason: str) -> None:
         """Cancel every resting BUY GTD (T1..T4) during a volatility blackout.
 
@@ -1708,6 +1824,45 @@ class StrategyEngine:
                 )
                 continue
 
+            # ── T4-only entry gates (2026-10-31) ────────────────────────
+            # Applied before the drift gate so the drift-FAIL bypass below
+            # cannot circumvent them: the bypass relaxes BTC *drift*, not
+            # the time/strike context.
+            t4_metrics: dict = {}
+            if tier.tier == 4:
+                ok, remaining = self._t4_remaining_ok()
+                if not ok:
+                    self._tN_skip_log(
+                        "engine.tN_skip_t4_late_window",
+                        tier=4, mid=mid_price, remaining_s=remaining,
+                        min_remaining_s=self._cfg_float(
+                            "T4_MIN_REMAINING_S", 240.0
+                        ),
+                    )
+                    continue
+                ok, t4_metrics = self._t4_strike_gate(
+                    bc_now, snap.entry_side
+                )
+                if not ok:
+                    self._tN_skip_log(
+                        "engine.tN_skip_t4_strike",
+                        tier=4, mid=mid_price, side=snap.entry_side,
+                        **t4_metrics,
+                    )
+                    continue
+                ok, gap_floor = self._t4_gap_ok(mid_price, strategy_price)
+                if not ok:
+                    self._tN_skip_log(
+                        "engine.tN_skip_t4_gap",
+                        tier=4, mid=mid_price,
+                        strategy_price=strategy_price,
+                        gap_floor=gap_floor,
+                        gap_pct=self._cfg_float(
+                            "T4_MAX_GAP_BELOW_TRIGGER_PCT", 0.05
+                        ),
+                    )
+                    continue
+
             # BTC drift gate for averaging.
             next_drop = TierSnapshot._next_tier_drop(tier.tier)
             if not self._gate.can_double_down(bc_now, mid_price, tier.tier, next_drop, t1_entry):
@@ -1782,6 +1937,7 @@ class StrategyEngine:
                 strategy_price=strategy_price,
                 t1_entry=t1_entry,
                 notional=order_notional,
+                **t4_metrics,
             )
 
             # Same pre-arm logic as T1: post at the configured strategy price.

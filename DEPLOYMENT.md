@@ -71,6 +71,13 @@ TP_DECREMENT_PCT=0.03    # 每补一档 -3% (N=1→17%, N=2→14%, N=3→11%)
 TP_MIN_PCT=0.05          # 止盈下限 5%
 BASELINE_DRIFT_LIMIT=0.0015  # BTC 现货偏移上限 0.15%
 
+# T4 入场闸门（T4 是最大的一层，避免在趋势中越补越深）
+T4_MIN_REMAINING_S=240   # 剩余 <240s 不补 T4；0=关闭
+T4_STRIKE_GATE_ENABLED=true  # 只允许 BTC 仍接近开盘价时补 T4
+T4_MAX_STRIKE_Z=2.0      # 不利方向 z 分数上限；越小越保守
+T4_STRIKE_SIGMA_PCT_PER_MIN=0.05  # 60s 样本不足时的 1 分钟波动率下限
+T4_MAX_GAP_BELOW_TRIGGER_PCT=0.05  # mid 已跌破触发价 >5% 时不挂单；0=关闭
+
 # 订单参数
 GTD_LIFETIME_S=300       # GTD 有效期（CLOB 硬下限 180，客户端会钳制到 >=181）
 SELL_SLIPPAGE_PCT=0.02   # FAK 卖出滑点 2%
