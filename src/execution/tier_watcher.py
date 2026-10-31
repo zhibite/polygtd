@@ -88,6 +88,9 @@ class WatcherResult:
     # to ensure the same terminal state is not applied twice to position
     # totals.
     dedup_key: str = ""
+    # Whether OUR order was the taker in the associated trades. Polymarket
+    # only charges takers (fee = C × rate × p × (1-p)); makers pay 0.
+    is_taker: bool = False
 
 
 # Callback signatures the ActionRouter / engine wire up.
@@ -205,6 +208,8 @@ class TierWatcher:
         # change wires additional callbacks. Without this guard the
         # downstream `apply_tier_watcher_result` would double-count (B-NEW-3).
         self._fire_complete_called = False
+        # Whether our order was the taker in its trades (drives the fee).
+        self._is_taker: bool = False
         # H-NEW-2026-07-12: continuous ground-truth reconciliation state.
         # `_last_pushed_size_matched` is the cumulative size_matched the
         # watcher most recently pushed through `on_partial_fill` (or
@@ -338,6 +343,8 @@ class TierWatcher:
         avg = fs.get("avg_price", 0.0)
         if avg > 0:
             self._avg_price_running = avg
+        if fs.get("is_taker"):
+            self._is_taker = True
 
     async def _run(self) -> None:
         """Main loop. One watcher = one GTD = one terminal state."""
@@ -404,6 +411,8 @@ class TierWatcher:
         fast_state = await self._read_fill_state()
         fast_size = fast_state.get("size_matched", 0.0) if fast_state else 0.0
         fast_avg = fast_state.get("avg_price", 0.0) if fast_state else 0.0
+        if fast_state and fast_state.get("is_taker"):
+            self._is_taker = True
         if fast_size + 1e-9 >= self._expected_size and fast_size > 0:
             cancel_sent = await self._safe_cancel()
             self._result = WatcherResult(
@@ -734,6 +743,10 @@ class TierWatcher:
         if self._fire_complete_called:
             return
         self._fire_complete_called = True
+        # Carry the taker flag to the router (fee accounting): the result is
+        # built in several places and not all of them have the fill state.
+        if self._on_complete is not None and self._is_taker:
+            result.is_taker = True
         if self._on_complete is None:
             return
         try:
@@ -783,6 +796,8 @@ class TierWatcher:
         avg_price = float(fill_state.get("avg_price", 0.0) or 0.0)
         if avg_price > 0:
             self._avg_price_running = avg_price
+        if fill_state.get("is_taker"):
+            self._is_taker = True
 
         # Record the observation for terminal decisions. This happens even
         # if the callback below raises: the CLOB fact is still true, and
@@ -828,10 +843,26 @@ class TierWatcher:
         # delta from `cumulative - tracked.size_matched`, so we just pass
         # the raw cumulative and price.
         try:
+            hint = WatcherResult(
+                outcome=TierOutcome.FILLED,
+                server_order_id=self._server_order_id,
+                token_id=self._token_id,
+                side=self._side,
+                strategy_price=self._strategy_price,
+                expected_size=self._expected_size,
+                filled_qty=high_water,
+                cancel_sent=False,
+                avg_fill_price=(
+                    self._avg_price_running
+                    if self._avg_price_running > 0
+                    else self._strategy_price
+                ),
+                is_taker=self._is_taker,
+            )
             await self._on_partial_fill(
                 high_water,
                 self._avg_price_running if self._avg_price_running > 0 else self._strategy_price,
-                None,
+                hint,
             )
         except Exception as exc:
             log.exception(

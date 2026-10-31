@@ -126,6 +126,9 @@ PARAMS: tuple[Param, ...] = (
           help="WS 漏事件时的 REST 兜底轮询"),
     Param("SELL_SLIPPAGE_PCT", "卖出滑点", "订单", "float", 0.0, 0.5, 0.01,
           help="仅 FAK 卖出路径使用"),
+    Param("TAKER_FEE_RATE", "Taker 手续费率", "订单", "float", 0.0, 0.2, 0.005,
+          help="官方公式 fee = C×feeRate×p×(1-p)，仅 taker 收取（Crypto=0.07）；"
+               "maker 免费。0 = 关闭手续费统计"),
     Param("CANCEL_HYSTERESIS_PCT", "撤单滞回幅度", "订单", "float", 0.0, 0.2, 0.005,
           help="撤单线比挂单线多走的比例，避免 mid 在阈值附近抖动时反复挂撤；"
                "0 = 关闭（旧的即时撤单行为）"),

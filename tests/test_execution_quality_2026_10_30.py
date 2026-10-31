@@ -228,7 +228,7 @@ async def test_sufficient_balance_posts_normally() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_legacy_fills_table_gets_trader_side_column(tmp_path) -> None:
+def test_legacy_fills_table_gets_new_columns(tmp_path) -> None:
     path = tmp_path / "legacy.db"
     raw = sqlite3.connect(path)
     raw.execute(
@@ -243,6 +243,7 @@ def test_legacy_fills_table_gets_trader_side_column(tmp_path) -> None:
     conn = init_db(path)
     cols = {row[1] for row in conn.execute("PRAGMA table_info(fills)")}
     assert "trader_side" in cols
+    assert "fee" in cols
     conn.close()
 
 

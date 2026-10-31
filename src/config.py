@@ -144,6 +144,16 @@ class StrategySettings(BaseSettings):
     # Prevents chasing at the very end of the 15-min window.
     T1_ENTRY_WINDOW_S: float = 300.0    # 5 minutes
 
+    # ── Trading fees (official formula) ───────────────────────────────────
+    # fee = C × feeRate × p × (1 - p)
+    #   C = shares, p = fill price, taker-only; makers pay 0.
+    # Crypto category: taker 0.07, maker 0, maker rebate 20% (rebates are
+    # not credited here — we only avoid overstating PnL). Set 0 to disable
+    # fee accounting entirely (the CLOB trade payload's fee_rate_bps field
+    # has been observed as 0 even for markets whose /fee-rate reports 1000,
+    # so the official category rate is used instead).
+    TAKER_FEE_RATE: float = 0.07
+
     # Boot-time window-age guard: if the process starts more than
     # ENTRY_OPEN_OFFSET_GRACE_SEC into a window, skip that window entirely.
     SKIP_IF_LATE_WINDOW_AT_BOOT: bool = True

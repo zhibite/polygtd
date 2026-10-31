@@ -73,10 +73,10 @@
       <thead>
         <tr>
           <th>开始 (UTC)</th><th>轮次</th><th>买入成本</th><th>卖出收入</th>
-          <th>盈亏</th><th>盈亏 %</th><th>成交笔数</th><th>撤单</th><th>状态</th>
+          <th>手续费</th><th>盈亏</th><th>盈亏 %</th><th>成交笔数</th><th>撤单</th><th>状态</th>
         </tr>
       </thead>
-      <tbody id="rounds-tbody"><tr><td colspan="9" class="no-data">加载中...</td></tr></tbody>
+      <tbody id="rounds-tbody"><tr><td colspan="10" class="no-data">加载中...</td></tr></tbody>
     </table>
   </div>
 
@@ -84,9 +84,9 @@
     <h2>成交明细 <span class="pill" id="fill-count">0</span></h2>
     <table>
       <thead>
-        <tr><th>时间 (UTC)</th><th>轮次</th><th>层</th><th>方向</th><th>价格</th><th>挂价</th><th>价差</th><th>数量</th><th>金额</th><th>方式</th></tr>
+        <tr><th>时间 (UTC)</th><th>轮次</th><th>层</th><th>方向</th><th>价格</th><th>挂价</th><th>价差</th><th>数量</th><th>金额</th><th>手续费</th><th>方式</th></tr>
       </thead>
-      <tbody id="fills-tbody"><tr><td colspan="10" class="no-data">加载中...</td></tr></tbody>
+      <tbody id="fills-tbody"><tr><td colspan="11" class="no-data">加载中...</td></tr></tbody>
     </table>
   </div>
 </div>
@@ -156,7 +156,7 @@ function renderRounds(rounds) {
   $('round-count').textContent = rounds.length;
   const body = $('rounds-tbody');
   if (!rounds.length) {
-    body.innerHTML = '<tr><td colspan="9" class="no-data">暂无记录（下单成交后会出现在这里）</td></tr>';
+    body.innerHTML = '<tr><td colspan="10" class="no-data">暂无记录（下单成交后会出现在这里）</td></tr>';
     return;
   }
   body.innerHTML = rounds.map(r => {
@@ -173,6 +173,7 @@ function renderRounds(rounds) {
       <td class="mono muted">${r.slug || r.round_start_ts}</td>
       <td class="mono">$${fmt(r.buy_cost, 2)}</td>
       <td class="mono">$${fmt(r.sell_proceeds, 2)}</td>
+      <td class="mono muted">$${fmt(r.fee_total, 2)}</td>
       <td class="mono ${pnl === null ? '' : cls(pnl)}">${pnl === null ? '--' : money(pnl)}</td>
       <td class="mono ${pnl === null ? '' : cls(pnl)}">${r.pnl_pct === null ? '--' : fmt(r.pnl_pct * 100, 2) + '%'}</td>
       <td class="mono">${r.fill_count}</td>
@@ -186,7 +187,7 @@ function renderFills(fills) {
   $('fill-count').textContent = fills.length;
   const body = $('fills-tbody');
   if (!fills.length) {
-    body.innerHTML = '<tr><td colspan="10" class="no-data">暂无成交</td></tr>';
+    body.innerHTML = '<tr><td colspan="11" class="no-data">暂无成交</td></tr>';
     return;
   }
   body.innerHTML = fills.map(f => {
@@ -207,6 +208,7 @@ function renderFills(fills) {
       <td class="mono ${imp === null || imp === undefined ? '' : cls(imp)}">${impTxt}</td>
       <td class="mono">${fmt(f.size, 2)}</td>
       <td class="mono">$${fmt(f.notional, 2)}</td>
+      <td class="mono muted">${f.fee > 0 ? '$' + fmt(f.fee, 4) : '--'}</td>
       <td><span class="pill ${roleCls}">${roleLbl}</span></td>
     </tr>`;
   }).join('');

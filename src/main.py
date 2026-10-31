@@ -586,6 +586,12 @@ class ActionRouter:
                         result.server_order_id,
                         size_matched=float(result.filled_qty),
                         fill_price=float(forward_price),
+                        # Taker fills pay the Polymarket fee; makers do not.
+                        trader_side=(
+                            "TAKER"
+                            if getattr(result, "is_taker", False)
+                            else None
+                        ),
                     )
                     # Promote status too: the fast-fill path can be the ONLY
                     # observation of a fully matched order (the WS TRADE and
@@ -688,6 +694,11 @@ class ActionRouter:
                 server_order_id,
                 size_matched=cumulative_size_matched,
                 fill_price=fill_price,
+                trader_side=(
+                    "TAKER"
+                    if getattr(hint_result, "is_taker", False)
+                    else None
+                ),
             )
             om.mark_filled(server_order_id)
             eng.on_order_filled(
@@ -751,7 +762,14 @@ class ActionRouter:
         fill_px = getattr(result, "avg_fill_price", 0.0) or 0.0
         if fill_px <= 0:
             fill_px = getattr(result, "strategy_price", 0.0) or 0.0
-        om.apply_fill_event(sid, size_matched=filled, fill_price=float(fill_px))
+        om.apply_fill_event(
+            sid,
+            size_matched=filled,
+            fill_price=float(fill_px),
+            trader_side=(
+                "TAKER" if getattr(result, "is_taker", False) else None
+            ),
+        )
         om.mark_filled(sid)
 
     def _spawn_tp_watcher(
@@ -831,6 +849,11 @@ class ActionRouter:
                 server_order_id,
                 size_matched=cumulative_size_matched,
                 fill_price=fill_price,
+                trader_side=(
+                    "TAKER"
+                    if getattr(hint_result, "is_taker", False)
+                    else None
+                ),
             )
             om.mark_filled(server_order_id)
             # No BUY tier matches a SELL id, so on_order_filled falls
@@ -921,7 +944,14 @@ class ActionRouter:
         if delta <= 1e-9:
             return
         om.apply_fill_event(
-            server_order_id, size_matched=cumulative, fill_price=fill_px
+            server_order_id,
+            size_matched=cumulative,
+            fill_price=fill_px,
+            trader_side=(
+                "TAKER"
+                if (fill_state or {}).get("is_taker")
+                else None
+            ),
         )
         # Promote the tracked order to `filled` once the cumulative reaches
         # its expected size. Without this, an order whose last fill is

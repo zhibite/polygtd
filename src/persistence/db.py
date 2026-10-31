@@ -71,7 +71,8 @@ CREATE TABLE IF NOT EXISTS fills (
   ts_ms          INTEGER,
   confirmed      INTEGER DEFAULT 0,
   recorded_at     TEXT,
-  trader_side    TEXT
+  trader_side    TEXT,
+  fee            REAL DEFAULT 0
 );
 
 -- The dashboard filters rounds by activity. These keep that lookup cheap
@@ -103,6 +104,9 @@ def init_db(db_path: Path = _DB_PATH) -> sqlite3.Connection:
         if "trader_side" not in fill_cols:
             conn.execute("ALTER TABLE fills ADD COLUMN trader_side TEXT")
             log.info("db.migrate.fills_trader_side")
+        if "fee" not in fill_cols:
+            conn.execute("ALTER TABLE fills ADD COLUMN fee REAL DEFAULT 0")
+            log.info("db.migrate.fills_fee")
     except Exception as exc:  # noqa: BLE001
         log.warning("db.migrate.failed", error=str(exc))
     conn.commit()
@@ -209,15 +213,17 @@ class DB:
         ts_ms: int,
         confirmed: int = 0,
         trader_side: str | None = None,
+        fee: float = 0.0,
     ) -> None:
         self._c.execute("""
             INSERT OR IGNORE INTO fills
               (fill_id, order_id, round_start_ts, token_id, side,
-               price, size, ts_ms, confirmed, recorded_at, trader_side)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               price, size, ts_ms, confirmed, recorded_at, trader_side, fee)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (fill_id, order_id, round_start_ts, token_id, side,
               price, size, ts_ms, confirmed,
-              datetime.now(timezone.utc).isoformat(), trader_side))
+              datetime.now(timezone.utc).isoformat(), trader_side,
+              float(fee or 0.0)))
         self._c.commit()
 
     def confirm_fill(self, fill_id: str) -> None:

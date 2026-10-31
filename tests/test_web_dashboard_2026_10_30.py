@@ -486,3 +486,59 @@ def test_build_status_flat_position_shows_idle_tiers() -> None:
     assert tier["size_expected"] == 0.0
     assert tier["server_order_id"] is None
     assert tier["avg_fill_price"] is None
+
+
+def test_fees_are_recorded_and_reduce_realized_pnl(conn) -> None:
+    """Official Polymarket taker fee: C × rate × p × (1-p).
+
+    Buy fees join the cost basis; sell fees reduce the proceeds.
+    """
+    db = DB(conn)
+    round_ts = 5_000
+    db.upsert_round(round_start_ts=round_ts, slug="fee-round")
+    db.insert_order(
+        client_order_id="c1", server_order_id="s1", round_start_ts=round_ts,
+        side="BUY", token_id="tok", tier_name="T1", price=0.40, size=5.0,
+        lifetime_s=300, expires_at=round_ts + 300, placed_at=round_ts,
+    )
+    buy_fee = 5.0 * 0.07 * 0.40 * (1 - 0.40)      # 0.084
+    sell_fee = 5.0 * 0.07 * 0.48 * (1 - 0.48)     # 0.08736
+    db.insert_fill(
+        "f1", "c1", round_ts, "tok", "BUY", 0.40, 5.0,
+        ts_ms=1_000_000, fee=buy_fee,
+    )
+    db.insert_fill(
+        "f2", "c1", round_ts, "tok", "SELL", 0.48, 5.0,
+        ts_ms=2_000_000, fee=sell_fee,
+    )
+
+    rounds = status_mod.rounds_with_pnl(conn)
+    r = rounds[0]
+    assert r["fee_total"] == pytest.approx(buy_fee + sell_fee)
+    assert r["pnl_usd"] == pytest.approx(
+        (0.48 * 5 - sell_fee) - (0.40 * 5 + buy_fee)
+    )
+
+    fills = status_mod.recent_fills(conn)
+    assert fills[0]["fee"] == pytest.approx(sell_fee)
+    assert fills[1]["fee"] == pytest.approx(buy_fee)
+
+
+def test_order_manager_computes_taker_fee_maker_zero() -> None:
+    """Makers pay no fee; takers pay C × rate × p × (1-p)."""
+    fake = _FakeDB()
+    om = OrderManager(clob=object(), db=fake)
+    order = _tracked_order()
+    om._orders[order.client_order_id] = order
+    om._by_server[order.server_order_id] = order.client_order_id
+
+    om.apply_fill_event("s1", 5.0, 0.40, trader_side="TAKER")
+    assert fake.fills[0]["fee"] == pytest.approx(5.0 * 0.07 * 0.40 * 0.60)
+
+    maker = _tracked_order()
+    maker.client_order_id = "c2"
+    maker.server_order_id = "s2"
+    om._orders["c2"] = maker
+    om._by_server["s2"] = "c2"
+    om.apply_fill_event("s2", 5.0, 0.40, trader_side="MAKER")
+    assert fake.fills[-1]["fee"] == 0.0

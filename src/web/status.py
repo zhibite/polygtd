@@ -240,7 +240,7 @@ def _round_realized_pnl(
     conn: Any, wanted: set[int]
 ) -> tuple[
     dict[int, float], dict[int, float], dict[int, float],
-    dict[int, float], dict[int, int],
+    dict[int, float], dict[int, int], dict[int, float],
 ]:
     """Walk each round's fills in time order and return REALISED PnL.
 
@@ -255,22 +255,27 @@ def _round_realized_pnl(
     re-entry displayed -1.5). Realised PnL counts each SELL when it fills;
     an open re-entry does not touch it.
 
+    Fees (Polymarket taker fee, stored per fill) are included: a BUY fee
+    is added to the cost basis, a SELL fee is deducted from the proceeds.
+
     Returns dicts keyed by round_start_ts:
-      realized, cost_of_sold, open_qty, pnl_today, sells_today
+      realized, cost_of_sold, open_qty, pnl_today, sells_today, fees_total
     """
     realized: dict[int, float] = {}
     cost_sold: dict[int, float] = {}
     open_qty: dict[int, float] = {}
     pnl_today: dict[int, float] = {}
     sells_today: dict[int, int] = {}
+    fees_total: dict[int, float] = {}
     today_start_ms = int(
         datetime.now(timezone.utc)
         .replace(hour=0, minute=0, second=0, microsecond=0)
         .timestamp() * 1000
     )
     state: dict[int, list[float]] = {}  # round -> [qty, cost basis]
-    for round_ts, side, price, size, ts_ms in conn.execute(
-        "SELECT round_start_ts, side, price, size, ts_ms FROM fills "
+    for round_ts, side, price, size, ts_ms, fee in conn.execute(
+        "SELECT round_start_ts, side, price, size, ts_ms, COALESCE(fee, 0) "
+        "FROM fills "
         "ORDER BY round_start_ts ASC, ts_ms ASC, fill_id ASC"
     ):
         if round_ts not in wanted:
@@ -278,21 +283,25 @@ def _round_realized_pnl(
         try:
             px = float(price or 0.0)
             sz = float(size or 0.0)
+            fee_f = float(fee or 0.0)
         except (TypeError, ValueError):
             continue
         if px <= 0 or sz <= 0:
             continue
         st = state.setdefault(round_ts, [0.0, 0.0])
+        fees_total[round_ts] = fees_total.get(round_ts, 0.0) + fee_f
         if str(side or "").upper() == "BUY":
             st[0] += sz
-            st[1] += px * sz
+            st[1] += px * sz + fee_f
             continue
         # SELL: realise only against shares actually held.
         sold = min(sz, st[0])
         if sold <= 1e-12:
             continue
         avg = st[1] / st[0]
-        pnl = (px - avg) * sold
+        fee_sold = fee_f * (sold / sz)
+        proceeds = px * sold - fee_sold
+        pnl = proceeds - avg * sold
         realized[round_ts] = realized.get(round_ts, 0.0) + pnl
         cost_sold[round_ts] = cost_sold.get(round_ts, 0.0) + avg * sold
         try:
@@ -308,7 +317,7 @@ def _round_realized_pnl(
             st[0] = 0.0
             st[1] = 0.0
     open_qty = {ts: st[0] for ts, st in state.items()}
-    return realized, cost_sold, open_qty, pnl_today, sells_today
+    return realized, cost_sold, open_qty, pnl_today, sells_today, fees_total
 
 
 def rounds_with_pnl(conn: Any, limit: int = 100) -> list[dict[str, Any]]:
@@ -332,12 +341,11 @@ def rounds_with_pnl(conn: Any, limit: int = 100) -> list[dict[str, Any]]:
     rows = conn.execute(_ROUNDS_SQL, (int(limit),)).fetchall()
     wanted = {int(row[0]) for row in rows}
     if wanted:
-        (realized, cost_sold, open_qty, pnl_today, sells_today) = (
-            _round_realized_pnl(conn, wanted)
-        )
+        (realized, cost_sold, open_qty, pnl_today, sells_today,
+         fees_total) = _round_realized_pnl(conn, wanted)
     else:
-        realized, cost_sold, open_qty, pnl_today, sells_today = (
-            {}, {}, {}, {}, {}
+        realized, cost_sold, open_qty, pnl_today, sells_today, fees_total = (
+            {}, {}, {}, {}, {}, {}
         )
     out: list[dict[str, Any]] = []
     for row in rows:
@@ -369,6 +377,8 @@ def rounds_with_pnl(conn: Any, limit: int = 100) -> list[dict[str, Any]]:
             "fill_count": fill_count,
             "order_count": int(order_count or 0),
             "cancel_count": int(cancel_count or 0),
+            # Taker fees recorded on this round's fills (USDC).
+            "fee_total": float(fees_total.get(round_ts, 0.0)),
             "status": round_status,
             "closed": round_status == "closed",
             "pnl_usd": pnl,
@@ -432,7 +442,8 @@ SELECT f.fill_id,
        COALESCE(o.tier_name, '') AS tier_name,
        COALESCE(r.slug, '') AS slug,
        COALESCE(o.price, 0.0) AS limit_price,
-       COALESCE(f.trader_side, '') AS trader_side
+       COALESCE(f.trader_side, '') AS trader_side,
+       COALESCE(f.fee, 0.0) AS fee
 FROM fills f
 LEFT JOIN orders o ON o.client_order_id = f.order_id
 LEFT JOIN rounds r ON r.round_start_ts = f.round_start_ts
@@ -462,10 +473,11 @@ def recent_fills(conn: Any, limit: int = 200) -> list[dict[str, Any]]:
     rows = conn.execute(_FILLS_SQL, (int(limit),)).fetchall()
     out = []
     for (fill_id, round_ts, side, price, size, ts_ms,
-         tier_name, slug, limit_price, trader_side) in rows:
+         tier_name, slug, limit_price, trader_side, fee) in rows:
         price = float(price or 0.0)
         size = float(size or 0.0)
         limit_price = float(limit_price or 0.0)
+        fee = float(fee or 0.0)
         notional = price * size
         out.append({
             "fill_id": fill_id,
@@ -479,6 +491,7 @@ def recent_fills(conn: Any, limit: int = 200) -> list[dict[str, Any]]:
             "slug": slug,
             "limit_price": limit_price,
             "trader_side": str(trader_side or "").upper(),
+            "fee": fee,
             "improvement_bps": _improvement_bps(side, price, limit_price),
         })
     return out

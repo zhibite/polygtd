@@ -241,12 +241,36 @@ class OrderManager:
         except Exception as exc:  # noqa: BLE001
             log.warning("order_manager.db_persist_status_failed", error=str(exc))
 
+    def _taker_fee_rate(self) -> float:
+        """Configured taker fee rate (official formula fee = C×rate×p×(1-p))."""
+        try:
+            return float(getattr(self._s, "TAKER_FEE_RATE", 0.07) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _fill_fee(
+        self, delta_size: float, fill_price: float, trader_side: str | None
+    ) -> float:
+        """Polymarket taker fee for one fill (USDC). Makers pay nothing."""
+        if str(trader_side or "").upper() != "TAKER":
+            return 0.0
+        rate = self._taker_fee_rate()
+        if rate <= 0 or delta_size <= 0 or fill_price <= 0:
+            return 0.0
+        p = min(max(float(fill_price), 0.0), 1.0)
+        fee = float(delta_size) * rate * p * (1.0 - p)
+        if fee <= 0:
+            return 0.0
+        # Official docs: fees are rounded to 5 decimals, minimum 0.00001 USDC.
+        return max(round(fee, 5), 0.00001)
+
     def _persist_fill(
         self,
         order: TrackedOrder,
         delta_size: float,
         fill_price: float,
         trader_side: str | None = None,
+        fee: float = 0.0,
     ) -> None:
         """Record an incremental fill (best effort, idempotent by fill_id)."""
         db = getattr(self, "_db", None)
@@ -269,6 +293,7 @@ class OrderManager:
                 size=delta_size,
                 ts_ms=int(time.time() * 1000),
                 trader_side=trader_side,
+                fee=fee,
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("order_manager.db_persist_fill_failed", error=str(exc))
@@ -1816,14 +1841,17 @@ class OrderManager:
             # mirror point for the WS-UPDATE and TierWatcher-resync feeds,
             # and the fill_id is keyed on the cumulative size, so a duplicate
             # observation of the same fill is dropped by the INSERT OR IGNORE.
+            delta_size = size_matched - prev_matched
+            fill_px = (
+                fill_price if fill_price is not None and fill_price > 0
+                else order.price
+            )
             self._persist_fill(
                 order,
-                delta_size=size_matched - prev_matched,
-                fill_price=(
-                    fill_price if fill_price is not None and fill_price > 0
-                    else order.price
-                ),
+                delta_size=delta_size,
+                fill_price=fill_px,
                 trader_side=trader_side,
+                fee=self._fill_fee(delta_size, fill_px, trader_side),
             )
             self._persist_status(order)
             # H-V6-2 fix: log every incremental fill so operators can see
