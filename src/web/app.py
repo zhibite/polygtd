@@ -294,9 +294,16 @@ async def api_rounds(
 @app.get("/api/fills")
 async def api_fills(
     limit: int = Query(200, ge=1, le=2000),
+    offset: int = Query(0, ge=0),
     _: None = Depends(_require_auth),
 ) -> dict[str, Any]:
-    return {"fills": status_mod.recent_fills(_conn(), limit)}
+    conn = _conn()
+    return {
+        "fills": status_mod.recent_fills(conn, limit, offset),
+        "total": status_mod.count_fills(conn),
+        "limit": int(limit),
+        "offset": int(offset),
+    }
 
 
 @app.get("/api/trades")

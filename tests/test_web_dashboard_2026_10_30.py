@@ -154,6 +154,52 @@ def test_rounds_with_pnl_and_stats(conn) -> None:
     assert fills[0]["tier"] == "T1"
 
 
+def test_fills_pagination_is_stable_and_counted(conn) -> None:
+    """成交明细 pages must not overlap or skip when ts_ms ties.
+
+    Fills are ordered by (ts_ms DESC, fill_id DESC); the secondary key is
+    what keeps LIMIT/OFFSET paging deterministic when several fills share
+    the same millisecond.
+    """
+    db = DB(conn)
+    db.upsert_round(round_start_ts=1_000, slug="r1")
+    for i in range(45):
+        db.insert_fill(
+            fill_id=f"f{i:03d}", order_id="c1", round_start_ts=1_000,
+            token_id="tok", side="BUY", price=0.40, size=1.0,
+            # 5 fills share each millisecond — exercises the tiebreaker.
+            ts_ms=1_000_000 + (i // 5),
+        )
+
+    assert status_mod.count_fills(conn) == 45
+
+    page1 = status_mod.recent_fills(conn, limit=20, offset=0)
+    page2 = status_mod.recent_fills(conn, limit=20, offset=20)
+    page3 = status_mod.recent_fills(conn, limit=20, offset=40)
+
+    ids = [f["fill_id"] for f in page1 + page2 + page3]
+    assert len(ids) == 45
+    assert len(set(ids)) == 45, "pages overlap or skip a fill"
+    # Newest first; ties broken by fill_id DESC.
+    assert ids[0] == "f044"
+    assert ids[-1] == "f000"
+    assert len(page3) == 5
+
+
+def test_trades_page_exposes_the_fill_pager() -> None:
+    from fastapi.testclient import TestClient
+
+    from src.web.app import app
+
+    r = TestClient(app).get("/trades")
+    assert r.status_code == 200
+    assert 'id="fills-pager"' in r.text
+    assert 'id="fill-prev"' in r.text
+    assert 'id="fill-next"' in r.text
+    assert "/api/fills?limit=" in r.text
+    assert "FILL_PAGE_SIZE = 20" in r.text
+
+
 def test_open_round_is_not_counted_as_loss(conn) -> None:
     db = DB(conn)
     db.upsert_round(round_start_ts=2_000, slug="r2")

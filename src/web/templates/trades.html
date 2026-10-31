@@ -88,6 +88,11 @@
       </thead>
       <tbody id="fills-tbody"><tr><td colspan="11" class="no-data">加载中...</td></tr></tbody>
     </table>
+    <div class="pager" id="fills-pager" hidden>
+      <button class="btn btn-ghost btn-sm" id="fill-prev" type="button">上一页</button>
+      <span class="pager-info" id="fill-page-info">--</span>
+      <button class="btn btn-ghost btn-sm" id="fill-next" type="button">下一页</button>
+    </div>
   </div>
 </div>
 
@@ -100,6 +105,11 @@ const money = (n) => (n === null || n === undefined || isNaN(n)) ? '--' : (n >= 
 const cls = (n) => (n > 0 ? 'green' : n < 0 ? 'red' : '');
 const utc = (ts) => ts ? new Date(ts * 1000).toISOString().slice(11, 19) : '--';
 const iso = (s) => s ? new Date(s).toISOString().replace('T', ' ').slice(0, 19) : '--';
+
+// 成交明细分页：每页 20 条，服务端按 (ts_ms, fill_id) 倒序切片。
+const FILL_PAGE_SIZE = 20;
+let fillOffset = 0;
+let fillTotal = 0;
 
 function setLive(ok) {
   $('live-dot').className = 'live-dot' + (ok ? '' : ' offline');
@@ -184,7 +194,6 @@ function renderRounds(rounds) {
 }
 
 function renderFills(fills) {
-  $('fill-count').textContent = fills.length;
   const body = $('fills-tbody');
   if (!fills.length) {
     body.innerHTML = '<tr><td colspan="11" class="no-data">暂无成交</td></tr>';
@@ -214,18 +223,56 @@ function renderFills(fills) {
   }).join('');
 }
 
+function renderFillPager() {
+  const pages = Math.max(1, Math.ceil(fillTotal / FILL_PAGE_SIZE));
+  const page = Math.floor(fillOffset / FILL_PAGE_SIZE) + 1;
+  $('fill-count').textContent = fillTotal;
+  $('fill-page-info').textContent = `第 ${page} / ${pages} 页 · 共 ${fillTotal} 笔`;
+  $('fill-prev').disabled = fillOffset <= 0;
+  $('fill-next').disabled = fillOffset + FILL_PAGE_SIZE >= fillTotal;
+  // 只有一页时不需要分页条。
+  $('fills-pager').hidden = fillTotal <= FILL_PAGE_SIZE;
+}
+
+async function refreshFills() {
+  const d = await getJSON(
+    `/api/fills?limit=${FILL_PAGE_SIZE}&offset=${fillOffset}`
+  );
+  fillTotal = Number(d.total || 0);
+  // 记录变少（理论上不会发生）时把越界的页码拉回最后一页。
+  const pages = Math.max(1, Math.ceil(fillTotal / FILL_PAGE_SIZE));
+  const maxOffset = (pages - 1) * FILL_PAGE_SIZE;
+  if (fillOffset > maxOffset) {
+    fillOffset = maxOffset;
+    return refreshFills();
+  }
+  renderFills(d.fills || []);
+  renderFillPager();
+}
+
 async function refresh() {
   try {
     const d = await getJSON('/api/trades?limit=300');
     renderStats(d.stats);
     renderQuality(d.quality);
     renderRounds(d.rounds || []);
-    renderFills(d.fills || []);
+    await refreshFills();
     setLive(true);
   } catch (e) {
     setLive(false);
   }
 }
+
+$('fill-prev').addEventListener('click', () => {
+  if (fillOffset < FILL_PAGE_SIZE) return;
+  fillOffset -= FILL_PAGE_SIZE;
+  refreshFills().catch(() => setLive(false));
+});
+$('fill-next').addEventListener('click', () => {
+  if (fillOffset + FILL_PAGE_SIZE >= fillTotal) return;
+  fillOffset += FILL_PAGE_SIZE;
+  refreshFills().catch(() => setLive(false));
+});
 
 $('clock').textContent = new Date().toISOString().slice(11, 19) + ' UTC';
 setInterval(() => { $('clock').textContent = new Date().toISOString().slice(11, 19) + ' UTC'; }, 1000);

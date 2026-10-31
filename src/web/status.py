@@ -447,8 +447,8 @@ SELECT f.fill_id,
 FROM fills f
 LEFT JOIN orders o ON o.client_order_id = f.order_id
 LEFT JOIN rounds r ON r.round_start_ts = f.round_start_ts
-ORDER BY f.ts_ms DESC
-LIMIT ?
+ORDER BY f.ts_ms DESC, f.fill_id DESC
+LIMIT ? OFFSET ?
 """
 
 
@@ -469,8 +469,24 @@ def _improvement_bps(side: str, price: float, limit_price: float) -> float | Non
     return None
 
 
-def recent_fills(conn: Any, limit: int = 200) -> list[dict[str, Any]]:
-    rows = conn.execute(_FILLS_SQL, (int(limit),)).fetchall()
+def count_fills(conn: Any) -> int:
+    """Total number of fill rows (pagination denominator)."""
+    row = conn.execute("SELECT COUNT(*) FROM fills").fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+def recent_fills(
+    conn: Any, limit: int = 200, offset: int = 0
+) -> list[dict[str, Any]]:
+    """Fill rows, newest first.
+
+    `offset` powers the 成交明细 pager: the query is deterministically
+    ordered by (ts_ms, fill_id) so consecutive pages neither overlap nor
+    skip a row when several fills share a millisecond.
+    """
+    rows = conn.execute(
+        _FILLS_SQL, (int(limit), max(0, int(offset)))
+    ).fetchall()
     out = []
     for (fill_id, round_ts, side, price, size, ts_ms,
          tier_name, slug, limit_price, trader_side, fee) in rows:
