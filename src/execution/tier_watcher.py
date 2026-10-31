@@ -127,6 +127,18 @@ OnCrossTier = Callable[[WatcherResult], Awaitable[None]]
 OnPartialFill = Callable[[float, float, "WatcherResult | None"], Awaitable[None]]
 
 
+def _fill_pct(balance: float | None, expected: float) -> float | None:
+    """Safe fill percentage for the periodic progress log.
+
+    `_read_balance()` returns None when the CLOB balance endpoint fails;
+    dividing that directly crashed the watcher (production 2026-10-31
+    01:20: "unsupported operand type(s) for /: 'NoneType' and 'float'").
+    """
+    if balance is None or expected <= 0:
+        return None
+    return balance / expected * 100.0
+
+
 class TierWatcher:
     """Watch a single GTD order's progress via token-balance polling.
 
@@ -612,7 +624,7 @@ class TierWatcher:
                     side=self._side,
                     balance=balance,
                     expected=self._expected_size,
-                    fill_pct=(balance / self._expected_size * 100.0) if self._expected_size > 0 else 0.0,
+                    fill_pct=_fill_pct(balance, self._expected_size),
                     remaining_s=max(0.0, self._expires_at - now),
                 )
 

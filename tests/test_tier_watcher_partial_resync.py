@@ -30,6 +30,8 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+import pytest
+
 from src.execution.tier_watcher import TierOutcome, TierWatcher, WatcherResult
 
 
@@ -615,3 +617,18 @@ async def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(asyncio.run(main()))
+
+
+def test_fill_pct_handles_none_balance() -> None:
+    """The balance endpoint can return None; the progress log must not crash.
+
+    Production 2026-10-31 01:20: `tier_watcher.crashed` with
+    "unsupported operand type(s) for /: 'NoneType' and 'float'" because the
+    poll-progress line divided the balance unconditionally.
+    """
+    from src.execution.tier_watcher import _fill_pct
+
+    assert _fill_pct(None, 5.0) is None
+    assert _fill_pct(5.0, 5.0) == pytest.approx(100.0)
+    assert _fill_pct(2.5, 5.0) == pytest.approx(50.0)
+    assert _fill_pct(5.0, 0.0) is None
