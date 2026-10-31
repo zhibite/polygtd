@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>回测 - PolyGTD</title>
+<link rel="stylesheet" href="/static/style.css?v=__ASSET_VERSION__">
+</head>
+<body>
+<nav>
+  <span class="brand">PolyGTD</span>
+  <a href="/">控制台</a>
+  <a href="/trades">交易记录</a>
+  <a href="/config">策略配置</a>
+  <a href="/backtest" class="active">回测</a>
+  <div class="nav-right">
+    <span id="auth-area" class="nav-auth"></span>
+    <span class="live-dot" id="live-dot"></span>
+    <span id="live-label">连接中</span>
+    <span id="clock" class="mono"></span>
+  </div>
+</nav>
+
+<div class="container">
+  <div class="page-head">
+    <div>
+      <h1>历史回测</h1>
+      <div class="page-sub">future.news 概率 K 线 + Polymarket 成交 + Binance BTC · 结果仅供参考</div>
+    </div>
+    <div class="head-meta">
+      采集窗口：<b id="cov-windows">--</b>（已结算 <b id="cov-resolved">--</b>）<br>
+      数据范围：<span class="mono" id="cov-range">--</span><br>
+      最后采集：<span class="mono" id="cov-last">--</span>
+    </div>
+  </div>
+
+  <!-- Controls -->
+  <div class="section">
+    <h2>运行</h2>
+    <div class="bt-controls">
+      <label class="bt-field">回测天数
+        <input id="bt-days" type="number" min="1" max="30" value="7">
+      </label>
+      <label class="bt-check"><input id="bt-refresh" type="checkbox"> 重新抓取已有窗口（慢）</label>
+      <label class="bt-check"><input id="bt-variants" type="checkbox" checked> 同时跑对比配置</label>
+      <button class="btn btn-primary" id="bt-run" type="button">开始采集并回测</button>
+      <span id="bt-run-hint" class="muted"></span>
+    </div>
+    <div class="bt-controls" style="margin-top:10px">
+      <label class="bt-check">
+        <input id="bt-pause" type="checkbox">
+        暂停开仓/补仓（止盈止损仍生效）
+      </label>
+      <span class="muted" id="bt-pause-note">回测采集期间建议打开；采集完成后可手动恢复。</span>
+    </div>
+    <div style="margin-top:12px">
+      <div class="bt-progress"><div id="bt-progress-bar"></div></div>
+      <div class="muted" id="bt-status">空闲</div>
+    </div>
+  </div>
+
+  <!-- Report -->
+  <div class="section" id="bt-report-section" hidden>
+    <h2>报告 <span class="pill" id="bt-report-age">--</span></h2>
+    <p class="bt-conclusion" id="bt-conclusion">--</p>
+    <div class="stats-row">
+      <div class="stat-card"><div class="stat-label">总盈亏</div><div class="stat-value" id="bt-pnl">--</div><div class="stat-sub" id="bt-pnl-sub">--</div></div>
+      <div class="stat-card"><div class="stat-label">胜率</div><div class="stat-value purple" id="bt-winrate">--</div><div class="stat-sub" id="bt-wl">--</div></div>
+      <div class="stat-card"><div class="stat-label">盈亏比</div><div class="stat-value orange" id="bt-pf">--</div><div class="stat-sub" id="bt-avg">--</div></div>
+      <div class="stat-card"><div class="stat-label">最大回撤</div><div class="stat-value red" id="bt-dd">--</div><div class="stat-sub" id="bt-windows">--</div></div>
+    </div>
+
+    <h3 class="bt-h3">配置对比</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>配置</th><th>总盈亏</th><th>胜率</th><th>盈亏比</th><th>最大回撤</th><th>T4 轮数</th><th>T4 盈亏</th></tr></thead>
+        <tbody id="bt-variants-tbody"><tr><td colspan="7" class="no-data">暂无</td></tr></tbody>
+      </table>
+    </div>
+
+    <h3 class="bt-h3">基线分档</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>最高补到</th><th>轮数</th><th>总盈亏</th><th>平均</th><th>胜率</th></tr></thead>
+        <tbody id="bt-tier-tbody"><tr><td colspan="5" class="no-data">暂无</td></tr></tbody>
+      </table>
+    </div>
+
+    <h3 class="bt-h3">出场分布</h3>
+    <div id="bt-exits" class="muted">--</div>
+
+    <p class="bt-assumptions">
+      假设：15 分钟 token 的 future.news K 线为 5 秒 bar（开盘前 ~75 秒用 Polymarket
+      逐笔成交补齐）；T1 为 taker，T2-T4 在触发价挂 maker（触发时已跌破则按 taker 成交）；
+      止盈按目标价成交、止损按触发价 taker；未计滑点/排队/盘口深度，maker 成交偏乐观。
+      绝对盈亏是估计值，配置之间的相对比较更有参考意义。
+    </p>
+  </div>
+</div>
+
+<footer>PolyGTD · 回测数据来自 future.news / Polymarket data API / Binance · 时间为 UTC</footer>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const fmt = (n, d = 2) => (n === null || n === undefined || isNaN(n)) ? '--' : Number(n).toFixed(d);
+const money = (n) => (n === null || n === undefined || isNaN(n)) ? '--' : (n >= 0 ? '+$' : '-$') + Math.abs(n).toFixed(2);
+const cls = (n) => (n > 0 ? 'green' : n < 0 ? 'red' : '');
+const iso = (s) => s ? new Date(s).toISOString().replace('T', ' ').slice(0, 19) : '--';
+const utc = (ts) => ts ? new Date(ts * 1000).toISOString().replace('T', ' ').slice(0, 19) : '--';
+const PHASE = {idle: '空闲', starting: '启动中', collecting: '采集中', replaying: '回放中', done: '完成', error: '出错'};
+
+let lastReportAt = null;
+
+async function getJSON(path) {
+  const r = await fetch(path, {cache: 'no-store'});
+  if (r.status === 401) { location.href = '/login?next=/backtest'; throw new Error('需要登录'); }
+  if (!r.ok) throw new Error(path + ' ' + r.status);
+  return await r.json();
+}
+async function postJSON(path, body) {
+  const r = await fetch(path, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body), cache: 'no-store',
+  });
+  if (r.status === 401) { location.href = '/login?next=/backtest'; throw new Error('需要登录'); }
+  if (!r.ok) {
+    let detail = path + ' ' + r.status;
+    try { detail = (await r.json()).detail || detail; } catch (e) {}
+    throw new Error(detail);
+  }
+  return await r.json();
+}
+function setLive(ok) {
+  $('live-dot').className = 'live-dot' + (ok ? '' : ' offline');
+  $('live-label').textContent = ok ? '在线' : '离线';
+}
+
+function renderCoverage(cov) {
+  cov = cov || {};
+  $('cov-windows').textContent = cov.windows ?? '0';
+  $('cov-resolved').textContent = cov.resolved ?? '0';
+  $('cov-range').textContent = cov.earliest
+    ? utc(cov.earliest) + ' → ' + utc(cov.latest) : '--';
+  $('cov-last').textContent = cov.last_fetched_at ? iso(cov.last_fetched_at) : '--';
+}
+
+function renderStatus(s) {
+  const phase = s.phase || 'idle';
+  const running = !!s.running;
+  $('bt-run').disabled = running;
+  $('bt-run-hint').textContent = running ? '任务运行中…' : '';
+  $('bt-pause').checked = !!s.pause_new_entries;
+  let text = PHASE[phase] || phase;
+  if (running && s.total > 0) {
+    text += ` · ${s.done}/${s.total}（ok ${s.ok} · skip ${s.skipped} · fail ${s.failed}）`;
+  } else if (s.message) {
+    text += ' · ' + s.message;
+  }
+  if (s.error) text += ' · ' + s.error;
+  $('bt-status').textContent = text;
+  const pct = (running && s.total > 0) ? Math.min(100, 100 * s.done / s.total)
+            : (phase === 'done' ? 100 : 0);
+  $('bt-progress-bar').style.width = pct + '%';
+  renderCoverage(s.coverage);
+  if (phase === 'done' && lastReportAt !== null) {
+    // A new report was written; refresh it once.
+  }
+  if (phase === 'done' && s.finished_at && s.finished_at !== lastReportAt) {
+    lastReportAt = s.finished_at;
+    refreshReport();
+  }
+}
+
+function renderReport(r) {
+  if (!r || !r.baseline) return;
+  $('bt-report-section').hidden = false;
+  $('bt-report-age').textContent = r.generated_at ? iso(r.generated_at) + ' UTC' : '--';
+  $('bt-conclusion').textContent = r.conclusion || '--';
+  const b = r.baseline;
+  $('bt-pnl').textContent = money(b.pnl_total);
+  $('bt-pnl').className = 'stat-value ' + cls(b.pnl_total);
+  $('bt-pnl-sub').textContent = `入场 ${b.entries ?? 0} · 无入场 ${b.no_entry ?? 0} · ${r.days ?? '--'} 天`;
+  $('bt-winrate').textContent = b.win_rate === null ? '--' : (b.win_rate * 100).toFixed(1) + '%';
+  $('bt-wl').textContent = `${b.wins ?? 0} 胜 / ${b.losses ?? 0} 负`;
+  $('bt-pf').textContent = b.profit_factor === null ? '--' : fmt(b.profit_factor, 2);
+  $('bt-avg').textContent = `均赢 ${money(b.gross_win / Math.max(b.wins, 1))} · 均亏 ${money(-b.gross_loss / Math.max(b.losses, 1))}`;
+  $('bt-dd').textContent = money(b.max_drawdown);
+  $('bt-windows').textContent = `回放 ${b.windows_replayed ?? 0} 轮（共 ${b.windows_total ?? '--'}）`;
+
+  const vt = $('bt-variants-tbody');
+  vt.innerHTML = (r.variants || []).map(v => {
+    const s = v.summary || {};
+    return `<tr>
+      <td>${v.name}${v.name === r.baseline_name ? ' <span class="pill filled">基线</span>' : ''}</td>
+      <td class="mono ${cls(s.pnl_total)}">${money(s.pnl_total)}</td>
+      <td class="mono">${s.win_rate === null ? '--' : (s.win_rate * 100).toFixed(1) + '%'}</td>
+      <td class="mono">${s.profit_factor ?? '--'}</td>
+      <td class="mono red">${money(s.max_drawdown)}</td>
+      <td class="mono">${s.t4_rounds ?? 0}</td>
+      <td class="mono ${cls(s.t4_pnl)}">${money(s.t4_pnl)}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="7" class="no-data">暂无</td></tr>';
+
+  const tt = $('bt-tier-tbody');
+  const tiers = b.by_highest_tier || {};
+  tt.innerHTML = ['T1','T2','T3','T4'].map(name => {
+    const s = tiers[name] || {};
+    if (!s.n) return `<tr><td>${name}</td><td class="mono">0</td><td colspan="3" class="muted">--</td></tr>`;
+    return `<tr>
+      <td>${name}</td>
+      <td class="mono">${s.n}</td>
+      <td class="mono ${cls(s.pnl)}">${money(s.pnl)}</td>
+      <td class="mono ${cls(s.avg)}">${money(s.avg)}</td>
+      <td class="mono">${(s.win_rate * 100).toFixed(1)}%</td>
+    </tr>`;
+  }).join('');
+
+  const exits = b.exits || {};
+  $('bt-exits').textContent = Object.keys(exits).length
+    ? Object.entries(exits).map(([k, v]) => `${k}: ${v}`).join(' · ')
+    : '--';
+}
+
+async function refreshStatus() {
+  try {
+    const s = await getJSON('/api/backtest/status');
+    renderStatus(s);
+    setLive(true);
+  } catch (e) { setLive(false); }
+}
+
+async function refreshReport() {
+  try {
+    const r = await getJSON('/api/backtest/report');
+    if (r && r.baseline) renderReport(r);
+  } catch (e) { /* status poll handles the indicator */ }
+}
+
+$('bt-run').addEventListener('click', async () => {
+  const days = Math.max(1, Math.min(30, parseInt($('bt-days').value || '7', 10)));
+  $('bt-days').value = days;
+  $('bt-run-hint').textContent = '提交中…';
+  try {
+    await postJSON('/api/backtest/run', {
+      days, refresh: $('bt-refresh').checked, variants: $('bt-variants').checked,
+    });
+    $('bt-run-hint').textContent = '任务已启动';
+    await refreshStatus();
+  } catch (e) {
+    $('bt-run-hint').textContent = e.message;
+  }
+});
+
+$('bt-pause').addEventListener('change', async () => {
+  const paused = $('bt-pause').checked;
+  try {
+    await postJSON('/api/backtest/pause', {paused});
+    $('bt-pause-note').textContent = paused
+      ? '已暂停新开仓/补仓（止盈止损仍生效）'
+      : '已恢复开仓/补仓';
+  } catch (e) {
+    $('bt-pause').checked = !paused;
+    $('bt-pause-note').textContent = e.message;
+  }
+});
+
+$('clock').textContent = new Date().toISOString().slice(11, 19) + ' UTC';
+setInterval(() => { $('clock').textContent = new Date().toISOString().slice(11, 19) + ' UTC'; }, 1000);
+refreshStatus();
+refreshReport();
+setInterval(refreshStatus, 3000);
+</script>
+<script src="/static/auth-nav.js?v=__ASSET_VERSION__"></script>
+</body>
+</html>

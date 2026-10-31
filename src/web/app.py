@@ -47,6 +47,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from src.backtest.runner import get_manager as _get_backtest_manager
 from src.infra.logging import get_logger
 from src.web import auth
 from src.web import status as status_mod
@@ -330,6 +331,78 @@ async def api_round_fills(
         "round_start_ts": round_start_ts,
         "fills": status_mod.fills_for_round(_conn(), round_start_ts),
     }
+
+
+# ---------------------------------------------------------------------------
+# Backtest (login required, always)
+# ---------------------------------------------------------------------------
+
+
+class BacktestRunPayload(BaseModel):
+    days: int = 7
+    refresh: bool = False
+    variants: bool = True
+
+
+class BacktestPausePayload(BaseModel):
+    paused: bool
+
+
+@app.get("/backtest", response_class=HTMLResponse)
+async def backtest_page(request: Request) -> Any:
+    if auth.current_session(request) is None:
+        return RedirectResponse("/login?next=/backtest", status_code=302)
+    return _render("backtest.html")
+
+
+@app.get("/api/backtest/status")
+async def api_backtest_status(
+    _: str = Depends(_require_login),
+) -> dict[str, Any]:
+    from src.web import runtime_config as rc
+
+    mgr = _get_backtest_manager()
+    state = mgr.status()
+    state["pause_new_entries"] = bool(
+        rc.current_values().get("PAUSE_NEW_ENTRIES", False)
+    )
+    return state
+
+
+@app.get("/api/backtest/report")
+async def api_backtest_report(
+    _: str = Depends(_require_login),
+) -> dict[str, Any]:
+    return _get_backtest_manager().latest_report() or {}
+
+
+@app.post("/api/backtest/run")
+async def api_backtest_run(
+    payload: BacktestRunPayload,
+    _: str = Depends(_require_login),
+) -> dict[str, Any]:
+    mgr = _get_backtest_manager()
+    ok = mgr.start(
+        days=payload.days, refresh=payload.refresh, variants=payload.variants
+    )
+    if not ok:
+        raise HTTPException(status_code=409, detail="回测任务已在运行")
+    return {"ok": True, **mgr.status()}
+
+
+@app.post("/api/backtest/pause")
+async def api_backtest_pause(
+    payload: BacktestPausePayload,
+    _: str = Depends(_require_login),
+) -> dict[str, Any]:
+    from src.web import runtime_config as rc
+
+    try:
+        values = rc.update({"PAUSE_NEW_ENTRIES": bool(payload.paused)})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    log.info("web.backtest.pause", paused=bool(values["PAUSE_NEW_ENTRIES"]))
+    return {"ok": True, "paused": bool(values["PAUSE_NEW_ENTRIES"])}
 
 
 # ---------------------------------------------------------------------------

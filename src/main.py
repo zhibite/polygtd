@@ -2783,6 +2783,31 @@ async def main() -> None:
     # ── Web dashboard (FastAPI on the bot's event loop) ─────────────────
     web_task = _start_dashboard()
 
+    # ── Historical backtest (background daemon thread) ─────────────────
+    # Collects the last N days (cached, incremental) and replays the live
+    # strategy plus a few variants. Runs off the event loop; the dashboard
+    # at /backtest shows progress. A collection failure must never affect
+    # trading, hence the broad try.
+    try:
+        from src.config import backtest as _backtest_cfg
+        from src.backtest.runner import get_manager as _get_backtest_manager
+
+        bt = _backtest_cfg()
+        if bt.BACKTEST_ENABLED and bt.BACKTEST_COLLECT_ON_START:
+            started = _get_backtest_manager().start(
+                days=int(bt.BACKTEST_COLLECT_DAYS),
+                refresh=False,
+                variants=bool(bt.BACKTEST_AUTO_VARIANTS),
+            )
+            if started:
+                log.info(
+                    "backtest.job_started",
+                    days=int(bt.BACKTEST_COLLECT_DAYS),
+                    variants=bool(bt.BACKTEST_AUTO_VARIANTS),
+                )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("backtest.job_start_failed", error=str(exc))
+
     # Status printer + REST midpoint poller + settlement resolver
     status_task = asyncio.create_task(_status_loop())
     midpoint_task = asyncio.create_task(_midpoint_poll_loop())

@@ -233,3 +233,14 @@ dialog.modal[open] { animation: modal-in .18s ease-out; }
   nav .nav-right #clock, nav .nav-right #live-label, .nav-user { display: none; }
   .stat-value { font-size: 18px; }
 }
+
+/* ── Backtest page ───────────────────────────────────────────────────── */
+.bt-controls { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; }
+.bt-field { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #9ca3af; }
+.bt-field input { width: 72px; background: #0a0a14; border: 1px solid #1e1e3a; color: #e0e0e0; border-radius: 6px; padding: 7px 9px; font-size: 13px; }
+.bt-check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #9ca3af; }
+.bt-progress { height: 8px; background: #1e1e3a; border-radius: 4px; overflow: hidden; margin-bottom: 8px; }
+#bt-progress-bar { height: 100%; width: 0; background: linear-gradient(90deg, #7c3aed, #a78bfa); transition: width .4s ease; }
+.bt-conclusion { font-size: 13px; line-height: 1.65; color: #c9c9d6; background: #0a0a14; border: 1px solid #1e1e3a; border-left: 3px solid #7c3aed; border-radius: 8px; padding: 14px 16px; margin-bottom: 18px; }
+.bt-h3 { font-size: 13px; font-weight: 600; color: #9ca3af; margin: 20px 0 10px; text-transform: uppercase; letter-spacing: .05em; }
+.bt-assumptions { font-size: 12px; line-height: 1.7; color: #6b7280; margin-top: 18px; padding-top: 14px; border-top: 1px solid #1e1e3a; }

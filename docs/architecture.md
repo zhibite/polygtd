@@ -138,6 +138,20 @@ z、剩余时间、σ 等指标写进 `engine.trigger_tN` / `engine.tN_skip_t4_*
 `T4_JOURNAL_PATH` 覆盖）：T4 决策、成交、止盈/止损出场、回合结算各一行
 JSON，方便长期积累后回看。注意 `/app/data` 需要持久卷才能跨部署保留。
 
+### 历史回测模块（research → 内置）
+
+`src/backtest/` 是只读研究模块，不参与下单：
+
+- `model.py`：回放引擎（T1 前置、T2-T4 预挂/闸门、TP、两段止损、到期结算）。
+- `store.py`：future.news 事件/K 线 + Polymarket data API 成交 + Binance
+  1m BTC 的增量采集，SQLite 缓存（`<data dir>/backtest.db`）。
+- `runner.py`：后台任务管理器；启动时自动采集最近 N 天并回放基线 +
+  对比配置，报告写入 `<data dir>/backtest_report.json`；`/backtest` 页面
+  读取状态和报告。
+
+`PAUSE_NEW_ENTRIES=true` 只暂停 T1/T2-T4 的新开仓/补仓，止盈和止损
+继续执行；可在回测页或策略配置页恢复。
+
 ### T4 后止损
 
 T4 成交代表本轮已经打满计划仓位，之后继续下跌不再是马丁格尔可以摊薄的

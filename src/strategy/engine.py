@@ -502,6 +502,19 @@ class StrategyEngine:
         floor_price = strategy_price * (1.0 - gap)
         return mid >= floor_price, floor_price
 
+    def _log_entries_paused(self) -> None:
+        """One breadcrumb per round when PAUSE_NEW_ENTRIES is on."""
+        rnd = getattr(self, "_round", None)
+        rt = getattr(rnd, "round_start_ts", None)
+        if getattr(self, "_pause_logged_round", None) == rt:
+            return
+        self._pause_logged_round = rt
+        log.info(
+            "engine.entries_paused",
+            round_start_ts=rt,
+            note="PAUSE_NEW_ENTRIES=true; TP and stop-loss stay active",
+        )
+
     async def _cancel_placed_buys(self, reason: str) -> None:
         """Cancel every resting BUY GTD (T1..T4) during a volatility blackout.
 
@@ -1434,6 +1447,12 @@ class StrategyEngine:
         if not self._round or not self._gate or not self._round.up_token:
             return
 
+        # Operator pause (e.g. while the backtest collects data): block new
+        # entries and averaging, but leave TP / stop-loss untouched.
+        if self._cfg_bool("PAUSE_NEW_ENTRIES", False):
+            self._log_entries_paused()
+            return
+
         # Feed-health / volatility guards: never open during a data outage
         # or a flash move.
         if self._btc_feed_stale():
@@ -1639,6 +1658,11 @@ class StrategyEngine:
         instead of reading `pos` repeatedly.
         """
         if not self._round or not self._gate:
+            return
+
+        # Same operator pause as _check_t1_entry: no new averaging tiers.
+        if self._cfg_bool("PAUSE_NEW_ENTRIES", False):
+            self._log_entries_paused()
             return
 
         pos = self._round.position

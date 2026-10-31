@@ -253,6 +253,12 @@ class StrategySettings(BaseSettings):
     T4_JOURNAL_ENABLED: bool = True
     T4_JOURNAL_PATH: str = ""
 
+    # Pause NEW entries/averaging without touching TP or stop-loss
+    # management. The backtest page toggles this while it collects data;
+    # any open position can still exit normally. (The full emergency stop
+    # remains available separately.)
+    PAUSE_NEW_ENTRIES: bool = False
+
     # NOTE: Same-window T1 re-entry after a take-profit is deliberately NOT
     # supported (operator decision 2026-10-31). Once a round has taken
     # profit, `entry_token` is kept until the next window so a fresh
@@ -369,6 +375,33 @@ class StrategySettings(BaseSettings):
 
 
 # ---------------------------------------------------------------------------
+# Research / backtest settings
+# ---------------------------------------------------------------------------
+
+
+class BacktestSettings(BaseSettings):
+    """In-process historical backtest (dashboard 回测 page)."""
+
+    model_config = SettingsConfigDict(
+        env_file=(str(_ROOT / ".env.docker"), str(_ROOT / ".env")),
+        extra="ignore",
+    )
+
+    BACKTEST_ENABLED: bool = True
+    # Start a collection/replay job on every process start. Cached
+    # windows are skipped, so this is incremental after the first run.
+    BACKTEST_COLLECT_ON_START: bool = True
+    BACKTEST_COLLECT_DAYS: int = 7
+    BACKTEST_MAX_DAYS: int = 30
+    # Seconds between future.news / data-API requests; keep it polite.
+    BACKTEST_RATE_LIMIT_S: float = 0.15
+    # Run the A/B variants (T4 off/2u, stop 30%, z=1) in every report.
+    BACKTEST_AUTO_VARIANTS: bool = True
+    BACKTEST_DB_PATH: str = ""
+    BACKTEST_REPORT_PATH: str = ""
+
+
+# ---------------------------------------------------------------------------
 # Singleton access
 # ---------------------------------------------------------------------------
 
@@ -377,6 +410,7 @@ _binance: BinanceConfig | None = None
 _baseline: BaselineConfig | None = None
 _log: LogConfig | None = None
 _strategy: StrategySettings | None = None
+_backtest: BacktestSettings | None = None
 
 
 def general() -> GeneralConfig:
@@ -414,3 +448,10 @@ def strategy() -> StrategySettings:
     if _strategy is None:
         _strategy = StrategySettings()
     return _strategy
+
+
+def backtest() -> BacktestSettings:
+    global _backtest
+    if _backtest is None:
+        _backtest = BacktestSettings()
+    return _backtest

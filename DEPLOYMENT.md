@@ -288,6 +288,24 @@ UP(last=0.35 bid=0.35)  DOWN(last=0.65 bid=0.65)
 | tiers=[T1=✓ T2=○ T3=○ T4=○] qty=10.53 cost=$2.00
 ```
 
+### 历史回测（/backtest）
+
+部署后 bot 会在后台**自动增量采集**最近 `BACKTEST_COLLECT_DAYS` 天（默认 7，
+已缓存窗口跳过），然后回放当前策略 + 4 个对比配置，报告写入
+`/app/data/backtest_report.json`，页面 `/backtest` 显示进度、结论和分档表。
+
+- 数据源：future.news 事件/K 线（5 秒 bar）、Polymarket data API 逐笔成交
+  （补齐开盘前 75 秒）、Binance 1m BTC。第三方接口，有限速和缓存。
+- 采集是后台线程，不阻塞 bot；采集期间建议打开「暂停开仓/补仓」
+  （`PAUSE_NEW_ENTRIES=true`，止盈/止损仍生效）。
+- 对比配置：基线（当前参数）、T4 关闭、T4 降到 2u、止损收紧到 30%、
+  z 上限 1.0。
+- 回测假设：T1 taker、T2-T4 触发价 maker（触发时已跌破则 taker）、
+  止盈按目标价、止损按触发价 taker；不计滑点/排队/盘口深度，maker 成交
+  偏乐观。绝对盈亏是估计值，配置间相对比较更有参考意义。
+- 首次部署采集约 15-30 分钟；之后每次启动只补新窗口。可在页面上手动
+  重跑或勾选「重新抓取已有窗口」。
+
 ### T4 决策日志（JSONL）
 
 T4 入场/出场的关键字段除了打印到 stdout，还会追加写入：
