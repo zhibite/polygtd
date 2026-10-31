@@ -29,12 +29,12 @@ def _strategy_settings():
 
 
 def test_strategy_notionals_match_operator_spec() -> None:
-    """T1..T4 USD notionals must be 2 / 3 / 5 / 6 USD."""
+    """T1..T4 USD notionals must be 1 / 2 / 4 / 8 USD."""
     cfg = _strategy_settings()
-    assert cfg.TIER1_NOTIONAL == pytest.approx(2.0)
-    assert cfg.TIER2_NOTIONAL == pytest.approx(3.0)
-    assert cfg.TIER3_NOTIONAL == pytest.approx(5.0)
-    assert cfg.TIER4_NOTIONAL == pytest.approx(6.0)
+    assert cfg.TIER1_NOTIONAL == pytest.approx(1.0)
+    assert cfg.TIER2_NOTIONAL == pytest.approx(2.0)
+    assert cfg.TIER3_NOTIONAL == pytest.approx(4.0)
+    assert cfg.TIER4_NOTIONAL == pytest.approx(8.0)
 
 
 def test_strategy_entry_cap_and_drop_thresholds() -> None:
@@ -57,15 +57,15 @@ def test_strategy_tp_decrement_is_three_percent() -> None:
 def test_max_tier_is_four() -> None:
     cfg = _strategy_settings()
     assert cfg.max_tier == 4
-    assert cfg.tier_notionals == [2.0, 3.0, 5.0, 6.0]
+    assert cfg.tier_notionals == [1.0, 2.0, 4.0, 8.0]
     assert cfg.tier_drop_pcts == [None, 0.20, 0.40, 0.60]
-    assert cfg.total_max_notional == pytest.approx(16.0)
+    assert cfg.total_max_notional == pytest.approx(15.0)
 
 
 def test_position_has_four_tier_snapshots_with_configured_notionals() -> None:
     pos = Position()
     assert [t.tier for t in pos.tiers] == [1, 2, 3, 4]
-    for tier, expected in zip(pos.tiers, (2.0, 3.0, 5.0, 6.0)):
+    for tier, expected in zip(pos.tiers, (1.0, 2.0, 4.0, 8.0)):
         assert isinstance(tier, TierSnapshot)
         assert tier.notional == pytest.approx(expected)
 
@@ -115,11 +115,11 @@ def test_stake_cap_accounts_for_inflight_averaging_tier() -> None:
     the full configured notional has been reserved for it.
     """
     pos = Position()
-    pos.tier1.size_expected = 5.0
-    pos.record_fill(pos.tier1, price=0.40, size=5.0)  # 2.0 USD consumed.
-    pos.tier4.size_expected = 15.0
+    pos.tier1.size_expected = 2.5
+    pos.record_fill(pos.tier1, price=0.40, size=2.5)  # 1.0 USD consumed.
+    pos.tier4.size_expected = 52.63
     pos.tier4.placed = True
     pos.tier4.server_order_id = "0xt4-1"
 
-    # 16 (max) - 2 (T1 filled) - 6 (T4 planned) = 8 left.
-    assert pos.stake_cap_remaining == pytest.approx(8.0)
+    # 15 (max) - 1 (T1 filled) - 8 (T4 planned) = 6 left.
+    assert pos.stake_cap_remaining == pytest.approx(6.0)

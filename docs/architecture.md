@@ -7,7 +7,7 @@
 ### 核心特性
 
 - **回合制交易**：每个 15 分钟为一个独立交易回合
-- **马丁格尔策略**：最多 4 层加仓，最大风险暴露 $16/回合
+- **马丁格尔策略**：最多 4 层加仓，最大风险暴露 $15/回合（T1 用 taker 市价入场）
 - **GateKeeper 机制**：限制 BTC 价格漂移，防止追涨杀跌
 - **GTD 订单**：Good-Till-Date 订单，自动过期
 - **实盘交易**：DRY_RUN 已移除，全部走真实 CLOB
@@ -80,7 +80,7 @@ polygtd/
 ├─────────────────────────────────────────────────────────────────┤
 │  Step 3: 策略评估循环 (每价格tick触发)                          │
 │  ├── GateKeeper: 检查 BTC 漂移 ≤ 0.15%                        │
-│  ├── T1 入场: mid ≤ 0.44 时在 0.40 预挂 GTD BUY                │
+│  ├── T1 入场: mid ≤ 0.44 时以 ≤0.40 的 FAK 市价买单吃单          │
 │  ├── TN 加仓: 相对 T1 实际成交均价跌 20/40/60% 时加仓          │
 │  └── 止盈: 达到 tp_target（20%, 逐层 −3%）时预挂 GTD SELL      │
 ├─────────────────────────────────────────────────────────────────┤
@@ -94,13 +94,34 @@ polygtd/
 
 | 层级 | 名义价值 | 触发条件 | 说明 |
 |------|---------|---------|------|
-| T1   | $2      | mid ≤ 0.40×1.10 且 GateKeeper PASS | 初始入场（GTD 挂在 0.40） |
-| T2   | $3      | 相对 T1 成交均价下跌 20% | 第一次加仓 |
-| T3   | $5      | 相对 T1 成交均价下跌 40% | 第二次加仓 |
-| T4   | $6      | 相对 T1 成交均价下跌 60% | 第三次加仓 |
+| T1   | $1      | mid ≤ 0.40×1.10 且 GateKeeper PASS | 初始入场（taker 市价买，限价 ≤0.40） |
+| T2   | $2      | 相对 T1 成交均价下跌 20% | 第一次加仓（maker GTD） |
+| T3   | $4      | 相对 T1 成交均价下跌 40% | 第二次加仓（maker GTD） |
+| T4   | $8      | 相对 T1 成交均价下跌 60% | 第三次加仓（maker GTD） |
 | TP   | 全部    | 盈利 20% − N×3%（N=已成交加仓层数） | 止盈离场 |
 
-**最大风险暴露：** $2 + $3 + $5 + $6 = $16/回合
+**最大风险暴露：** $1 + $2 + $4 + $8 = $15/回合
+
+T1 使用 taker 市价单的原因：$1 名义在 0.40 附近只有 2.5 股，低于 CLOB
+对挂单（GTD）的 5 股最小限制；市价买单按 USDC 金额下单，可以直接吃单。
+T2–T4 的金额在触发价上都能买到 ≥5 股，因此继续用 maker GTD。
+
+止盈同理：T1 单独持仓（约 2.5 股）无法挂 GTD SELL，改为用 FAK 市价
+卖出（限价 = mid − `SELL_SLIPPAGE_PCT`）；加仓后总股数 ≥5 时恢复 GTD 止盈。
+
+### T4 后止损
+
+T4 成交代表本轮已经打满计划仓位，之后继续下跌不再是马丁格尔可以摊薄的
+"回调"。`_check_stop_loss` 在 T4 有成交后启用：
+
+1. **第一段**：`mid ≤ T4成交均价 × (1 − STOP_LOSS_T4_DROP_PCT)` 且持续
+   `STOP_LOSS_CONFIRM_S` 秒 → 用 FAK 市价卖出 `STOP_LOSS_STAGE1_SELL_PCT`（默认 60%）。
+2. **第二段**：在第一段触发线基础上再跌 `STOP_LOSS_STAGE2_EXTRA_DROP_PCT`，
+   或剩余 ≤`STOP_LOSS_TIME_EXIT_S` 且 mid ≤`STOP_LOSS_FLOOR`，或最后
+   `STOP_LOSS_FINAL_EXIT_S` 秒且 mid <`STOP_LOSS_FINAL_MID` → 清掉剩余。
+
+卖出前会撤销本回合所有未成交挂单（包括 TP GTD），避免股份被占用；成交
+按 taker 计费。止损只会在 T4 有成交后触发，killswitch 激活时不会自动卖。
 
 ### GateKeeper（漂移门控）
 
@@ -337,11 +358,11 @@ API_SECRET=xxx
 API_PASSPHRASE=xxx
 WALLET_ADDRESS=xxx
 
-# 策略参数（四层马丁，最大暴露 2+3+5+6 = 16 USD）
-TIER1_NOTIONAL=2.0
-TIER2_NOTIONAL=3.0
-TIER3_NOTIONAL=5.0
-TIER4_NOTIONAL=6.0
+# 策略参数（四层马丁，最大暴露 1+2+4+8 = 15 USD）
+TIER1_NOTIONAL=1.0
+TIER2_NOTIONAL=2.0
+TIER3_NOTIONAL=4.0
+TIER4_NOTIONAL=8.0
 ENTRY_PRICE_CAP=0.40
 TIER2_DROP_PCT=0.20
 TIER3_DROP_PCT=0.40

@@ -938,38 +938,154 @@ class CLOBClient:
             expiration_ts=expiration_ts,
         )
 
-    async def place_fak_sell(
+    async def place_fak_buy(
         self,
         token_id: str,
-        size: float,
+        amount: float,
         price: float,
         tick_size: float,
-        slippage_pct: float = 2.0,
     ) -> FillResult:
-        """
-        Post a FAK (fill-or-kill) market SELL order.
-        Returns FillResult with fill details on success.
+        """Post a FAK market BUY for `amount` USDC, walking the book to `price`.
+
+        T1 uses this path. A 1-USDC tier at ~0.40 is only ~2.5 shares,
+        below the 5-share minimum the CLOB enforces on resting GTDs; a
+        market BUY is sized in USDC and crosses the book as taker.
+
+        Returns the executed fill (shares + USDC spent). Deliberately does
+        NOT fire `_fire_fill_callback`: the T1 tier is bound only after
+        this returns, so the router feeds the fill to the engine there.
+        Any later UserWS observation is deduped by OrderManager's monotonic
+        `size_matched`.
         """
         if not self._client:
             return FillResult("", 0, 0, price, False, "ClobClient not initialised")
 
         tick_d = Decimal(str(tick_size))
-        slip_d = Decimal(str(slippage_pct)) / Decimal("100")
-        slip_price = Decimal(str(price)) * (Decimal("1") + slip_d)
-        sell_price = float(slip_price.quantize(tick_d, rounding=ROUND_DOWN))
+        price_q = _round_down(price, tick_d)
+        amount_q = _round_down(amount, Decimal("0.01"))
+        if amount_q <= 0 or price_q <= 0:
+            return FillResult(
+                "", 0, 0, price_q, False, "invalid FAK buy amount/price"
+            )
 
+        log.debug(
+            "clob.fak_buy",
+            token=token_id[:12], amount=amount_q, price=price_q,
+        )
+        try:
+            mkt_args = MarketOrderArgs(
+                token_id=token_id,
+                amount=float(amount_q),
+                side=ClobSide.BUY,
+                price=float(price_q),
+                order_type=OrderType.FAK,
+            )
+            resp = await self._run(
+                self._client.create_and_post_market_order,
+                mkt_args,
+                order_type=OrderType.FAK,
+            )
+        except Exception as exc:
+            log.warning("clob.fak_buy.post_error", error=str(exc))
+            return FillResult(
+                "", 0, 0, price_q, False, f"FAK_post_error:{exc}"
+            )
+
+        if not resp:
+            return FillResult("", 0, 0, price_q, False, "FAK_no_response")
+
+        total_sz = 0.0
+        total_usdc = 0.0
+        for f in resp.get("fills") or []:
+            try:
+                sz = float(f.get("size", 0))
+                px = float(f.get("price", price_q))
+            except (TypeError, ValueError):
+                continue
+            if sz > 0 and px > 0:
+                total_sz += sz
+                total_usdc += sz * px
+
+        # Market-order responses may only expose aggregate amounts. For a
+        # BUY: takingAmount = shares received, makingAmount = USDC spent.
+        if total_sz <= 0:
+            try:
+                taking = float(resp.get("takingAmount") or 0)
+                making = float(resp.get("makingAmount") or 0)
+            except (TypeError, ValueError):
+                taking = making = 0.0
+            if taking > 0 and making > 0:
+                total_sz, total_usdc = taking, making
+
+        # Some endpoints return 6-decimal base units. This bot's tiers are
+        # at most 8 USDC, so a value in the millions is certainly base
+        # units, not shares/USDC. Check each field independently — a
+        # fills[].size in base units and price 0.40 makes USDC land at
+        # exactly 1_000_000, which a combined "both > 1e6" test would miss.
+        if total_sz > 1_000_000:
+            total_sz /= self._CLOB_BASE_UNITS
+        if total_usdc > 1_000_000:
+            total_usdc /= self._CLOB_BASE_UNITS
+
+        if total_sz <= 0 or total_usdc <= 0:
+            return FillResult("", 0, 0, price_q, False, "FAK_no_fills")
+
+        avg_px = total_usdc / total_sz
+        if avg_px <= 0 or avg_px > 1:
+            return FillResult("", 0, 0, price_q, False, "FAK_bad_avg_price")
+
+        order_id = str(resp.get("orderID") or resp.get("order_id") or "")
+        if order_id and self.register_pending:
+            try:
+                self.register_pending(order_id)
+            except Exception as exc:
+                log.debug("clob.register_pending.error", error=str(exc))
+
+        result = FillResult(
+            order_id=order_id,
+            tokens=_round_down(total_sz, Decimal("0.0001")),
+            usdc=_round_down(total_usdc, Decimal("0.01")),
+            fill_price=_round_down(avg_px, tick_d),
+            success=True,
+        )
+        log.info(
+            "clob.fak_buy.filled",
+            order_id=order_id[:16],
+            token=token_id[:16],
+            shares=result.tokens,
+            usdc=result.usdc,
+            avg_price=result.fill_price,
+        )
+        return result
+
+    async def _fak_sell_core(
+        self,
+        token_id: str,
+        size: float,
+        sell_price: float,
+        tick_size: float,
+        *,
+        fire_callback: bool,
+    ) -> FillResult:
+        """Shared FAK market-SELL post/parse. `sell_price` is the limit."""
+        if not self._client:
+            return FillResult(
+                "", 0, 0, sell_price, False, "ClobClient not initialised"
+            )
+
+        tick_d = Decimal(str(tick_size))
         size_q = _round_down(size, max(Decimal("0.0001"), tick_d))
 
         log.debug(
             "clob.fak_sell",
-            token=token_id[:12], size=size_q, price=sell_price, slippage_pct=slippage_pct,
+            token=token_id[:12], size=size_q, price=sell_price,
         )
 
         try:
             # py-clob-client-v2 MarketOrderArgsV2 uses `amount` (shares for
             # a SELL) and `price`; there is no `size` / `slippage` keyword.
-            # The slippage-adjusted price is computed above and passed
-            # explicitly so the market order walks the book only up to it.
+            # The limit price is computed by the caller and passed
+            # explicitly so the market order walks the book only to it.
             mkt_args = MarketOrderArgs(
                 token_id=token_id,
                 amount=float(size_q),
@@ -989,7 +1105,9 @@ class CLOBClient:
             #                          the mutex, no work to do;
             #   * None / unexpected → keep mutex, log warning.
             log.warning("clob.fak_sell.post_error", error=str(exc))
-            return FillResult("", 0, 0, sell_price, False, f"FAK_post_error:{exc}")
+            return FillResult(
+                "", 0, 0, sell_price, False, f"FAK_post_error:{exc}"
+            )
 
         if not resp:
             return FillResult("", 0, 0, sell_price, False, "FAK_no_response")
@@ -1034,12 +1152,64 @@ class CLOBClient:
             fill_price=_round_down(avg_px, tick_d),
             success=True,
         )
-        # A FAK (market) sell only fills by crossing the book — by
-        # definition WE are the taker, so the Polymarket fee applies.
-        await self._fire_fill_callback(
-            token_id, result.order_id, avg_px, total_sz, trader_side="TAKER"
-        )
+        if fire_callback:
+            # A FAK (market) sell only fills by crossing the book — by
+            # definition WE are the taker, so the Polymarket fee applies.
+            await self._fire_fill_callback(
+                token_id, result.order_id, avg_px, total_sz, trader_side="TAKER"
+            )
         return result
+
+    async def place_fak_sell(
+        self,
+        token_id: str,
+        size: float,
+        price: float,
+        tick_size: float,
+        slippage_pct: float = 2.0,
+    ) -> FillResult:
+        """Legacy FAK sell (OrderManager.place_sell path).
+
+        Keeps its historical price direction: the limit is `price` plus
+        `slippage_pct`. The T1/compact-TP exits use
+        `place_fak_sell_marketable` instead.
+        """
+        tick_d = Decimal(str(tick_size))
+        slip_d = Decimal(str(slippage_pct)) / Decimal("100")
+        slip_price = Decimal(str(price)) * (Decimal("1") + slip_d)
+        sell_price = float(slip_price.quantize(tick_d, rounding=ROUND_DOWN))
+        return await self._fak_sell_core(
+            token_id, size, sell_price, tick_size, fire_callback=True
+        )
+
+    async def place_fak_sell_marketable(
+        self,
+        token_id: str,
+        size: float,
+        reference_price: float,
+        tick_size: float,
+        slippage_pct: float = 2.0,
+    ) -> FillResult:
+        """FAK market SELL that crosses below `reference_price`.
+
+        For a SELL the order price is a FLOOR, so subtract slippage to make
+        the order marketable. Compact positions (a sole 1-USD T1 is ~2.5
+        shares) cannot use a GTD exit (5-share minimum), so their take
+        profit goes through this path.
+
+        Does not fire the fill callback: the router records the fill
+        synchronously against the TP snapshot it registers right after
+        this returns.
+        """
+        tick_d = Decimal(str(tick_size))
+        slip_d = Decimal(str(slippage_pct)) / Decimal("100")
+        ref = Decimal(str(reference_price)) * (Decimal("1") - slip_d)
+        sell_price = float(ref.quantize(tick_d, rounding=ROUND_DOWN))
+        if sell_price <= 0:
+            sell_price = float(tick_d)
+        return await self._fak_sell_core(
+            token_id, size, sell_price, tick_size, fire_callback=False
+        )
 
     # ------------------------------------------------------------------
     # Cancellation

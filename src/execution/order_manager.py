@@ -501,7 +501,9 @@ class OrderManager:
             )
         return False
 
-    async def _cap_sell_to_token_balance(self, token_id: str, size: float) -> float:
+    async def _cap_sell_to_token_balance(
+        self, token_id: str, size: float, min_size: float = 5.0
+    ) -> float:
         """Never try to sell more shares than the wallet actually holds.
 
         The in-memory position can drift above the real token balance
@@ -528,8 +530,9 @@ class OrderManager:
         if balance + 1e-9 >= size:
             return size
         capped = _round_down(balance, Decimal("0.0001"))
-        if capped < 5.0:
-            # CLOB minimum order size is 5 shares — nothing can be sold.
+        if capped <= 0 or capped < min_size:
+            # GTD sells need >=5 shares (the CLOB minimum); a taker exit
+            # passes min_size=0 so a compact position can still be sold.
             # Returning 0 fails the attempt; the TP failure path then
             # reconciles a fully-empty wallet into a flat position.
             log.warning(
@@ -537,7 +540,8 @@ class OrderManager:
                 token=token_id[:16],
                 balance=round(balance, 4),
                 requested=round(size, 4),
-                note="wallet holds less than the CLOB 5-share minimum",
+                min_size=min_size,
+                note="wallet holds less than the requested sell minimum",
             )
             return 0.0
         log.warning(
@@ -859,6 +863,202 @@ class OrderManager:
             # Skip the orderbook snap — keep the exact strategy price.
             price_lock=True,
         )
+
+    async def place_market_buy(
+        self,
+        token_id: str,
+        notional: float,
+        limit_price: float,
+        round_start_ts: int,
+        tier_name: str,
+        tick_size: float,
+    ) -> TrackedOrder | None:
+        """Buy `notional` USDC with a FAK market order (taker).
+
+        T1 uses this path: at 1 USD a resting GTD would be ~2.5 shares
+        and rejected by the CLOB's 5-share minimum, while a market BUY is
+        sized in USDC and crosses the book. The fill is known
+        synchronously, so the returned TrackedOrder is already `filled`
+        (size == size_matched == executed shares); the router feeds that
+        same fill to the engine after binding tier 1. No TierWatcher is
+        spawned for this order.
+        """
+        if self._blocked("place_market_buy"):
+            return None
+        self._last_buy_reject_reason = ""
+        price = float(limit_price)
+        if price <= 0 or notional <= 0:
+            return None
+        cid = f"{round_start_ts}-{tier_name}-{uuid.uuid4().hex[:8]}"
+
+        async with self._lock:
+            for existing in self.open_orders_for_round(round_start_ts):
+                if existing.tier_name == tier_name:
+                    log.warning(
+                        "order_manager.market_buy.duplicate_tier",
+                        token=token_id[:16],
+                        tier=tier_name,
+                        round=round_start_ts,
+                        existing_client_id=existing.client_order_id,
+                    )
+                    return None
+
+            # Balance pre-check (fail-open), same contract as the GTD path.
+            if not await self._balance_allows(float(notional)):
+                self._last_buy_reject_reason = "insufficient_balance"
+                return None
+
+            result: FillResult = await self._clob.place_fak_buy(
+                token_id=token_id,
+                amount=float(notional),
+                price=price,
+                tick_size=tick_size,
+            )
+            if not result.success:
+                self._cleanup_failed_post(result.order_id)
+                self._last_buy_reject_reason = result.error or "fak_buy_failed"
+                log.warning(
+                    "order_manager.market_buy.failed",
+                    token=token_id[:16],
+                    notional=notional,
+                    price=price,
+                    tier=tier_name,
+                    error=result.error,
+                )
+                return None
+
+            server_id = result.order_id
+            filled = float(result.tokens)
+            avg_px = float(result.fill_price) or price
+            order = TrackedOrder(
+                client_order_id=cid,
+                server_order_id=server_id,
+                round_start_ts=round_start_ts,
+                side="BUY",
+                token_id=token_id,
+                tier_name=tier_name,
+                price=avg_px,
+                size=filled,
+                placed_size=filled,
+                size_matched=filled,
+                lifetime_s=0,
+                expires_at=0.0,
+                placed_at=time.time(),
+                status="filled",
+            )
+            self._orders[cid] = order
+            self._persist_order(order)
+            self._persist_fill(
+                order,
+                delta_size=filled,
+                fill_price=avg_px,
+                trader_side="TAKER",
+                fee=self._fill_fee(filled, avg_px, "TAKER"),
+            )
+            if server_id:
+                # A UserWS TRADE can observe the taker fill before this
+                # call returns; replaying it here is a monotonic no-op.
+                self.resolve_pending_server_id(cid, server_id)
+
+            log.info(
+                "order_manager.market_buy.filled",
+                client_id=cid,
+                server_id=(server_id or "")[:16],
+                token=token_id[:16],
+                tier=tier_name,
+                shares=filled,
+                avg_price=avg_px,
+                notional=notional,
+            )
+            return order
+
+    async def place_market_sell(
+        self,
+        token_id: str,
+        size: float,
+        reference_price: float,
+        round_start_ts: int,
+        tier_name: str,
+        tick_size: float,
+    ) -> TrackedOrder | None:
+        """Taker exit for a compact position (<5 shares).
+
+        A sole 1-USD T1 is ~2.5 shares; the CLOB rejects GTD SELLs below
+        5 shares. This path posts a FAK market SELL whose limit sits below
+        `reference_price` (mid) by `SELL_SLIPPAGE_PCT`, so it crosses the
+        bid. The fill is known synchronously and the caller records it
+        against the TP snapshot (no TierWatcher, no fill callback race).
+        """
+        if self._blocked("place_market_sell"):
+            return None
+        size = await self._cap_sell_to_token_balance(
+            token_id, float(size), min_size=0.0
+        )
+        if size <= 0:
+            return None
+        cid = f"{round_start_ts}-{tier_name}-{uuid.uuid4().hex[:8]}"
+
+        async with self._lock:
+            result = await self._clob.place_fak_sell_marketable(
+                token_id=token_id,
+                size=size,
+                reference_price=float(reference_price),
+                tick_size=tick_size,
+                slippage_pct=self._s.SELL_SLIPPAGE_PCT,
+            )
+            if not result.success:
+                self._cleanup_failed_post(result.order_id)
+                log.warning(
+                    "order_manager.market_sell.failed",
+                    token=token_id[:16],
+                    size=size,
+                    reference_price=reference_price,
+                    tier=tier_name,
+                    error=result.error,
+                )
+                return None
+
+            server_id = result.order_id
+            filled = float(result.tokens)
+            avg_px = float(result.fill_price) or float(reference_price)
+            order = TrackedOrder(
+                client_order_id=cid,
+                server_order_id=server_id,
+                round_start_ts=round_start_ts,
+                side="SELL",
+                token_id=token_id,
+                tier_name=tier_name,
+                price=avg_px,
+                size=filled,
+                placed_size=filled,
+                size_matched=filled,
+                lifetime_s=0,
+                expires_at=0.0,
+                placed_at=time.time(),
+                status="filled",
+            )
+            self._orders[cid] = order
+            self._persist_order(order)
+            self._persist_fill(
+                order,
+                delta_size=filled,
+                fill_price=avg_px,
+                trader_side="TAKER",
+                fee=self._fill_fee(filled, avg_px, "TAKER"),
+            )
+            if server_id:
+                self.resolve_pending_server_id(cid, server_id)
+
+            log.info(
+                "order_manager.market_sell.filled",
+                client_id=cid,
+                server_id=(server_id or "")[:16],
+                token=token_id[:16],
+                tier=tier_name,
+                shares=filled,
+                avg_price=avg_px,
+            )
+            return order
 
     async def place_gtd_sell_at_price(
         self,

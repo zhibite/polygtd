@@ -61,8 +61,8 @@ def test_m1_size_expected_falls_back_when_no_placed_size() -> None:
         placed_size=None,
     )
     t = eng._round.position.tier1
-    # TIER1_NOTIONAL default ≈ 2.0; 2.0 / 0.40 = 5.0
-    assert abs(t.size_expected - 5.0) < 1e-9
+    # TIER1_NOTIONAL default = 1.0; 1.0 / 0.40 = 2.5
+    assert abs(t.size_expected - 2.5) < 1e-9
 
 
 def test_m1_record_fill_triggers_is_complete_exactly() -> None:

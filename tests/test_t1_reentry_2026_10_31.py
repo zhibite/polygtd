@@ -112,6 +112,44 @@ async def test_late_tp_keeps_single_entry_per_window() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tp_uses_a_taker_sell_below_5_shares() -> None:
+    """A sole 1-USD T1 is ~2.5 shares; a GTD SELL would be rejected.
+
+    The engine must emit a taker TP action (FAK market sell) instead of
+    posting a doomed GTD order.
+    """
+    captured: list = []
+
+    async def handler(action) -> None:  # noqa: ANN001
+        captured.append(action)
+
+    eng = _engine()
+    eng._handler = handler
+    pos = Position()
+    pos.entry_token = "UP"
+    pos.entry_side = "UP"
+    pos._total_qty = 2.5
+    pos._total_cost = 1.0
+    pos._avg_cost = 0.40
+    pos.baseline_realized_price = 0.40
+    pos.baseline_set_realized = True
+    pos.tier1.size_filled = 2.5
+    pos.tier1.cost_filled = 1.0
+    pos.tier1.filled = True
+    eng._round = _round_with_end(pos, 600)
+    eng._pc = SimpleNamespace(get_midpoint=lambda tok: 0.50)  # above TP
+
+    await eng._check_take_profit(bc_now=100_000.0)
+
+    assert len(captured) == 1
+    action = captured[0]
+    assert action.taker is True
+    assert action.qty == pytest.approx(2.5)
+    assert action.price == pytest.approx(0.50)
+    assert pos._tp_inflight is True
+
+
+@pytest.mark.asyncio
 async def test_exact_zero_tp_close_cleans_tier_state_once() -> None:
     """A TP that sells the exact quantity leaves total_qty == 0 (not an FP
     residual). The cleanup must still run — once — or the dashboard keeps

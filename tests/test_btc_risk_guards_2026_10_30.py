@@ -211,18 +211,20 @@ async def test_vol_blackout_does_not_block_take_profit() -> None:
 
 
 def _t4_position() -> Position:
+    # T1..T3 filled for the current 1/2/4 USD ladder (7 USD committed),
+    # leaving exactly the 8-USD T4 budget inside the 15-USD round cap.
     pos = Position()
     pos.entry_token = "UP"
     pos.entry_side = "UP"
     pos.baseline_realized_price = 0.38
     pos.baseline_set_realized = True
-    pos._total_qty = 36.77
-    pos._total_cost = 9.68
-    pos._avg_cost = 9.68 / 36.77
+    pos._total_qty = 2.5 + 6.41 + 17.09
+    pos._total_cost = 1.0 + 2.0 + 4.0
+    pos._avg_cost = pos._total_cost / pos._total_qty
     for tier, filled, cost in (
-        (pos.tier1, 5.0, 1.90),
-        (pos.tier2, 9.86, 2.958),
-        (pos.tier3, 21.92, 4.822),
+        (pos.tier1, 2.5, 1.0),
+        (pos.tier2, 6.41, 2.0),
+        (pos.tier3, 17.09, 4.0),
     ):
         tier.size_filled = filled
         tier.cost_filled = cost

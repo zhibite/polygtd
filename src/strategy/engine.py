@@ -65,8 +65,21 @@ class ActionOpenTN:
 @dataclass
 class ActionTakeProfit:
     token: str
-    price: float    # best_bid at moment of decision
+    price: float    # best_bid at decision time (taker) / tp_target (GTD)
     qty: float     # total position qty
+    # True for a compact (<5-share) position: the router uses a FAK market
+    # SELL (GTD sells require >=5 shares).
+    taker: bool = False
+
+
+@dataclass
+class ActionStopLoss:
+    token: str
+    price: float        # reference mid; the router sells below it (slippage)
+    qty: float
+    stage: int          # 1 = partial de-risk, 2 = sell the remainder
+    reason: str
+    round_start_ts: int
 
 
 @dataclass
@@ -76,7 +89,10 @@ class ActionCancelTier:
     reason: str
 
 
-Action = ActionOpenT1 | ActionOpenTN | ActionTakeProfit | ActionCancelTier
+Action = (
+    ActionOpenT1 | ActionOpenTN | ActionTakeProfit | ActionStopLoss
+    | ActionCancelTier
+)
 
 
 class ActionHandler(Protocol):
@@ -1305,22 +1321,11 @@ class StrategyEngine:
         # Fire when mid has dropped to (or below) strategy_price * (1 + margin).
         trigger_line = strategy_price * (1.0 + margin)
 
-        # CLOB minimum order size is 5 shares. Catch a misconfigured
-        # TIER1_NOTIONAL here instead of POSTing a guaranteed rejection on
-        # every 250 ms tick.
-        min_shares = 5.0
-        if (
-            strategy_price > 0
-            and s.TIER1_NOTIONAL / strategy_price < min_shares - 1e-9
-        ):
-            self._t1_skip_log(
-                "engine.t1_skip_below_min_size",
-                side="BOTH",
-                notional=s.TIER1_NOTIONAL,
-                strategy_price=strategy_price,
-                min_shares=min_shares,
-            )
-            return
+        # NOTE: T1 is a TAKER market buy, so the 5-share minimum that
+        # applies to resting GTDs does not gate it. A 1-USD tier at 0.40
+        # buys ~2.5 shares via a market order; the router sends the FAK
+        # BUY sized in USDC. The old `t1_skip_below_min_size` check is
+        # removed accordingly.
 
         for side, token in [("UP", up_tok), ("DOWN", down_tok)]:
             mid_price = self._pc.get_midpoint(token)
@@ -1418,9 +1423,9 @@ class StrategyEngine:
             # operator sees the cap-spell duration in INFO alongside the
             # actual entry decision.
             self._t1_cap_reject_summary()
-            # H-NEW-2026-07-11: pass `strategy_price` (not bid_price).
-            # The GTD is posted at this exact limit; the watcher waits
-            # for the maker to be lifted by a taker crossing strategy_price.
+            # T1 enters as a TAKER market buy with `strategy_price` as the
+            # worst-case limit (see ActionRouter): the 1-USD tier is below
+            # the 5-share minimum for resting GTDs, so it must cross.
             await self._handler(ActionOpenT1(
                 side=side,
                 token=token,
@@ -2028,6 +2033,31 @@ class StrategyEngine:
                     note="TP suppressed by BTC drift gate "
                          "(TP_REQUIRE_DRIFT_GATE=true)",
                 )
+            return
+
+        # The CLOB rejects GTD SELLs below 5 shares. A sole 1-USD T1 is
+        # only ~2.5 shares, so exit it with a taker (FAK market) sell at
+        # the prevailing mid instead of a doomed GTD.
+        if float(snap.total_qty) + 1e-9 < 5.0:
+            pos._tp_inflight = True
+            log.info(
+                "engine.trigger_tp_taker",
+                mid=mid_price,
+                tp_target=tp_target,
+                qty=snap.total_qty,
+                note="position below the 5-share GTD minimum; "
+                     "using a taker exit",
+            )
+            try:
+                await self._handler(ActionTakeProfit(
+                    token=pos.entry_token,
+                    price=mid_price,
+                    qty=snap.total_qty,
+                    taker=True,
+                ))
+            except BaseException:
+                pos._tp_inflight = False
+                raise
             return
 
         # Set mutex BEFORE emitting the action so re-entrant _evaluate()

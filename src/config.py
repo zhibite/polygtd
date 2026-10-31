@@ -122,11 +122,14 @@ class StrategySettings(BaseSettings):
 
     # ── Martingale tiers (USD notional per tier) ─────────────────────────
     # Four-layer budget: T1 entry followed by three averaging orders.
-    # Maximum planned exposure per round is 2 + 3 + 5 + 6 = 16 USD.
-    TIER1_NOTIONAL: float = 2.0
-    TIER2_NOTIONAL: float = 3.0
-    TIER3_NOTIONAL: float = 5.0
-    TIER4_NOTIONAL: float = 6.0
+    # Maximum planned exposure per round is 1 + 2 + 4 + 8 = 15 USD.
+    # T1 is a taker (market) buy: at 1 USD the share count is below the
+    # 5-share minimum that applies to resting GTDs, so it must cross the
+    # book. T2-T4 remain maker GTDs (their notionals always buy >=5 shares).
+    TIER1_NOTIONAL: float = 1.0
+    TIER2_NOTIONAL: float = 2.0
+    TIER3_NOTIONAL: float = 4.0
+    TIER4_NOTIONAL: float = 8.0
 
     # ── Strategy thresholds ───────────────────────────────────────────────
     ENTRY_PRICE_CAP: float = 0.40      # max token price to enter

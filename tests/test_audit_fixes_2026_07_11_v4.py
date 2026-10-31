@@ -256,7 +256,10 @@ class _StubEngine:
 
 
 class _FailingOM:
-    """place_buy / place_gtd_sell / place_sell / place_buy_by_strategy_price all return None."""
+    """Every placement entry point returns None."""
+
+    async def place_market_buy(self, **kw):
+        return None
 
     async def place_buy_by_strategy_price(self, **kw):
         return None
@@ -348,27 +351,27 @@ async def test_b_v4_2_router_tn_failure_resets_tier_state() -> None:
 
 
 def test_h_v4_2_stake_cap_counts_inflight_notional() -> None:
-    """With T1 filled (cost=2.0) and T2 placed but not filled,
+    """With T1 filled (cost=1.0) and T2 placed but not filled,
     stake_cap_remaining must reflect T2's notional as committed (so the
     cap is enforced even before T2's fill lands).
     """
     pos = Position()
-    # T1 fills at 0.40 for 5 shares = $2 cost.
-    pos.tier1.size_expected = 5.0
-    pos.record_fill(pos.tier1, price=0.40, size=5.0)
+    # T1 fills at 0.40 for 2.5 shares = $1 cost.
+    pos.tier1.size_expected = 2.5
+    pos.record_fill(pos.tier1, price=0.40, size=2.5)
 
-    assert pos._total_cost == pytest.approx(2.0)
-    # Four-layer strategy. Total max exposure is 2+3+5+6=16 USD.
-    # 16 - 2 (T1 filled) = 14.
+    assert pos._total_cost == pytest.approx(1.0)
+    # Four-layer strategy. Total max exposure is 1+2+4+8=15 USD.
+    # 15 - 1 (T1 filled) = 14.
     assert pos.stake_cap_remaining == pytest.approx(14.0)
 
     # Mark T2 as placed (in-flight) without any fill yet.
     pos.tier2.placed = True
     pos.tier2.server_order_id = "0xt2"
 
-    # T2 reserves 3 USD, so 16 - (2 + 3) = 11.
-    assert pos.total_notional_committed == pytest.approx(5.0)
-    assert pos.stake_cap_remaining == pytest.approx(11.0), (
+    # T2 reserves 2 USD, so 15 - (1 + 2) = 12.
+    assert pos.total_notional_committed == pytest.approx(3.0)
+    assert pos.stake_cap_remaining == pytest.approx(12.0), (
         "H-V4-2 violation: stake_cap_remaining did not account for "
         "T2's in-flight notional. Use total_notional_committed, not "
         "_total_cost."
@@ -380,10 +383,10 @@ def test_h_v4_2_stake_cap_no_inflight_unchanged() -> None:
     filled cost only (which equals committed since placed=False).
     """
     pos = Position()
-    pos.tier1.size_expected = 5.0
-    pos.record_fill(pos.tier1, price=0.40, size=5.0)
+    pos.tier1.size_expected = 2.5
+    pos.record_fill(pos.tier1, price=0.40, size=2.5)
     # No in-flight.
-    # No in-flight orders: 16 - 2 (T1 filled) = 14.
+    # No in-flight orders: 15 - 1 (T1 filled) = 14.
     assert pos.stake_cap_remaining == pytest.approx(14.0)
 
 

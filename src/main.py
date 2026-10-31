@@ -1163,56 +1163,49 @@ class ActionRouter:
         round_ts = self._state.round_start_ts
 
         if isinstance(action, ActionOpenT1):
-            # H-NEW-2026-07-11: post at strategy_price exactly (the price the
-            # engine decided to enter at). No orderbook fetch, no half-tick
-            # snap. Size = notional / strategy_price.
-            order = await om.place_buy_by_strategy_price(
+            # T1 is a TAKER market buy. At the 1-USD tier a resting GTD
+            # would be ~2.5 shares, below the CLOB's 5-share minimum; a
+            # market BUY is sized in USDC and crosses the book. The fill
+            # is synchronous, so bind tier 1 and feed the fill to the
+            # engine directly — no TierWatcher is needed.
+            order = await om.place_market_buy(
                 token_id=action.token,
-                strategy_price=action.price,
                 notional=action.notional,
+                limit_price=action.price,
                 round_start_ts=round_ts,
                 tier_name="T1",
                 tick_size=tick_size,
             )
             if order:
-                expires = order.expires_at
+                server_id = order.server_order_id or ""
                 eng.bind_server_order_id(
                     tier=1,
-                    server_order_id=order.server_order_id or "",
+                    server_order_id=server_id,
                     token_id=action.token,
-                    expires_at=expires,
+                    expires_at=0.0,
                     expected_price=order.price,
-                    placed_size=order.placed_size if order.placed_size > 0 else None,
+                    placed_size=order.size,
                 )
-                self._state.clob.fill_callback = self._make_fill_callback()
-                size_expected = order.placed_size if order.placed_size > 0 else (action.notional / action.price)
-                # H-NEW-2026-07-15: tick-driven refactor. The watcher is
-                # passive — it does NOT receive a cross_threshold. Mid-cross
-                # cancellation is owned by the strategy tick
-                # (`StrategyEngine._reconcile_inflight_buys`). The spawn
-                # site just wires the order lifecycle owner.
-                self._spawn_tier_watcher(
-                    round_start_ts=round_ts,
-                    tier=1,
-                    server_order_id=order.server_order_id or "",
-                    token_id=action.token,
-                    strategy_price=order.price,
-                    size_expected=size_expected,
-                    expires_at=expires,
+                # place_market_buy already booked this fill in OrderManager
+                # (size_matched == filled), so any late WS/polling
+                # observation is a no-op. Feed the single delta to the
+                # engine now that tier 1 is bound.
+                eng.on_order_filled(
+                    action.token, server_id, order.price, order.size
                 )
                 log.info(
-                    "router.t1_placed",
+                    "router.t1_taker_filled",
                     side=action.side,
                     token=action.token[:16],
-                    strategy_price=action.price,
-                    size=order.size,
-                    server_id=order.server_order_id or "none",
-                    watcher=True,
+                    notional=action.notional,
+                    shares=order.size,
+                    avg_price=order.price,
+                    server_id=server_id or "none",
                 )
             else:
                 reject_reason = (
                     getattr(om, "last_buy_reject_reason", "")
-                    or "om.place_buy_by_strategy_price returned None"
+                    or "om.place_market_buy returned None"
                 )
                 log.error(
                     "router.t1_failed",
@@ -1321,6 +1314,71 @@ class ActionRouter:
                     if not eng._round:
                         return
                     pos = eng._round.position
+                    if getattr(action, "taker", False):
+                        # Compact (<5 share) position: a GTD SELL would be
+                        # rejected. Exit with a FAK market sell; the fill
+                        # is synchronous, so register the TP snapshot and
+                        # apply it directly (no TierWatcher).
+                        order = await om.place_market_sell(
+                            token_id=action.token,
+                            size=action.qty,
+                            reference_price=action.price,
+                            round_start_ts=round_ts,
+                            tier_name="TP",
+                            tick_size=tick_size,
+                        )
+                        if not order:
+                            pos._tp_inflight = False
+                            log.warning(
+                                "router.tp_taker_failed",
+                                token=action.token[:16],
+                                reference_price=action.price,
+                                qty=action.qty,
+                                reason="om.place_market_sell returned None",
+                            )
+                            if hasattr(eng, "notify_tp_post_error"):
+                                try:
+                                    eng.notify_tp_post_error(
+                                        reason="place_market_sell returned None"
+                                    )
+                                except Exception:
+                                    pass
+                            clob = getattr(self._state, "clob", None)
+                            if clob is not None:
+                                try:
+                                    await _maybe_realize_closed(
+                                        action.token, clob, pos
+                                    )
+                                except Exception:
+                                    pass
+                            return
+                        sid = order.server_order_id or ""
+                        sold_qty = (
+                            order.placed_size if order.placed_size > 0
+                            else order.size
+                        )
+                        pos.register_tp(
+                            server_order_id=sid,
+                            token_id=action.token,
+                            target_qty=sold_qty,
+                        )
+                        pos.record_tp_fill(sid, order.price, sold_qty)
+                        if pos.total_qty <= 1e-9:
+                            pos.realize_position_closed(
+                                source="router.tp_taker",
+                                note="taker TP closed the position",
+                            )
+                        eng.notify_tp_recovered()
+                        log.info(
+                            "router.tp_taker_filled",
+                            token=action.token[:16],
+                            mid=action.price,
+                            qty=action.qty,
+                            shares=sold_qty,
+                            avg_price=order.price,
+                            server_id=(sid or "none")[:16],
+                        )
+                        return
                     order = await om.place_gtd_sell_at_price(
                         token_id=action.token,
                         size=action.qty,
