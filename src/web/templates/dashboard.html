@@ -100,45 +100,53 @@
   <!-- Position -->
   <div class="section">
     <h2>当前持仓</h2>
-    <table>
-      <thead>
-        <tr><th>方向</th><th>数量</th><th>均价</th><th>成本</th><th>中间价</th><th>浮动盈亏</th><th>止盈目标</th></tr>
-      </thead>
-      <tbody id="position-tbody"><tr><td colspan="7" class="no-data">无持仓</td></tr></tbody>
-    </table>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>方向</th><th>数量</th><th>均价</th><th>成本</th><th>中间价</th><th>浮动盈亏</th><th>止盈目标</th></tr>
+        </thead>
+        <tbody id="position-tbody"><tr><td colspan="7" class="no-data">无持仓</td></tr></tbody>
+      </table>
+    </div>
   </div>
 
   <!-- Tiers -->
   <div class="section">
     <h2>分层状态</h2>
-    <table>
-      <thead>
-        <tr><th>层</th><th>状态</th><th>名义金额</th><th>已成交/预期</th><th>均价</th><th>服务端订单</th></tr>
-      </thead>
-      <tbody id="tiers-tbody"><tr><td colspan="6" class="no-data">本轮无分层数据</td></tr></tbody>
-    </table>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>层</th><th>状态</th><th>名义金额</th><th>已成交/预期</th><th>均价</th><th>服务端订单</th></tr>
+        </thead>
+        <tbody id="tiers-tbody"><tr><td colspan="6" class="no-data">本轮无分层数据</td></tr></tbody>
+      </table>
+    </div>
   </div>
 
   <!-- Open orders -->
   <div class="section">
     <h2>当前挂单</h2>
-    <table>
-      <thead>
-        <tr><th>层</th><th>方向</th><th>价格</th><th>数量</th><th>已成交</th><th>状态</th><th>存活</th></tr>
-      </thead>
-      <tbody id="orders-tbody"><tr><td colspan="7" class="no-data">无挂单</td></tr></tbody>
-    </table>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>层</th><th>方向</th><th>价格</th><th>数量</th><th>已成交</th><th>状态</th><th>存活</th></tr>
+        </thead>
+        <tbody id="orders-tbody"><tr><td colspan="7" class="no-data">无挂单</td></tr></tbody>
+      </table>
+    </div>
   </div>
 
   <!-- Recent fills -->
   <div class="section">
     <h2>最近成交</h2>
-    <table>
-      <thead>
-        <tr><th>时间 (UTC)</th><th>轮次</th><th>层</th><th>方向</th><th>价格</th><th>数量</th><th>金额</th></tr>
-      </thead>
-      <tbody id="fills-tbody"><tr><td colspan="7" class="no-data">暂无成交</td></tr></tbody>
-    </table>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>时间 (UTC)</th><th>轮次</th><th>层</th><th>方向</th><th>价格</th><th>数量</th><th>金额</th></tr>
+        </thead>
+        <tbody id="fills-tbody"><tr><td colspan="7" class="no-data">暂无成交</td></tr></tbody>
+      </table>
+    </div>
   </div>
 </div>
 
@@ -169,6 +177,13 @@ const money = (n) => (n === null || n === undefined || isNaN(n)) ? '--' : (n >= 
 const cls = (n) => (n > 0 ? 'green' : n < 0 ? 'red' : '');
 const utc = (ts) => ts ? new Date(ts * 1000).toISOString().slice(11, 19) : '--';
 const iso = (s) => s ? new Date(s).toISOString().replace('T', ' ').slice(0, 19) : '--';
+// 秒 → "14m 19s"（不足一分钟只显示秒），用于窗口剩余时间。
+const dur = (s) => {
+  s = Math.max(0, Math.round(Number(s) || 0));
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return m > 0 ? `${m}m ${String(r).padStart(2, '0')}s` : `${r}s`;
+};
 
 function setLive(ok) {
   $('live-dot').className = 'live-dot' + (ok ? '' : ' offline');
@@ -324,9 +339,9 @@ function renderStatus(s) {
 
   // window
   const w = s.window || {};
-  $('window-remain').textContent = Math.max(0, Math.round(w.remain_s || 0)) + 's';
+  $('window-remain').textContent = dur(w.remain_s);
   const phaseMap = { IN_T1: 'T1 可入场', PAST_T1: '已过 T1', END: '即将结算' };
-  $('window-phase').textContent = (phaseMap[w.phase] || '--') + ' · ' + Math.round(w.period_s || 0) + 's 窗口';
+  $('window-phase').textContent = (phaseMap[w.phase] || '--') + ' · ' + Math.round((w.period_s || 0) / 60) + ' 分钟窗口';
   $('phase-badge').textContent = phaseMap[w.phase] || '--';
   $('phase-badge').className = 'badge ' + ((w.phase || '').toLowerCase());
 

@@ -176,3 +176,54 @@ dialog.modal[open] { animation: modal-in .18s ease-out; }
 .toast.err { border-left-color: #ef4444; color: #fca5a5; }
 .toast.out { opacity: 0; transform: translateY(6px); transition: opacity .25s, transform .25s; }
 @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+
+/* ── Tables: horizontal scroll container ─────────────────────────────── */
+.table-wrap { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
+/* ── Mobile / narrow screens ─────────────────────────────────────────── */
+@media (max-width: 760px) {
+  .container { padding: 14px; }
+  nav { height: auto; min-height: 52px; padding: 8px 12px; flex-wrap: wrap; row-gap: 2px; }
+  nav .brand { margin-right: 4px; font-size: 15px; }
+  nav a { padding: 6px 9px; font-size: 13px; }
+  nav .nav-right { margin-left: auto; gap: 6px; font-size: 11px; }
+  .stats-row { gap: 10px; margin-bottom: 16px; }
+  .stat-card { padding: 14px; }
+  .stat-value { font-size: 21px; }
+  .stat-label { font-size: 10px; margin-bottom: 6px; }
+  .stat-sub { font-size: 11px; }
+  .section { padding: 14px; margin-bottom: 16px; }
+  .section h2 { font-size: 14px; margin-bottom: 10px; }
+  .table-wrap th, .table-wrap td { white-space: nowrap; }
+  table { font-size: 12px; }
+  th { font-size: 10px; padding: 7px 8px; }
+  td { padding: 8px; }
+  .price-card { padding: 14px; margin-bottom: 16px; }
+  .price-head { flex-wrap: wrap; gap: 8px; }
+  .price-title { font-size: 14px; }
+  .gate-row { gap: 10px 16px; font-size: 12px; }
+  .control-bar { padding: 12px 14px; gap: 12px; margin-bottom: 16px; }
+  .control-actions { width: 100%; }
+  .control-actions .btn { flex: 1; }
+  .page-head { flex-direction: column; align-items: flex-start; gap: 8px; }
+  .head-meta { text-align: left; }
+  .wallet-card { padding: 16px; gap: 16px; }
+  .wallet-main, .wallet-side { min-width: 0; width: 100%; }
+  .wallet-value { font-size: 30px; }
+  .config-grid { grid-template-columns: 1fr; }
+  .save-bar { flex-wrap: wrap; }
+  .pager { justify-content: space-between; }
+  footer { padding: 16px 0 28px; }
+}
+
+@media (max-width: 520px) {
+  .stats-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .stat-value { font-size: 19px; }
+  .tokens { gap: 8px; }
+  .token-price { font-size: 19px; }
+}
+
+@media (max-width: 420px) {
+  nav .nav-right #clock, nav .nav-right #live-label, .nav-user { display: none; }
+  .stat-value { font-size: 18px; }
+}

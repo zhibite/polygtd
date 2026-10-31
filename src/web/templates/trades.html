@@ -69,25 +69,29 @@
 
   <div class="section">
     <h2>轮次记录 <span class="pill" id="round-count">0</span></h2>
-    <table>
-      <thead>
-        <tr>
-          <th>开始 (UTC)</th><th>轮次</th><th>买入成本</th><th>卖出收入</th>
-          <th>手续费</th><th>盈亏</th><th>盈亏 %</th><th>成交笔数</th><th>撤单</th><th>状态</th>
-        </tr>
-      </thead>
-      <tbody id="rounds-tbody"><tr><td colspan="10" class="no-data">加载中...</td></tr></tbody>
-    </table>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>开始 (UTC)</th><th>轮次</th><th>买入成本</th><th>卖出收入</th>
+            <th>手续费</th><th>盈亏</th><th>盈亏 %</th><th>成交笔数</th><th>撤单</th><th>状态</th>
+          </tr>
+        </thead>
+        <tbody id="rounds-tbody"><tr><td colspan="10" class="no-data">加载中...</td></tr></tbody>
+      </table>
+    </div>
   </div>
 
   <div class="section">
     <h2>成交明细 <span class="pill" id="fill-count">0</span></h2>
-    <table>
-      <thead>
-        <tr><th>时间 (UTC)</th><th>轮次</th><th>层</th><th>方向</th><th>价格</th><th>挂价</th><th>价差</th><th>数量</th><th>金额</th><th>手续费</th><th>方式</th></tr>
-      </thead>
-      <tbody id="fills-tbody"><tr><td colspan="11" class="no-data">加载中...</td></tr></tbody>
-    </table>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>时间 (UTC)</th><th>轮次</th><th>层</th><th>方向</th><th>价格</th><th>挂价</th><th>价差</th><th>数量</th><th>金额</th><th>手续费</th><th>方式</th></tr>
+        </thead>
+        <tbody id="fills-tbody"><tr><td colspan="11" class="no-data">加载中...</td></tr></tbody>
+      </table>
+    </div>
     <div class="pager" id="fills-pager" hidden>
       <button class="btn btn-ghost btn-sm" id="fill-prev" type="button">上一页</button>
       <span class="pager-info" id="fill-page-info">--</span>

@@ -20,6 +20,15 @@ from typing import Any
 from src.config import strategy as _strategy
 
 
+# Share quantities below this are CLOB size-rounding dust, not inventory.
+# The exchange can match slightly less than the requested size (production
+# 2026-10-31 03:00: TP asked for 29.6049, matched 29.6 → 0.004925 left
+# behind). The engine itself closes a position at < 0.01 shares
+# (`engine._check_take_profit`), so the history must use the same cutoff —
+# otherwise a fully-exited round keeps showing 未平仓 forever.
+_DUST_QTY = 1e-2
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -110,8 +119,11 @@ def build_status(state: Any) -> dict[str, Any]:
     position = None
     if pos is not None:
         qty = float(pos.total_qty)
-        cost = float(pos.total_cost)
-        avg = float(pos.avg_cost)
+        if qty < _DUST_QTY:
+            # Rounding dust only — the engine treats this as flat too.
+            qty = 0.0
+        cost = float(pos.total_cost) if qty > 0 else 0.0
+        avg = float(pos.avg_cost) if qty > 0 else 0.0
         held_mid = 0.0
         if pos.entry_side == "UP":
             held_mid = up_mid
@@ -119,7 +131,7 @@ def build_status(state: Any) -> dict[str, Any]:
             held_mid = down_mid
         upnl = (held_mid - avg) * qty if qty > 0 and held_mid > 0 else 0.0
         tiers = [_tier_payload(t) for t in getattr(pos, "tiers", [])]
-        if qty <= 1e-9:
+        if qty <= 0:
             # Flat position: never show leftover filled/placed tier rows.
             # The engine clears them on its next tick, but the dashboard may
             # poll inside that window — and this also covers legacy state
@@ -357,7 +369,11 @@ def rounds_with_pnl(conn: Any, limit: int = 100) -> list[dict[str, Any]]:
         fill_count = int(fill_count or 0)
         has_sells = sell_proceeds > 0
         qty_open = float(open_qty.get(round_ts, 0.0))
-        if qty_open > 1e-9:
+        if qty_open < _DUST_QTY:
+            # Ignore CLOB size-rounding dust (see `_DUST_QTY`): a round
+            # whose residual cannot even be sold is flat.
+            qty_open = 0.0
+        if qty_open > 0:
             round_status = "holding" if has_sells else "open"
         elif has_sells:
             round_status = "closed"

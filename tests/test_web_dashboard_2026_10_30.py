@@ -110,6 +110,40 @@ def test_build_status_with_position() -> None:
     assert pos["tiers"][0]["status"] == "filled"
 
 
+def test_build_status_treats_rounding_dust_as_flat() -> None:
+    """0.004925 shares left after a TP must render as a flat position."""
+    class _DustPosition(_FakePosition):
+        total_qty = 0.004925
+        total_cost = 0.0014
+        avg_cost = 0.283
+
+    mkt = SimpleNamespace(
+        up_token="UPTOKEN", down_token="DOWNTOKEN",
+        slug="btc-updown-15m-1", condition_id="0xdead",
+        window_start=None, window_end=None,
+    )
+    state = SimpleNamespace(
+        wm=_FakeWM(mkt),
+        engine=SimpleNamespace(
+            _round=SimpleNamespace(
+                round_start_ts=1_000, slug=mkt.slug,
+                position=_DustPosition(), skip_reason=None,
+            ),
+            _gate=None,
+        ),
+        price_cache=PriceCache(),
+        binance_cache=SimpleNamespace(last_price=50_000.0),
+        order_manager=None,
+    )
+    pos = status_mod.build_status(state)["position"]
+    assert pos["qty"] == 0.0
+    assert pos["cost"] == 0.0
+    assert pos["avg_cost"] == 0.0
+    assert pos["upnl_usd"] == 0.0
+    # Flat position: no leftover filled tier rows.
+    assert pos["tiers"][0]["status"] == "idle"
+
+
 # ---------------------------------------------------------------------------
 # History queries
 # ---------------------------------------------------------------------------
@@ -218,6 +252,51 @@ def test_open_round_is_not_counted_as_loss(conn) -> None:
     assert stats["closed_rounds"] == 0
     assert stats["open_rounds"] == 1
     assert stats["total_pnl_usd"] == 0.0
+
+
+def test_round_with_only_rounding_dust_is_closed(conn) -> None:
+    """A sub-0.01-share residual is CLOB dust, not an open position.
+
+    Production 2026-10-31 03:00: the TP was placed for 29.6049 shares but
+    the CLOB matched 29.6, leaving 0.004925 behind. The engine already
+    closes the position at < 0.01 shares, yet the history derived from
+    fills kept the round "未平仓" forever.
+    """
+    db = DB(conn)
+    db.upsert_round(round_start_ts=4_000, slug="r4")
+    db.insert_order(
+        client_order_id="c4", server_order_id="s4", round_start_ts=4_000,
+        side="BUY", token_id="tok", tier_name="T1", price=0.40, size=10.0,
+        lifetime_s=300, expires_at=4_300, placed_at=4_000,
+    )
+    db.insert_fill("f4a", "c4", 4_000, "tok", "BUY", 0.40, 10.004925, 4_000_100)
+    db.insert_fill("f4b", "c4", 4_000, "tok", "SELL", 0.50, 10.0, 4_000_200)
+
+    r = status_mod.rounds_with_pnl(conn)[0]
+    assert r["status"] == "closed"
+    assert r["closed"] is True
+    assert r["open_qty"] == 0.0
+    stats = status_mod.compute_stats([r])
+    assert stats["open_rounds"] == 0
+    assert stats["closed_rounds"] == 1
+
+
+def test_round_with_a_real_partial_residual_is_still_holding(conn) -> None:
+    """The dust cutoff must not hide a genuine leftover position."""
+    db = DB(conn)
+    db.upsert_round(round_start_ts=5_000, slug="r5")
+    db.insert_order(
+        client_order_id="c5", server_order_id="s5", round_start_ts=5_000,
+        side="BUY", token_id="tok", tier_name="T1", price=0.40, size=10.0,
+        lifetime_s=300, expires_at=5_300, placed_at=5_000,
+    )
+    db.insert_fill("f5a", "c5", 5_000, "tok", "BUY", 0.40, 10.0, 5_000_100)
+    db.insert_fill("f5b", "c5", 5_000, "tok", "SELL", 0.50, 5.0, 5_000_200)
+
+    r = status_mod.rounds_with_pnl(conn)[0]
+    assert r["status"] == "holding"
+    assert r["closed"] is False
+    assert r["open_qty"] == pytest.approx(5.0)
 
 
 def test_round_without_activity_is_not_listed(conn) -> None:
@@ -471,10 +550,15 @@ def test_http_routes_serve_pages_and_health() -> None:
     assert 'id="confirm-dialog"' in r.text
     assert 'id="toast-wrap"' in r.text
     assert 'class="modal"' in r.text
+    # Tables are scroll containers so the mobile layout never squashes them.
+    assert 'class="table-wrap"' in r.text
+    # Window-remaining is rendered as "14m 19s", not raw seconds.
+    assert "const dur = (s) =>" in r.text
 
     r = client.get("/trades")
     assert r.status_code == 200
     assert "交易记录" in r.text
+    assert 'class="table-wrap"' in r.text
 
     r = client.get("/static/style.css")
     assert r.status_code == 200
