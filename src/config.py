@@ -143,6 +143,31 @@ class StrategySettings(BaseSettings):
     TP_MIN_PCT: float = 0.05             # floor (5%) so TP can never lock in a loss
     BASELINE_DRIFT_LIMIT: float = 0.0015  # 0.15% BTC spot drift cap
 
+    # ── T4 post-entry stop-loss (operator decision 2026-10-31) ────────────
+    # Once T4 has filled, the round is at max planned exposure and a
+    # continuing collapse is no longer a dip the ladder can average into.
+    # Stage 1 sells a fraction at a confirmed drop below T4's fill price;
+    # stage 2 exits the remainder on a deeper drop or near expiry.
+    STOP_LOSS_ENABLED: bool = True
+    # Trigger line = T4 average fill price × (1 − this). 0.45 → 0.55×.
+    STOP_LOSS_T4_DROP_PCT: float = 0.45
+    # The mid must stay below the stage-1 line for this long before selling
+    # (filters single bad prints / thin-book wicks).
+    STOP_LOSS_CONFIRM_S: float = 20.0
+    STOP_LOSS_STAGE1_SELL_PCT: float = 0.60
+    # Stage 2 line = stage-1 line × (1 − this). 0.30 → 0.70× again.
+    STOP_LOSS_STAGE2_EXTRA_DROP_PCT: float = 0.30
+    # Time floor: with <= STOP_LOSS_TIME_EXIT_S left and mid <= FLOOR,
+    # exit the remainder instead of holding a near-worthless lottery.
+    STOP_LOSS_TIME_EXIT_S: float = 120.0
+    STOP_LOSS_FLOOR: float = 0.05
+    # Final exit: last STOP_LOSS_FINAL_EXIT_S seconds and mid below
+    # STOP_LOSS_FINAL_MID → sell whatever is left (avoid a binary zero).
+    STOP_LOSS_FINAL_EXIT_S: float = 60.0
+    STOP_LOSS_FINAL_MID: float = 0.50
+    # Backoff after a failed stop POST before retrying.
+    STOP_LOSS_RETRY_S: float = 3.0
+
     # T1 entry time gate: T1 must enter within this many seconds of window open.
     # Prevents chasing at the very end of the 15-min window.
     T1_ENTRY_WINDOW_S: float = 300.0    # 5 minutes

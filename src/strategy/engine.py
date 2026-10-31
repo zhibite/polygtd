@@ -13,6 +13,7 @@ This ensures a tier cannot be triggered twice.
 """
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from typing import Literal, Protocol
@@ -170,6 +171,12 @@ class StrategyEngine:
         # or on a mid-retreated early-exit (don't keep retrying when the
         # opportunity has slipped away anyway).
         self._tp_post_failure_count: int = 0
+        # T4 post-entry stop-loss state. Stage 0 = armed but no sale yet,
+        # stage 1 = partial de-risk filled, stage 2 = full exit filled.
+        self._stop_loss_stage: int = 0
+        self._stop_loss_below_since: float | None = None
+        self._stop_loss_retry_after_ts: float = 0.0
+        self._stop_loss_inflight: bool = False
         # H-NEW-2026-07-12: throttle state for the per-tick `engine.t2_diag`
         # breadcrumb. The previous version logged every 250ms tick (~3600
         # lines per 15m round), drowning the operator signal in identical
@@ -218,6 +225,19 @@ class StrategyEngine:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return float(default)
         return float(value)
+
+    def _cfg_bool(self, name: str, default: bool) -> bool:
+        """Read a boolean setting safely for __new__-constructed engines."""
+        value = None
+        if getattr(self, "_s", None) is not None:
+            value = getattr(self._s, name, None)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        return bool(default)
 
     def _btc_age_s(self) -> float | None:
         """Seconds since the Binance cache last saw a trade (None = unknown)."""
@@ -578,6 +598,10 @@ class StrategyEngine:
         self._t1_cap_reject_reset_round()
         self._round = RoundState(round_start_ts=round_start_ts, market=market)
         self._gate = None
+        self._stop_loss_stage = 0
+        self._stop_loss_below_since = None
+        self._stop_loss_retry_after_ts = 0.0
+        self._stop_loss_inflight = False
 
         # Pin baseline from the market the WM just discovered. The WM has
         # already called `fetch_at_window_open()` for this asset; the price
@@ -1084,6 +1108,9 @@ class StrategyEngine:
                 snap = pos.snapshot()
                 await self._check_average_down(bc_now, snap)
                 await self._check_take_profit(bc_now, snap)
+                # Re-snapshot: a TP exit may have changed the inventory.
+                snap = pos.snapshot()
+                await self._check_stop_loss(bc_now, snap)
         finally:
             self._eval_inflight = False
 
@@ -1777,6 +1804,9 @@ class StrategyEngine:
         """
         if not self._round or not self._gate:
             return
+        # A stop-loss taker exit is in flight — do not race it with a TP.
+        if getattr(self, "_stop_loss_inflight", False):
+            return
 
         pos = self._round.position
         if snap is None:
@@ -2103,3 +2133,190 @@ class StrategyEngine:
             # about the in-memory state machine.
             pos._tp_inflight = False
             raise
+
+    # ------------------------------------------------------------------
+    # T4 post-entry stop-loss
+    # ------------------------------------------------------------------
+
+    async def _check_stop_loss(
+        self, bc_now: float, snap: PositionSnapshot | None = None
+    ) -> None:
+        """Two-stage stop after T4 fills (max planned exposure reached).
+
+        Stage 1: mid <= T4_avg × (1−STOP_LOSS_T4_DROP_PCT) sustained for
+                 STOP_LOSS_CONFIRM_S → sell STOP_LOSS_STAGE1_SELL_PCT.
+        Stage 2: a further STOP_LOSS_STAGE2_EXTRA_DROP_PCT, or the time
+                 floor / final-exit rules → sell the remainder.
+
+        The actual sells are taker FAK orders placed by the router (it
+        also cancels resting BUY/TP orders first so the shares are free).
+        """
+        if not self._round:
+            return
+        if not self._cfg_bool("STOP_LOSS_ENABLED", True):
+            return
+        pos = self._round.position
+        if snap is None:
+            snap = pos.snapshot()
+        if snap.entry_token is None or snap.total_qty <= 1e-9:
+            return
+        # Let an in-flight TP / averaging fill settle before selling.
+        if snap.tp_inflight or snap.has_inflight_tier:
+            return
+        if getattr(self, "_stop_loss_inflight", False):
+            return
+        now = time.time()
+        if now < _ts(getattr(self, "_stop_loss_retry_after_ts", 0.0)):
+            return
+
+        # Only armed once T4 has actually entered.
+        t4 = pos.tiers[3]
+        if t4.size_filled <= 1e-9:
+            return
+        t4_avg = float(getattr(t4, "avg_fill_price", None) or 0.0)
+        if t4_avg <= 0 and t4.size_filled > 0:
+            t4_avg = float(t4.cost_filled) / float(t4.size_filled)
+        if t4_avg <= 0:
+            t4_avg = float(snap.avg_cost)
+        mid = self._pc.get_midpoint(snap.entry_token)
+        if mid <= 0 or t4_avg <= 0:
+            return
+
+        drop = min(max(self._cfg_float("STOP_LOSS_T4_DROP_PCT", 0.45), 0.0), 0.99)
+        line = t4_avg * (1.0 - drop)
+        if line <= 0:
+            return
+
+        stage = int(getattr(self, "_stop_loss_stage", 0) or 0)
+        round_ts = int(getattr(self._round, "round_start_ts", 0) or 0)
+        retry_s = max(1.0, self._cfg_float("STOP_LOSS_RETRY_S", 3.0))
+
+        if stage <= 0:
+            if mid > line:
+                self._stop_loss_below_since = None
+                return
+            since = getattr(self, "_stop_loss_below_since", None)
+            if since is None:
+                self._stop_loss_below_since = now
+                log.info(
+                    "engine.stop_loss_armed",
+                    mid=mid,
+                    line=line,
+                    t4_avg=t4_avg,
+                    confirm_s=self._cfg_float("STOP_LOSS_CONFIRM_S", 20.0),
+                    qty=snap.total_qty,
+                )
+                return
+            confirm = max(0.0, self._cfg_float("STOP_LOSS_CONFIRM_S", 20.0))
+            if now - since < confirm:
+                return
+            pct = min(
+                max(self._cfg_float("STOP_LOSS_STAGE1_SELL_PCT", 0.60), 0.0),
+                1.0,
+            )
+            qty = math.floor(float(snap.total_qty) * pct * 10000.0) / 10000.0
+            if qty <= 0 or not round_ts:
+                return
+            self._stop_loss_retry_after_ts = now + retry_s
+            self._stop_loss_below_since = None
+            self._stop_loss_inflight = True
+            log.warning(
+                "engine.trigger_stop_loss",
+                stage=1,
+                mid=mid,
+                line=line,
+                t4_avg=t4_avg,
+                qty=qty,
+                total_qty=snap.total_qty,
+                reason="t4_drop",
+            )
+            try:
+                await self._handler(ActionStopLoss(
+                    token=snap.entry_token,
+                    price=mid,
+                    qty=qty,
+                    stage=1,
+                    reason="t4_drop",
+                    round_start_ts=round_ts,
+                ))
+            except BaseException:
+                self._stop_loss_inflight = False
+                raise
+            return
+
+        # Stage 2 — exit the remainder.
+        extra = min(
+            max(self._cfg_float("STOP_LOSS_STAGE2_EXTRA_DROP_PCT", 0.30), 0.0),
+            0.99,
+        )
+        stage2_line = line * (1.0 - extra)
+        remain = self._window_remaining_s()
+        remain = float("inf") if remain is None else remain
+        time_exit_s = self._cfg_float("STOP_LOSS_TIME_EXIT_S", 120.0)
+        floor = self._cfg_float("STOP_LOSS_FLOOR", 0.05)
+        final_s = self._cfg_float("STOP_LOSS_FINAL_EXIT_S", 60.0)
+        final_mid = self._cfg_float("STOP_LOSS_FINAL_MID", 0.50)
+        reason = ""
+        if mid <= stage2_line:
+            reason = "stage2_drop"
+        elif remain <= time_exit_s and mid <= floor:
+            reason = "time_floor"
+        elif remain <= final_s and mid < final_mid:
+            reason = "final_exit"
+        if not reason or not round_ts:
+            return
+        self._stop_loss_retry_after_ts = now + retry_s
+        self._stop_loss_inflight = True
+        log.warning(
+            "engine.trigger_stop_loss",
+            stage=2,
+            mid=mid,
+            line=stage2_line,
+            remain_s=round(remain, 1) if remain != float("inf") else None,
+            qty=snap.total_qty,
+            reason=reason,
+        )
+        try:
+            await self._handler(ActionStopLoss(
+                token=snap.entry_token,
+                price=mid,
+                qty=snap.total_qty,
+                stage=2,
+                reason=reason,
+                round_start_ts=round_ts,
+            ))
+        except BaseException:
+            self._stop_loss_inflight = False
+            raise
+
+    def notify_stop_filled(self, stage: int, qty: float) -> None:
+        """Router confirms a stop-loss FAK sell filled."""
+        self._stop_loss_stage = max(
+            int(getattr(self, "_stop_loss_stage", 0) or 0), int(stage)
+        )
+        self._stop_loss_below_since = None
+        self._stop_loss_retry_after_ts = 0.0
+        self._stop_loss_inflight = False
+        remaining = self._round.position.total_qty if self._round else 0.0
+        log.warning(
+            "engine.stop_loss_filled",
+            stage=stage,
+            sold_qty=qty,
+            remaining_qty=remaining,
+        )
+
+    def notify_stop_error(self, stage: int, reason: str) -> None:
+        """Router could not place/fill the stop order; retry shortly."""
+        now = time.time()
+        retry = max(1.0, self._cfg_float("STOP_LOSS_RETRY_S", 3.0))
+        self._stop_loss_retry_after_ts = now + retry
+        self._stop_loss_inflight = False
+        # The level was already confirmed; do not restart the 20s timer.
+        if int(stage) <= 1:
+            self._stop_loss_below_since = 0.0
+        log.warning(
+            "engine.stop_loss_error",
+            stage=stage,
+            reason=reason,
+            retry_s=retry,
+        )

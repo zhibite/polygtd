@@ -56,6 +56,7 @@ from src.strategy.engine import (
     ActionCancelTier,
     ActionOpenT1,
     ActionOpenTN,
+    ActionStopLoss,
     ActionTakeProfit,
     StrategyEngine,
 )
@@ -1157,6 +1158,12 @@ class ActionRouter:
                 action=type(action).__name__,
                 reason=getattr(ks, "reason", ""),
             )
+            # Release the stop-loss in-flight latch: the operator's stop
+            # suppresses auto-sells, but a later "恢复运行" must be able
+            # to re-arm the stop instead of deadlocking on this action.
+            if isinstance(action, ActionStopLoss) and eng._round is not None:
+                eng._stop_loss_inflight = False
+                eng._stop_loss_retry_after_ts = 0.0
             return
 
         tick_size = eng._round.tick_size if eng._round else 0.01
@@ -1507,6 +1514,119 @@ class ActionRouter:
                             )
 
             task = asyncio.create_task(_tp_runner())
+            self._state._bg_tasks.add(task)
+            task.add_done_callback(self._state._bg_tasks.discard)
+
+        elif isinstance(action, ActionStopLoss):
+            # Taker exit after T4 fills. Cancel resting BUY/TP orders
+            # first: a live TP GTD reserves the very shares we need to
+            # sell, and a resting BUY GTD could fill into the exit.
+            async def _stop_runner() -> None:
+                try:
+                    if (
+                        not eng._round
+                        or eng._round.round_start_ts != action.round_start_ts
+                    ):
+                        log.warning(
+                            "router.stop_loss.stale_round",
+                            action_round=action.round_start_ts,
+                            current_round=getattr(
+                                eng._round, "round_start_ts", None
+                            ),
+                        )
+                        eng._stop_loss_inflight = False
+                        return
+                    pos = eng._round.position
+                    try:
+                        cancelled = await om.cancel_market(
+                            action.round_start_ts
+                        )
+                        if cancelled:
+                            log.warning(
+                                "router.stop_loss.cancelled_orders",
+                                stage=action.stage,
+                                count=len(cancelled),
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning(
+                            "router.stop_loss.cancel_failed",
+                            stage=action.stage,
+                            error=str(exc),
+                            note="continuing; the sell may fail while the "
+                                 "GTD still reserves shares",
+                        )
+                    order = await om.place_market_sell(
+                        token_id=action.token,
+                        size=action.qty,
+                        reference_price=action.price,
+                        round_start_ts=action.round_start_ts,
+                        tier_name=f"SL{action.stage}",
+                        tick_size=tick_size,
+                    )
+                    if not order:
+                        log.error(
+                            "router.stop_loss_failed",
+                            stage=action.stage,
+                            reason=action.reason,
+                            qty=action.qty,
+                        )
+                        eng.notify_stop_error(
+                            action.stage,
+                            reason="place_market_sell returned None",
+                        )
+                        # If the wallet is actually empty (manual UI sale,
+                        # stale in-memory inventory), clear the phantom
+                        # position instead of retrying forever.
+                        clob = getattr(self._state, "clob", None)
+                        if clob is not None:
+                            try:
+                                await _maybe_realize_closed(
+                                    action.token, clob, pos
+                                )
+                            except Exception:  # noqa: BLE001
+                                pass
+                        return
+                    sid = order.server_order_id or ""
+                    sold = (
+                        order.placed_size if order.placed_size > 0
+                        else order.size
+                    )
+                    pos.register_tp(
+                        server_order_id=sid,
+                        token_id=action.token,
+                        target_qty=sold,
+                    )
+                    pos.record_tp_fill(sid, order.price, sold)
+                    if pos.total_qty <= 1e-9:
+                        pos.realize_position_closed(
+                            source="router.stop_loss",
+                            note=f"stop-loss stage {action.stage} closed "
+                                 "the position",
+                        )
+                    eng.notify_stop_filled(action.stage, sold)
+                    log.warning(
+                        "router.stop_loss_filled",
+                        stage=action.stage,
+                        reason=action.reason,
+                        mid=action.price,
+                        sold_qty=sold,
+                        avg_price=order.price,
+                        remaining_qty=pos.total_qty,
+                        server_id=sid[:16],
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.exception(
+                        "router.stop_runner_crashed", error=str(exc)
+                    )
+                    try:
+                        eng.notify_stop_error(
+                            action.stage,
+                            reason=f"runner exception: {exc!r}",
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            task = asyncio.create_task(_stop_runner())
             self._state._bg_tasks.add(task)
             task.add_done_callback(self._state._bg_tasks.discard)
 
