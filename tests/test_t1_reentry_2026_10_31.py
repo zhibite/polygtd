@@ -1,0 +1,116 @@
+"""Tests for same-window T1 re-entry after an early take-profit.
+
+Operator rule (2026-10-31): a TP exit normally blocks T1 until the next
+15-minute window. If the position is fully closed while the window still
+has at least `T1_REENTRY_MIN_REMAINING_S` (default 720 s = 12 min, i.e.
+the TP finished in the first 3 minutes), the round state is reset and a
+fresh T1 sequence may start in the same window.
+"""
+from __future__ import annotations
+
+import time
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+
+import pytest
+
+from src.strategy.engine import StrategyEngine
+from src.strategy.round_state import Position
+
+
+def _engine(**config):
+    eng = StrategyEngine.__new__(StrategyEngine)
+    eng._bc = SimpleNamespace(last_price=100_000.0, ts_ms=0)
+    eng._pc = SimpleNamespace(get_midpoint=lambda tok: 0.40)
+    eng._gate = SimpleNamespace(
+        can_act=lambda bc: True,
+        can_enter=lambda bc, mid: True,
+        can_double_down=lambda *a, **k: True,
+        state=lambda bc: SimpleNamespace(drift=0.0, within_limit=True),
+    )
+    eng._s = SimpleNamespace(
+        ENTRY_PRICE_CAP=0.40,
+        PRICE_PRE_MARGIN=0.10,
+        CANCEL_HYSTERESIS_PCT=0.02,
+        TP_PROFIT_PCT=0.20,
+        TP_DECREMENT_PCT=0.03,
+        TP_MIN_PCT=0.05,
+        **config,
+    )
+    eng._tp_last_post_error_ts = 0.0
+    eng._tp_post_failure_count = 0
+    eng._tp_backoff_s = 5.0
+    return eng
+
+
+def _residual_position() -> Position:
+    """Position just after a full TP: floating-point residual ~0.004."""
+    pos = Position()
+    pos.entry_token = "UP"
+    pos.entry_side = "UP"
+    pos._total_qty = 0.0041
+    pos._total_cost = 0.001
+    pos._avg_cost = 0.25
+    pos._tp_sold_qty = 5.0
+    pos.baseline_realized_price = 0.38
+    pos.baseline_set_realized = True
+    pos.tier1.size_filled = 5.0
+    pos.tier1.cost_filled = 1.9
+    pos.tier1.filled = True
+    return pos
+
+
+def _round_with_end(pos: Position, seconds_left: float):
+    return SimpleNamespace(
+        position=pos,
+        round_start_ts=int(time.time() - 60),
+        up_token="UP",
+        down_token="DOWN",
+        market=SimpleNamespace(
+            window_end=datetime.now(timezone.utc) + timedelta(seconds=seconds_left)
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_early_tp_rearms_t1_in_same_window() -> None:
+    eng = _engine()
+    pos = _residual_position()
+    eng._round = _round_with_end(pos, 800)  # ~13 min left: early TP
+
+    await eng._check_take_profit(bc_now=100_000.0)
+
+    assert pos.entry_token is None, "T1 must be re-enabled after an early TP"
+    assert pos.entry_side is None
+    assert pos._total_qty == 0.0
+    assert pos._tp_sold_qty == 0.0
+    assert pos.baseline_realized_price is None
+    assert all(t.size_filled == 0.0 for t in pos.tiers)
+    assert all(not t.placed and not t.filled for t in pos.tiers)
+
+
+@pytest.mark.asyncio
+async def test_late_tp_keeps_single_entry_per_window() -> None:
+    eng = _engine()
+    pos = _residual_position()
+    eng._round = _round_with_end(pos, 600)  # only 10 min left: not early
+
+    await eng._check_take_profit(bc_now=100_000.0)
+
+    assert pos.entry_token == "UP", (
+        "late TP must keep the round's entry_token so T1 cannot re-enter"
+    )
+    assert pos._total_qty == 0.0
+    # realize_position_closed preserves tier fills by design.
+    assert pos.tier1.size_filled == 5.0
+
+
+@pytest.mark.asyncio
+async def test_reentry_can_be_disabled() -> None:
+    eng = _engine(T1_REENTRY_MIN_REMAINING_S=0.0)
+    pos = _residual_position()
+    eng._round = _round_with_end(pos, 800)
+
+    await eng._check_take_profit(bc_now=100_000.0)
+
+    assert pos.entry_token == "UP", "0 disables the re-entry feature"
